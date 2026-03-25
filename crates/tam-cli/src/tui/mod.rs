@@ -523,42 +523,42 @@ fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
 // New task flow
 // ---------------------------------------------------------------------------
 
-fn start_new_task_flow(app: &mut App, config: &Config) {
-    if let Some(ref cmd) = config.project_picker {
-        let projects = run_project_picker(cmd);
-        let cwd_display = std::env::current_dir()
-            .ok()
-            .map(|p| ui::shorten_home(&p.display().to_string()))
-            .unwrap_or_else(|| ".".into());
+fn start_new_task_flow(app: &mut App, _config: &Config) {
+    let cwd_display = std::env::current_dir()
+        .ok()
+        .map(|p| ui::shorten_home(&p.display().to_string()))
+        .unwrap_or_else(|| ".".into());
 
-        let mut items = vec![
-            PickerItem {
-                display: format!(". ({cwd_display})"),
-                id: "__cwd__".into(),
-            },
-            PickerItem {
-                display: "enter path...".into(),
-                id: "__enter_path__".into(),
-            },
-        ];
+    let mut items = vec![
+        PickerItem {
+            display: format!(". ({cwd_display})"),
+            id: "__cwd__".into(),
+        },
+        PickerItem {
+            display: "enter path...".into(),
+            id: "__enter_path__".into(),
+        },
+    ];
 
-        for name in projects {
-            items.push(PickerItem {
-                display: name.clone(),
-                id: name,
-            });
+    // Discover projects using tam-worktree
+    if let Ok(wt_config) = tam_worktree::config::load_config() {
+        if let Ok(ignore) = tam_worktree::discovery::build_ignore_set(&wt_config.ignore) {
+            let root = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            if let Ok(paths) =
+                tam_worktree::discovery::discover(&root, &ignore, wt_config.max_depth)
+            {
+                let entries = tam_worktree::pretty::build_pretty_names(&paths);
+                for entry in &entries {
+                    items.push(PickerItem {
+                        display: entry.display_name.clone(),
+                        id: entry.path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
         }
-
-        app.mode = Mode::NewTaskPickProject(PickerState::new("Pick project", items));
-    } else {
-        let dir = std::env::current_dir().unwrap_or_default();
-        app.mode = Mode::NewTaskEnterName {
-            project_dir: dir,
-            name: String::new(),
-            create_worktree: false,
-            start_agent: false,
-        };
     }
+
+    app.mode = Mode::NewTaskPickProject(PickerState::new("Pick project", items));
 }
 
 fn start_run_flow(app: &mut App, config: &Config, task_name: &str) {
@@ -593,7 +593,7 @@ fn start_run_flow(app: &mut App, config: &Config, task_name: &str) {
     };
 }
 
-fn handle_picker_enter(app: &mut App, config: &Config) -> Action {
+fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
     let selected_id = match &app.mode {
         Mode::NewTaskPickProject(p) | Mode::RunPickSession { picker: p, .. } => {
             p.selected_item().map(|item| item.id.clone())
@@ -616,14 +616,6 @@ fn handle_picker_enter(app: &mut App, config: &Config) -> Action {
 
             let dir = if selected_id == "__cwd__" {
                 std::env::current_dir().unwrap_or_default()
-            } else if let Some(ref resolver) = config.project_resolver {
-                match config::run_project_resolver(resolver, &selected_id) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        app.set_status(format!("Resolver failed: {e}"), Duration::from_secs(5));
-                        return Action::None;
-                    }
-                }
             } else {
                 PathBuf::from(&selected_id)
             };
@@ -662,21 +654,6 @@ fn handle_picker_enter(app: &mut App, config: &Config) -> Action {
             }
         }
         _ => Action::None,
-    }
-}
-
-fn run_project_picker(command: &str) -> Vec<String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| l.trim().to_string())
-            .collect(),
-        _ => vec![],
     }
 }
 

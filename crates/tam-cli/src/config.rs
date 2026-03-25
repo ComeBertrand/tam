@@ -17,8 +17,6 @@ pub struct ConfigFile {
 pub struct SpawnConfig {
     #[serde(alias = "agent")]
     pub default_agent: Option<String>,
-    pub project_picker: Option<String>,
-    pub project_resolver: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,8 +52,6 @@ impl CustomCommand {
 #[derive(Debug)]
 pub struct Config {
     pub default_agent: String,
-    pub project_picker: Option<String>,
-    pub project_resolver: Option<String>,
     pub scrollback: usize,
     pub finder: Option<String>,
     pub commands: Vec<CustomCommand>,
@@ -65,8 +61,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_agent: "claude".into(),
-            project_picker: None,
-            project_resolver: None,
             scrollback: 1_048_576,
             finder: None,
             commands: Vec::new(),
@@ -83,9 +77,6 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         .as_ref()
         .and_then(|s| s.default_agent.clone())
         .unwrap_or(defaults.default_agent);
-
-    let project_picker = file.spawn.as_ref().and_then(|s| s.project_picker.clone());
-    let project_resolver = file.spawn.as_ref().and_then(|s| s.project_resolver.clone());
 
     let scrollback = file
         .daemon
@@ -104,8 +95,6 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
 
     Ok(Config {
         default_agent,
-        project_picker,
-        project_resolver,
         scrollback,
         finder,
         commands,
@@ -158,29 +147,6 @@ pub(crate) fn shell_quote(s: &str) -> String {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-pub fn run_project_resolver(template: &str, name: &str) -> Result<std::path::PathBuf> {
-    let cmd = template.replace("{name}", &shell_quote(name));
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
-        .with_context(|| format!("failed to run project resolver: {cmd}"))?;
-    if !output.status.success() {
-        anyhow::bail!("project resolver command failed: {cmd}");
-    }
-    let path = String::from_utf8(output.stdout)
-        .context("project resolver produced non-UTF8 output")?
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if path.is_empty() {
-        anyhow::bail!("project resolver produced empty output: {cmd}");
-    }
-    Ok(std::path::PathBuf::from(path))
 }
 
 pub fn run_custom_command(

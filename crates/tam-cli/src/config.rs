@@ -17,7 +17,6 @@ pub struct ConfigFile {
 pub struct SpawnConfig {
     #[serde(alias = "agent")]
     pub default_agent: Option<String>,
-    pub namer: Option<String>,
     pub project_picker: Option<String>,
     pub project_resolver: Option<String>,
 }
@@ -55,7 +54,6 @@ impl CustomCommand {
 #[derive(Debug)]
 pub struct Config {
     pub default_agent: String,
-    pub namer: Option<String>,
     pub project_picker: Option<String>,
     pub project_resolver: Option<String>,
     pub scrollback: usize,
@@ -67,7 +65,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_agent: "claude".into(),
-            namer: None,
             project_picker: None,
             project_resolver: None,
             scrollback: 1_048_576,
@@ -87,7 +84,6 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         .and_then(|s| s.default_agent.clone())
         .unwrap_or(defaults.default_agent);
 
-    let namer = file.spawn.as_ref().and_then(|s| s.namer.clone());
     let project_picker = file.spawn.as_ref().and_then(|s| s.project_picker.clone());
     let project_resolver = file.spawn.as_ref().and_then(|s| s.project_resolver.clone());
 
@@ -108,7 +104,6 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
 
     Ok(Config {
         default_agent,
-        namer,
         project_picker,
         project_resolver,
         scrollback,
@@ -158,30 +153,6 @@ pub(crate) fn shell_quote(s: &str) -> String {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-pub fn run_namer(template: &str, dir: &std::path::Path) -> Result<String> {
-    let dir_str = dir.to_string_lossy();
-    let cmd = template.replace("{dir}", &shell_quote(&dir_str));
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
-        .with_context(|| format!("failed to run namer: {cmd}"))?;
-    if !output.status.success() {
-        anyhow::bail!("namer command failed: {cmd}");
-    }
-    let name = String::from_utf8(output.stdout)
-        .context("namer produced non-UTF8 output")?
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if name.is_empty() {
-        anyhow::bail!("namer command produced empty output: {cmd}");
-    }
-    Ok(name)
 }
 
 pub fn run_project_resolver(template: &str, name: &str) -> Result<std::path::PathBuf> {
@@ -262,34 +233,6 @@ fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn resolve_id(
-    explicit: Option<String>,
-    namer: Option<&str>,
-    dir: &std::path::Path,
-) -> Result<String> {
-    if let Some(id) = explicit {
-        return Ok(id);
-    }
-    if let Some(template) = namer {
-        return run_namer(template, dir);
-    }
-    Ok(default_id_from_dir(dir))
-}
-
-pub fn default_id_from_dir(dir: &std::path::Path) -> String {
-    dir.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "agent".into())
-}
-
-pub fn find_agents_in_dir(agents: &[tam_proto::AgentInfo], dir: &std::path::Path) -> Vec<String> {
-    agents
-        .iter()
-        .filter(|a| a.dir == dir)
-        .map(|a| a.id.clone())
-        .collect()
 }
 
 /// Display info for a session in the picker.
@@ -519,13 +462,11 @@ fn entry_matches_hook(entry: &serde_json::Value, event: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn defaults() {
         let config = Config::default();
         assert_eq!(config.default_agent, "claude");
-        assert!(config.namer.is_none());
         assert_eq!(config.scrollback, 1_048_576);
     }
 
@@ -540,11 +481,9 @@ mod tests {
         let toml = r#"
 [spawn]
 default_agent = "codex"
-namer = "basename {dir}"
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(config.default_agent, "codex");
-        assert_eq!(config.namer.unwrap(), "basename {dir}");
     }
 
     #[test]
@@ -569,14 +508,6 @@ finder = "fzf"
     }
 
     #[test]
-    fn default_id_from_regular_dir() {
-        assert_eq!(
-            default_id_from_dir(Path::new("/home/user/worktrees/myapp--fix-auth")),
-            "myapp--fix-auth"
-        );
-    }
-
-    #[test]
     fn shell_quote_safe_string() {
         assert_eq!(shell_quote("/tmp/foo-bar"), "/tmp/foo-bar");
     }
@@ -589,23 +520,6 @@ finder = "fzf"
     #[test]
     fn shell_quote_injection() {
         assert_eq!(shell_quote("/tmp/foo; rm -rf /"), "'/tmp/foo; rm -rf /'");
-    }
-
-    #[test]
-    fn namer_with_echo() {
-        let name = run_namer("echo test-name", Path::new("/tmp")).unwrap();
-        assert_eq!(name, "test-name");
-    }
-
-    #[test]
-    fn resolve_id_explicit_wins() {
-        let id = resolve_id(
-            Some("my-id".into()),
-            Some("basename {dir}"),
-            Path::new("/tmp/project"),
-        )
-        .unwrap();
-        assert_eq!(id, "my-id");
     }
 
     fn make_sessions() -> Vec<SessionDisplay> {

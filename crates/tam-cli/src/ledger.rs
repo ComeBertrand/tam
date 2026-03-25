@@ -402,4 +402,165 @@ mod tests {
             .unwrap();
         assert!(ledger.task_exists("feat"));
     }
+
+    #[test]
+    fn full_task_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = test_ledger(&tmp);
+
+        // Create
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "feat".into(),
+                dir: PathBuf::from("/tmp/feat"),
+                owned: true,
+                timestamp: 100,
+            })
+            .unwrap();
+        assert_eq!(ledger.active_tasks().len(), 1);
+
+        // First agent run
+        ledger
+            .append(LedgerEvent::AgentRunStarted {
+                task: "feat".into(),
+                provider: "claude".into(),
+                session_id: Some("s1".into()),
+                timestamp: 200,
+            })
+            .unwrap();
+        ledger
+            .append(LedgerEvent::AgentRunEnded {
+                task: "feat".into(),
+                exit_code: 0,
+                timestamp: 300,
+            })
+            .unwrap();
+
+        // Second agent run
+        ledger
+            .append(LedgerEvent::AgentRunStarted {
+                task: "feat".into(),
+                provider: "claude".into(),
+                session_id: Some("s2".into()),
+                timestamp: 400,
+            })
+            .unwrap();
+        ledger
+            .append(LedgerEvent::AgentRunEnded {
+                task: "feat".into(),
+                exit_code: 0,
+                timestamp: 500,
+            })
+            .unwrap();
+
+        let tasks = ledger.active_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].run_count, 2);
+        assert_eq!(tasks[0].last_activity, Some(500));
+
+        let runs = ledger.task_runs("feat");
+        assert_eq!(runs.len(), 2);
+
+        // Drop
+        ledger
+            .append(LedgerEvent::TaskDropped {
+                task: "feat".into(),
+                timestamp: 600,
+            })
+            .unwrap();
+        assert!(ledger.active_tasks().is_empty());
+        assert!(!ledger.task_exists("feat"));
+    }
+
+    #[test]
+    fn multiple_tasks_independent() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = test_ledger(&tmp);
+
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "feat-a".into(),
+                dir: PathBuf::from("/tmp/a"),
+                owned: true,
+                timestamp: 100,
+            })
+            .unwrap();
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "feat-b".into(),
+                dir: PathBuf::from("/tmp/b"),
+                owned: false,
+                timestamp: 200,
+            })
+            .unwrap();
+
+        assert_eq!(ledger.active_tasks().len(), 2);
+
+        // Drop only one
+        ledger
+            .append(LedgerEvent::TaskDropped {
+                task: "feat-a".into(),
+                timestamp: 300,
+            })
+            .unwrap();
+
+        let tasks = ledger.active_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].name, "feat-b");
+    }
+
+    #[test]
+    fn find_task_by_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = test_ledger(&tmp);
+
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "feat".into(),
+                dir: PathBuf::from("/tmp/feat"),
+                owned: true,
+                timestamp: now(),
+            })
+            .unwrap();
+
+        assert!(ledger.find_task("feat").is_some());
+        assert!(ledger.find_task("nonexistent").is_none());
+
+        // Dropped tasks are not found
+        ledger
+            .append(LedgerEvent::TaskDropped {
+                task: "feat".into(),
+                timestamp: now(),
+            })
+            .unwrap();
+        assert!(ledger.find_task("feat").is_none());
+    }
+
+    #[test]
+    fn dir_uniqueness() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = test_ledger(&tmp);
+
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "task-a".into(),
+                dir: PathBuf::from("/tmp/shared"),
+                owned: false,
+                timestamp: now(),
+            })
+            .unwrap();
+
+        // Same dir is found
+        let found = ledger.find_task_by_dir(Path::new("/tmp/shared"));
+        assert_eq!(found.unwrap().name, "task-a");
+
+        // After drop, dir is free
+        ledger
+            .append(LedgerEvent::TaskDropped {
+                task: "task-a".into(),
+                timestamp: now(),
+            })
+            .unwrap();
+        assert!(ledger.find_task_by_dir(Path::new("/tmp/shared")).is_none());
+    }
 }

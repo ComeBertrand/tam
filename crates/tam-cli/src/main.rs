@@ -515,6 +515,7 @@ fn shorten_home(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_shorten_home() {
@@ -523,5 +524,275 @@ mod tests {
             let input = format!("{}/projects/foo", home);
             assert_eq!(shorten_home(&input), "~/projects/foo");
         }
+    }
+
+    #[test]
+    fn test_format_age_none() {
+        assert_eq!(format_age(None), "-");
+    }
+
+    #[test]
+    fn test_format_age_recent() {
+        let ts = ledger::now();
+        assert_eq!(format_age(Some(ts)), "now");
+    }
+
+    #[test]
+    fn test_format_age_minutes() {
+        let ts = ledger::now() - 300; // 5 minutes ago
+        assert_eq!(format_age(Some(ts)), "5m");
+    }
+
+    #[test]
+    fn test_format_age_hours() {
+        let ts = ledger::now() - 7200; // 2 hours ago
+        assert_eq!(format_age(Some(ts)), "2h");
+    }
+
+    #[test]
+    fn test_format_age_days() {
+        let ts = ledger::now() - 172800; // 2 days ago
+        assert_eq!(format_age(Some(ts)), "2d");
+    }
+
+    #[test]
+    fn test_resolve_task_name_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
+        let name = resolve_task_name(Some("my-task".into()), &ledger).unwrap();
+        assert_eq!(name, "my-task");
+    }
+
+    #[test]
+    fn test_resolve_task_name_from_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
+
+        let cwd = std::fs::canonicalize(".").unwrap();
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "cwd-task".into(),
+                dir: cwd,
+                owned: false,
+                timestamp: ledger::now(),
+            })
+            .unwrap();
+
+        let name = resolve_task_name(None, &ledger).unwrap();
+        assert_eq!(name, "cwd-task");
+    }
+
+    #[test]
+    fn test_resolve_task_name_no_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
+        let result = resolve_task_name(None, &ledger);
+        assert!(result.is_err());
+    }
+
+    /// Helper: create a git repo with an initial commit.
+    fn init_git_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(path.join("README.md"), "# test").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn test_worktree_flow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("myrepo");
+        init_git_repo(&repo);
+
+        // Create a worktree via tam-worktree
+        let wt_config = tam_worktree::config::Config {
+            max_depth: 3,
+            ignore: vec![],
+            worktree_root: tmp.path().to_path_buf(),
+            auto_init: false,
+        };
+        let wt_path = tam_worktree::worktree::create("test-feat", None, &wt_config, &repo).unwrap();
+        assert!(wt_path.exists());
+
+        // Track in ledger
+        let mut ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "test-feat".into(),
+                dir: wt_path.clone(),
+                owned: true,
+                timestamp: ledger::now(),
+            })
+            .unwrap();
+
+        let tasks = ledger.active_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].owned);
+
+        // Delete worktree
+        tam_worktree::worktree::delete("test-feat", false, true, &wt_config, &wt_path).unwrap();
+        assert!(!wt_path.exists());
+
+        // Drop from ledger
+        ledger
+            .append(LedgerEvent::TaskDropped {
+                task: "test-feat".into(),
+                timestamp: ledger::now(),
+            })
+            .unwrap();
+        assert!(ledger.active_tasks().is_empty());
+    }
+
+    #[test]
+    fn test_gc_detects_merged_branch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("myrepo");
+        init_git_repo(&repo);
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
+
+        // Get default branch name
+        let output = git(&["branch", "--show-current"]);
+        let default = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Create a branch and merge it
+        git(&["branch", "feat-merged"]);
+
+        // Create an unmerged branch with a new commit
+        git(&["checkout", "-b", "feat-unmerged"]);
+        std::fs::write(repo.join("new.txt"), "content").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "new work"]);
+        git(&["checkout", &default]);
+
+        // Track both in ledger
+        let mut ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "feat-merged".into(),
+                dir: repo.clone(),
+                owned: true,
+                timestamp: ledger::now(),
+            })
+            .unwrap();
+        ledger
+            .append(LedgerEvent::TaskCreated {
+                name: "feat-unmerged".into(),
+                dir: repo.clone(),
+                owned: true,
+                timestamp: ledger::now(),
+            })
+            .unwrap();
+
+        // Verify is_branch_merged
+        let root = tam_worktree::git::repo_root(&repo).unwrap();
+        assert!(tam_worktree::git::is_branch_merged(&root, "feat-merged", &default).unwrap());
+        assert!(!tam_worktree::git::is_branch_merged(&root, "feat-unmerged", &default).unwrap());
+
+        // Simulate GC: only merged tasks should be candidates
+        let tasks = ledger.active_tasks();
+        let gc_candidates: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.owned)
+            .filter(|t| {
+                tam_worktree::git::is_branch_merged(&root, &t.name, &default).unwrap_or(false)
+            })
+            .map(|t| t.name.as_str())
+            .collect();
+
+        assert_eq!(gc_candidates, vec!["feat-merged"]);
+    }
+
+    #[test]
+    fn test_task_status_with_git() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("myrepo");
+        init_git_repo(&repo);
+
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
+
+        // Create a worktree so we have a real owned task dir
+        let wt_config = tam_worktree::config::Config {
+            max_depth: 3,
+            ignore: vec![],
+            worktree_root: tmp.path().to_path_buf(),
+            auto_init: false,
+        };
+        let wt_path =
+            tam_worktree::worktree::create("test-branch", None, &wt_config, &repo).unwrap();
+
+        // check_git_branch_status uses repo_root which resolves from the worktree.
+        let root = tam_worktree::git::repo_root(&wt_path).unwrap();
+        assert!(
+            root.join(".git").exists(),
+            "repo_root should find main repo"
+        );
+
+        // Verify the pieces work individually from the resolved root
+        assert!(tam_worktree::git::local_branch_exists(&root, "test-branch").unwrap());
+        let detected_default = tam_worktree::git::default_branch(&root).unwrap();
+        assert!(
+            tam_worktree::git::is_branch_merged(&root, "test-branch", &detected_default).unwrap(),
+            "branch at same commit as {} should be merged",
+            detected_default,
+        );
+
+        // Now verify the combined check_git_branch_status works
+        let status = task::check_git_branch_status("test-branch", &wt_path);
+        assert_eq!(
+            status,
+            task::GitBranchStatus::Merged,
+            "new branch at same commit should be merged"
+        );
+
+        // Make a commit on the worktree branch so it diverges
+        std::fs::write(wt_path.join("new.txt"), "content").unwrap();
+        let git_wt = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&wt_path)
+                .output()
+                .unwrap()
+        };
+        git_wt(&["add", "."]);
+        git_wt(&["commit", "-m", "diverge"]);
+
+        // Now it's active (not merged)
+        let status = task::check_git_branch_status("test-branch", &wt_path);
+        assert_eq!(status, task::GitBranchStatus::Active);
+
+        // Merge it back from the main repo
+        git(&["merge", "test-branch"]);
+        let status = task::check_git_branch_status("test-branch", &wt_path);
+        assert_eq!(status, task::GitBranchStatus::Merged);
+
+        // Remove worktree and delete branch → BranchGone
+        tam_worktree::worktree::delete("test-branch", false, true, &wt_config, &wt_path).unwrap();
+        // Delete branch from main repo
+        git(&["branch", "-d", "test-branch"]);
+        let status = task::check_git_branch_status("test-branch", &repo);
+        assert_eq!(status, task::GitBranchStatus::BranchGone);
     }
 }

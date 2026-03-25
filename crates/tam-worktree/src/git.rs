@@ -158,9 +158,13 @@ pub fn delete_branch(dir: &Path, name: &str) -> Result<()> {
 /// Check if a branch is merged into another branch.
 pub fn is_branch_merged(dir: &Path, branch: &str, into: &str) -> Result<bool> {
     let output = git(dir, &["branch", "--merged", into])?;
-    Ok(output
-        .lines()
-        .any(|line| line.trim().trim_start_matches("* ") == branch))
+    Ok(output.lines().any(|line| {
+        let name = line
+            .trim()
+            .trim_start_matches("* ")
+            .trim_start_matches("+ ");
+        name == branch
+    }))
 }
 
 /// List worktrees. Returns list of worktree paths.

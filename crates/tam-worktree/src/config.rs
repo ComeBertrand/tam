@@ -2,29 +2,43 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Raw TOML config file shape — all fields optional.
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
+    /// Discovery settings (`[discovery]` section).
     pub discovery: Option<DiscoveryConfig>,
+    /// Worktree settings (`[worktree]` section).
     pub worktree: Option<WorktreeConfig>,
 }
 
+/// TOML `[discovery]` section.
 #[derive(Debug, Deserialize)]
 pub struct DiscoveryConfig {
+    /// Maximum directory depth when scanning for git projects.
     pub max_depth: Option<usize>,
+    /// Glob patterns for directories to skip during discovery.
     pub ignore: Option<Vec<String>>,
 }
 
+/// TOML `[worktree]` section.
 #[derive(Debug, Deserialize)]
 pub struct WorktreeConfig {
+    /// Parent directory where new worktrees are created.
     pub root: Option<String>,
+    /// Whether to run `.worktree-init.toml` after creating a worktree.
     pub auto_init: Option<bool>,
 }
 
+/// Resolved configuration with defaults applied.
 #[derive(Debug)]
 pub struct Config {
+    /// Maximum directory depth when scanning for git projects.
     pub max_depth: usize,
+    /// Glob patterns for directories to skip during discovery.
     pub ignore: Vec<String>,
+    /// Parent directory where new worktrees are created.
     pub worktree_root: PathBuf,
+    /// Whether to run `.worktree-init.toml` after creating a worktree.
     pub auto_init: bool,
 }
 

@@ -17,9 +17,12 @@ struct InitConfig {
     commands: Option<Vec<String>>,
 }
 
+/// Parsed `.worktree-init.toml` configuration for initializing new worktrees.
 #[derive(Debug, Default)]
 pub struct ProjectInit {
+    /// File globs to copy from the main checkout (e.g. `[".env", ".claude/**"]`).
     pub include: Vec<String>,
+    /// Shell commands to run in the new worktree (e.g. `["npm install"]`).
     pub commands: Vec<String>,
 }
 

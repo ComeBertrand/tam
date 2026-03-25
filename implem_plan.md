@@ -321,7 +321,7 @@ Data flow: load ledger → fetch agents from daemon → build task list → subs
 
 ---
 
-## Phase 7 — Polish & Ship [TODO]
+## Phase 7 — Polish & Ship [DONE]
 
 - Fill out README with usage examples, TUI screenshots, install instructions
 - Doc comments on all public API items in tam-worktree

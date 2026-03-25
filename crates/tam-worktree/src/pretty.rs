@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 /// A discovered project with its computed pretty name.
 #[derive(Debug, Clone)]
 pub struct PrettyEntry {
+    /// Absolute path to the project or worktree root.
     pub path: PathBuf,
+    /// Display name with disambiguation suffix (e.g. `"myapp [projects]"`).
     pub display_name: String,
     /// Short name before disambiguation (e.g. "feature" for a worktree, "myapp" for a repo)
     pub base_name: String,

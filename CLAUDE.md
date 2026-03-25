@@ -12,6 +12,22 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 - `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init
 - `tam-cli`      — binary `tam`: CLI, TUI, task ledger, bridges worktrees and agents
 
+Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-proto`.
+`tam-cli` depends on all three.
+
+## Key architecture patterns
+
+- **Task status is always derived** — computed from daemon state + git state +
+  filesystem, never stored. See `task.rs` `GitBranchStatus` + `Task::status()`.
+- **Ledger is append-only JSONL** — `~/.local/share/tam/ledger.jsonl`. Records
+  events (TaskCreated, AgentRunStarted, etc.), never states.
+- **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
+  daemon exits after 30s with no agents and no clients.
+- **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
+  detection, generic/codex use PTY heuristic (5s idle timeout).
+- **Config fallback chain** — tam config -> zinc config -> yawn config, with
+  migration hints printed to stderr on fallback.
+
 ## Build & check
 
 ```bash
@@ -22,8 +38,8 @@ cargo test
 
 ## Testing
 
-- Unit tests are inline in each module
-- Integration tests in `crates/tam-daemon/tests/`
+- Unit tests are inline in each module (~230 across all crates)
+- Integration tests in `crates/tam-daemon/tests/` (19 async tests, real sockets/PTYs)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

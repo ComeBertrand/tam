@@ -3,9 +3,9 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
+use tam_proto::{Request, Response, ServerMessage};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tam_proto::{Request, Response, ServerMessage};
 
 const DETACH_KEY: u8 = 0x1d; // ctrl-]
 
@@ -84,9 +84,7 @@ impl Client {
             }
             Response::Error { .. } => {
                 // Old daemon that doesn't understand Hello — suggest restart
-                anyhow::bail!(
-                    "daemon is running an older version. Run 'tam shutdown' then retry."
-                );
+                anyhow::bail!("daemon is running an older version. Run 'tam shutdown' then retry.");
             }
             _ => Ok(()),
         }

@@ -11,6 +11,48 @@ struct SessionInfo {
     modified: SystemTime,
 }
 
+/// List sessions for a task, cross-referencing ledger runs with filesystem sessions.
+/// Sessions known to this task (from the ledger) are listed first, and only runs
+/// matching the requested provider are considered.
+pub fn list_sessions_for_task(
+    provider: &str,
+    dir: &Path,
+    task_runs: &[crate::ledger::RunInfo],
+) -> Vec<SessionDisplay> {
+    let all = list_sessions(provider, dir);
+
+    // Only consider ledger runs matching this provider, collect session IDs
+    // ordered by most recent run timestamp.
+    let mut matching: Vec<&crate::ledger::RunInfo> = task_runs
+        .iter()
+        .filter(|r| r.provider == provider && r.session_id.is_some())
+        .collect();
+    matching.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    let mut known_ids: Vec<&str> = matching
+        .iter()
+        .filter_map(|r| r.session_id.as_deref())
+        .collect();
+    known_ids.dedup();
+
+    if known_ids.is_empty() {
+        return all;
+    }
+
+    let known_set: std::collections::HashSet<&str> = known_ids.iter().copied().collect();
+
+    let mut known = Vec::new();
+    let mut other = Vec::new();
+    for s in all {
+        if known_set.contains(s.id.as_str()) {
+            known.push(s);
+        } else {
+            other.push(s);
+        }
+    }
+    known.extend(other);
+    known
+}
+
 /// List sessions for a given provider and working directory.
 pub fn list_sessions(provider: &str, dir: &Path) -> Vec<SessionDisplay> {
     let sessions = match provider {

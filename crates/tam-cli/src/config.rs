@@ -394,10 +394,7 @@ fn init_claude_hooks() -> Result<()> {
             .with_context(|| format!("hooks.{event} is not an array"))?;
 
         // Check if tam or zinc hook already exists for this event+matcher
-        if arr
-            .iter()
-            .any(|entry| entry_matches_hook(entry, tam_event))
-        {
+        if arr.iter().any(|entry| entry_matches_hook(entry, tam_event)) {
             skipped.push(format!(
                 "{event}{}",
                 matcher.map(|m| format!("({m})")).unwrap_or_default()

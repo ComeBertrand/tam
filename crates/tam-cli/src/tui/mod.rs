@@ -2,7 +2,7 @@ mod app;
 mod ui;
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,14 +29,37 @@ enum Action {
     Quit,
     SelectNext,
     SelectPrev,
-    Attach { name: String },
-    StopAgent { name: String },
-    DropTask { name: String },
+    Attach {
+        name: String,
+    },
+    StopAgent {
+        name: String,
+    },
+    DropTask {
+        name: String,
+    },
     NewTask,
-    RunAgent { name: String },
-    DoNewTask { name: String, dir: PathBuf, worktree: bool, start_agent: bool },
-    DoRun { name: String, dir: PathBuf, resume_session: Option<String> },
-    CustomCommand { name: String, command: String, task: String, dir: PathBuf, provider: String },
+    RunAgent {
+        name: String,
+    },
+    DoNewTask {
+        name: String,
+        dir: PathBuf,
+        worktree: bool,
+        start_agent: bool,
+    },
+    DoRun {
+        name: String,
+        dir: PathBuf,
+        resume_session: Option<String>,
+    },
+    CustomCommand {
+        name: String,
+        command: String,
+        task: String,
+        dir: PathBuf,
+        provider: String,
+    },
     TogglePeek,
     RefreshPeek,
 }
@@ -108,6 +131,8 @@ async fn run_loop(
     let (mut ct_rx, ct_active) = spawn_crossterm_reader();
     let mut peek_timer = tokio::time::interval(Duration::from_secs(2));
     peek_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut git_timer = tokio::time::interval(Duration::from_secs(30));
+    git_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
@@ -128,7 +153,11 @@ async fn run_loop(
                 }
                 Action::None
             }
-            _ = peek_timer.tick(), if app.peek.is_some() => Action::RefreshPeek
+            _ = peek_timer.tick(), if app.peek.is_some() => Action::RefreshPeek,
+            _ = git_timer.tick() => {
+                app.refresh_git_status();
+                Action::None
+            }
         };
 
         match action {
@@ -172,20 +201,33 @@ async fn run_loop(
             Action::RunAgent { name } => {
                 start_run_flow(app, config, &name);
             }
-            Action::DoNewTask { name, dir, worktree, start_agent } => {
+            Action::DoNewTask {
+                name,
+                dir,
+                worktree,
+                start_agent,
+            } => {
                 do_new_task(client, app, &name, &dir, worktree, start_agent, config).await?;
                 app.set_tasks(build_task_list(client).await?);
             }
-            Action::DoRun { name, dir, resume_session } => {
+            Action::DoRun {
+                name,
+                dir,
+                resume_session,
+            } => {
                 do_run(client, app, config, &name, &dir, resume_session).await?;
                 app.set_tasks(build_task_list(client).await?);
             }
-            Action::CustomCommand { name, command, task, dir, provider } => {
-                match config::run_custom_command(&command, &task, &dir, &provider) {
-                    Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
-                    Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
-                }
-            }
+            Action::CustomCommand {
+                name,
+                command,
+                task,
+                dir,
+                provider,
+            } => match config::run_custom_command(&command, &task, &dir, &provider) {
+                Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
+                Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
+            },
             Action::TogglePeek => {
                 if app.peek.is_some() {
                     app.peek = None;
@@ -226,7 +268,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Enter, _) => {
             if let Some(task) = app.selected_task() {
                 if task.agent_info.is_some() {
-                    Action::Attach { name: task.name.clone() }
+                    Action::Attach {
+                        name: task.name.clone(),
+                    }
                 } else {
                     Action::None
                 }
@@ -242,7 +286,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('r'), _) => {
             if let Some(task) = app.selected_task() {
                 if task.agent_info.is_none() {
-                    Action::RunAgent { name: task.name.clone() }
+                    Action::RunAgent {
+                        name: task.name.clone(),
+                    }
                 } else {
                     Action::None
                 }
@@ -253,7 +299,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('s'), _) => {
             if let Some(task) = app.selected_task() {
                 if task.agent_info.is_some() {
-                    Action::StopAgent { name: task.name.clone() }
+                    Action::StopAgent {
+                        name: task.name.clone(),
+                    }
                 } else {
                     Action::None
                 }
@@ -264,7 +312,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('p'), _) => Action::TogglePeek,
         (KeyCode::Char('d'), _) => {
             if let Some(task) = app.selected_task() {
-                Action::DropTask { name: task.name.clone() }
+                Action::DropTask {
+                    name: task.name.clone(),
+                }
             } else {
                 Action::None
             }
@@ -272,7 +322,11 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char(c), _) => {
             if let Some(cmd) = config.commands.iter().find(|cmd| cmd.key_char() == c) {
                 if let Some(task) = app.selected_task() {
-                    let provider = task.agent_info.as_ref().map(|a| a.provider.clone()).unwrap_or_default();
+                    let provider = task
+                        .agent_info
+                        .as_ref()
+                        .map(|a| a.provider.clone())
+                        .unwrap_or_default();
                     Action::CustomCommand {
                         name: cmd.name.clone(),
                         command: cmd.command.clone(),
@@ -393,7 +447,12 @@ fn handle_new_task_name_key(key: KeyEvent, app: &mut App) -> Action {
                 return Action::None;
             }
             app.mode = Mode::Normal;
-            Action::DoNewTask { name, dir, worktree, start_agent }
+            Action::DoNewTask {
+                name,
+                dir,
+                worktree,
+                start_agent,
+            }
         }
         (KeyCode::Backspace, _) => {
             if let Mode::NewTaskEnterName { ref mut name, .. } = app.mode {
@@ -508,7 +567,10 @@ fn start_run_flow(app: &mut App, config: &Config, task_name: &str) {
         None => return,
     };
 
-    let found = sessions::list_sessions(&config.default_agent, &task.dir);
+    let runs = Ledger::load()
+        .map(|l| l.task_runs(task_name))
+        .unwrap_or_default();
+    let found = sessions::list_sessions_for_task(&config.default_agent, &task.dir, &runs);
     if found.is_empty() {
         // No sessions, will spawn directly via Action
         return; // Caller handles this
@@ -658,7 +720,7 @@ async fn do_new_task(
     client: &mut Client,
     app: &mut App,
     name: &str,
-    dir: &PathBuf,
+    dir: &Path,
     worktree: bool,
     start_agent: bool,
     config: &Config,
@@ -666,7 +728,10 @@ async fn do_new_task(
     let mut ledger = Ledger::load()?;
 
     if ledger.task_exists(name) {
-        app.set_status(format!("Task '{}' already exists", name), Duration::from_secs(3));
+        app.set_status(
+            format!("Task '{}' already exists", name),
+            Duration::from_secs(3),
+        );
         return Ok(());
     }
 
@@ -685,7 +750,7 @@ async fn do_new_task(
             }
         }
     } else {
-        dir.clone()
+        dir.to_path_buf()
     };
 
     ledger.append(LedgerEvent::TaskCreated {
@@ -733,7 +798,7 @@ async fn do_run(
     app: &mut App,
     config: &Config,
     name: &str,
-    dir: &PathBuf,
+    dir: &Path,
     resume_session: Option<String>,
 ) -> Result<()> {
     let mut ledger = Ledger::load()?;
@@ -741,7 +806,7 @@ async fn do_run(
     let resp = client
         .send(tam_proto::Request::Spawn {
             provider: config.default_agent.clone(),
-            dir: dir.clone(),
+            dir: dir.to_path_buf(),
             id: Some(name.into()),
             args: vec![],
             resume_session: resume_session.clone(),
@@ -881,13 +946,19 @@ async fn build_task_list(client: &mut Client) -> Result<Vec<Task>> {
 
     let agents = fetch_agents(client).await.unwrap_or_default();
 
-    let tasks = snapshots
+    let mut tasks: Vec<Task> = snapshots
         .into_iter()
         .map(|s| {
             let agent_info = agents.iter().find(|a| a.id == s.name).cloned();
             Task::from_snapshot(s, agent_info)
         })
         .collect();
+
+    for t in &mut tasks {
+        if t.owned && t.agent_info.is_none() {
+            t.git_branch_status = crate::task::check_git_branch_status(&t.name, &t.dir);
+        }
+    }
 
     Ok(tasks)
 }

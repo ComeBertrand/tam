@@ -30,10 +30,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         render_tasks(frame, table_area, app);
 
-        let task_name = app
-            .selected_task()
-            .map(|t| t.name.as_str())
-            .unwrap_or("—");
+        let task_name = app.selected_task().map(|t| t.name.as_str()).unwrap_or("—");
         let content = app.peek.as_deref().unwrap_or("");
         render_preview(frame, preview_area, task_name, content);
 
@@ -198,9 +195,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
         let hints = match app.mode {
             Mode::Normal => {
                 let selected = app.selected_task();
-                let has_agent = selected
-                    .map(|t| t.agent_info.is_some())
-                    .unwrap_or(false);
+                let has_agent = selected.map(|t| t.agent_info.is_some()).unwrap_or(false);
 
                 let mut hints = Vec::new();
                 if has_agent {
@@ -211,10 +206,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                         Span::raw(":stop  "),
                     ]);
                 } else if selected.is_some() {
-                    hints.extend([
-                        Span::styled(" r", Style::new().bold()),
-                        Span::raw(":run  "),
-                    ]);
+                    hints.extend([Span::styled(" r", Style::new().bold()), Span::raw(":run  ")]);
                 }
                 hints.extend([
                     Span::styled("n", Style::new().bold()),

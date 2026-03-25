@@ -1,8 +1,8 @@
 use std::process::Command;
 
 use serde::Deserialize;
-use tracing::{error, info};
 use tam_proto::AgentState;
+use tracing::{error, info};
 
 /// Notification configuration from config.toml.
 #[derive(Debug, Clone)]

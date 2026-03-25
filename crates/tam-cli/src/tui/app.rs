@@ -218,6 +218,17 @@ impl App {
         self.status.as_ref().map(|(msg, _)| msg.as_str())
     }
 
+    /// Refresh git branch status for owned idle tasks and re-sort.
+    pub fn refresh_git_status(&mut self) {
+        for t in &mut self.tasks {
+            if t.owned && t.agent_info.is_none() {
+                t.git_branch_status = crate::task::check_git_branch_status(&t.name, &t.dir);
+            }
+        }
+        self.sort_tasks();
+        self.clamp_selection();
+    }
+
     /// Count tasks needing attention (input or blocked).
     pub fn needs_attention_count(&self) -> usize {
         self.tasks

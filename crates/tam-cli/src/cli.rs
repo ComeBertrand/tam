@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "tam", about = "Terminal agent multiplexer — manage units of work, not just processes")]
+#[command(
+    name = "tam",
+    about = "Terminal agent multiplexer — manage units of work, not just processes"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,

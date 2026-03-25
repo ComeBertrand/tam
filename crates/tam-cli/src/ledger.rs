@@ -83,6 +83,7 @@ impl Ledger {
     }
 
     /// Load from a specific path (for testing).
+    #[cfg(test)]
     pub fn load_from(path: PathBuf) -> Result<Self> {
         let events = if path.exists() {
             Self::read_events(&path)?
@@ -327,12 +328,8 @@ mod tests {
             })
             .unwrap();
 
-        assert!(ledger
-            .find_task_by_dir(Path::new("/tmp/feat"))
-            .is_some());
-        assert!(ledger
-            .find_task_by_dir(Path::new("/tmp/other"))
-            .is_none());
+        assert!(ledger.find_task_by_dir(Path::new("/tmp/feat")).is_some());
+        assert!(ledger.find_task_by_dir(Path::new("/tmp/other")).is_none());
     }
 
     #[test]

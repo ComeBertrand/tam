@@ -31,9 +31,7 @@ pub fn load_project_config(repo_root: &Path) -> Result<ProjectInit> {
     let config_path = if primary.exists() {
         primary
     } else if fallback.exists() {
-        eprintln!(
-            "note: using .yawn.toml — consider renaming to .worktree-init.toml"
-        );
+        eprintln!("note: using .yawn.toml — consider renaming to .worktree-init.toml");
         fallback
     } else {
         return Ok(ProjectInit::default());

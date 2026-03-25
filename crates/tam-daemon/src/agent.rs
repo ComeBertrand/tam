@@ -11,9 +11,9 @@ use anyhow::{Context, Result};
 use nix::pty::openpty;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use tam_proto::{AgentInfo, AgentState};
 use tokio::sync::broadcast;
 use tracing::error;
-use tam_proto::{AgentInfo, AgentState};
 
 use crate::provider::Provider;
 use crate::scrollback::ScrollbackBuffer;

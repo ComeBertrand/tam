@@ -1,8 +1,21 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tam_proto::{AgentInfo, AgentState};
 
 use crate::ledger::TaskSnapshot;
+
+/// Git branch state for an owned task, populated by callers before status().
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GitBranchStatus {
+    #[default]
+    Unknown,
+    /// Branch exists, not merged
+    Active,
+    /// Branch is merged into default branch
+    Merged,
+    /// Local branch does not exist (deleted externally)
+    BranchGone,
+}
 
 /// Computed task status — always derived, never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +87,7 @@ pub struct Task {
     pub agent_info: Option<AgentInfo>,
     pub run_count: usize,
     pub last_activity: Option<u64>,
+    pub git_branch_status: GitBranchStatus,
 }
 
 impl Task {
@@ -86,10 +100,11 @@ impl Task {
             agent_info,
             run_count: snapshot.run_count,
             last_activity: snapshot.last_activity,
+            git_branch_status: GitBranchStatus::Unknown,
         }
     }
 
-    /// Compute the current status from daemon state + filesystem.
+    /// Compute the current status from daemon state + git branch state.
     pub fn status(&self) -> TaskStatus {
         if let Some(ref info) = self.agent_info {
             return match info.state {
@@ -100,16 +115,45 @@ impl Task {
             };
         }
 
-        // No agent running — check filesystem state for owned tasks
+        // No agent running — check filesystem and git state for owned tasks
         if self.owned {
             if !self.dir.exists() {
                 return TaskStatus::Gone;
             }
-            // Check if branch is merged (would need git call, defer to caller)
-            // For now, return Idle — merged/orphan detection happens at a higher level
+            match self.git_branch_status {
+                GitBranchStatus::Merged => return TaskStatus::Merged,
+                GitBranchStatus::BranchGone => return TaskStatus::Orphan,
+                _ => {}
+            }
         }
 
         TaskStatus::Idle
+    }
+}
+
+/// Query git to determine branch status for an owned task.
+/// Returns Unknown if git operations fail (graceful degradation).
+pub fn check_git_branch_status(task_name: &str, task_dir: &Path) -> GitBranchStatus {
+    let root = match tam_worktree::git::repo_root(task_dir) {
+        Ok(r) => r,
+        Err(_) => return GitBranchStatus::Unknown,
+    };
+
+    match tam_worktree::git::local_branch_exists(&root, task_name) {
+        Ok(false) => return GitBranchStatus::BranchGone,
+        Err(_) => return GitBranchStatus::Unknown,
+        Ok(true) => {}
+    }
+
+    let default = match tam_worktree::git::default_branch(&root) {
+        Ok(d) => d,
+        Err(_) => return GitBranchStatus::Unknown,
+    };
+
+    match tam_worktree::git::is_branch_merged(&root, task_name, &default) {
+        Ok(true) => GitBranchStatus::Merged,
+        Ok(false) => GitBranchStatus::Active,
+        Err(_) => GitBranchStatus::Unknown,
     }
 }
 
@@ -190,6 +234,56 @@ mod tests {
         snapshot.dir = PathBuf::from("/nonexistent/path/that/doesnt/exist");
         let task = Task::from_snapshot(snapshot, None);
         assert_eq!(task.status(), TaskStatus::Gone);
+    }
+
+    #[test]
+    fn merged_when_branch_merged() {
+        let mut task = Task::from_snapshot(test_snapshot(), None);
+        task.git_branch_status = GitBranchStatus::Merged;
+        assert_eq!(task.status(), TaskStatus::Merged);
+    }
+
+    #[test]
+    fn orphan_when_branch_gone() {
+        let mut task = Task::from_snapshot(test_snapshot(), None);
+        task.git_branch_status = GitBranchStatus::BranchGone;
+        assert_eq!(task.status(), TaskStatus::Orphan);
+    }
+
+    #[test]
+    fn idle_when_branch_active() {
+        let mut task = Task::from_snapshot(test_snapshot(), None);
+        task.git_branch_status = GitBranchStatus::Active;
+        assert_eq!(task.status(), TaskStatus::Idle);
+    }
+
+    #[test]
+    fn borrowed_task_ignores_git_status() {
+        let mut snapshot = test_snapshot();
+        snapshot.owned = false;
+        let mut task = Task::from_snapshot(snapshot, None);
+        task.git_branch_status = GitBranchStatus::Merged;
+        // Borrowed tasks stay Idle regardless of git state
+        assert_eq!(task.status(), TaskStatus::Idle);
+    }
+
+    #[test]
+    fn agent_state_overrides_git_status() {
+        let info = AgentInfo {
+            id: "feat".into(),
+            provider: "claude".into(),
+            dir: PathBuf::from("/tmp/feat"),
+            state: AgentState::Working,
+            pid: Some(1234),
+            uptime_secs: 60,
+            viewers: 0,
+            context_percent: None,
+            task: Some("feat".into()),
+        };
+        let mut task = Task::from_snapshot(test_snapshot(), Some(info));
+        task.git_branch_status = GitBranchStatus::Merged;
+        // Agent running takes priority over git state
+        assert_eq!(task.status(), TaskStatus::Run);
     }
 
     #[test]

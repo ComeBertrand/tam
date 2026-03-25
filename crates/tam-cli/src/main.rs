@@ -62,10 +62,7 @@ async fn main() -> Result<()> {
                 let cwd = std::fs::canonicalize(".")?;
 
                 if let Some(existing) = ledger.find_task_by_dir(&cwd) {
-                    anyhow::bail!(
-                        "directory already has an active task: '{}'",
-                        existing.name
-                    );
+                    anyhow::bail!("directory already has an active task: '{}'", existing.name);
                 }
 
                 ledger.append(LedgerEvent::TaskCreated {
@@ -94,11 +91,12 @@ async fn main() -> Result<()> {
             let agent = agent.unwrap_or_else(|| config.default_agent.clone());
             config::validate_provider(&agent)?;
 
-            // Resolve session
+            // Resolve session — cross-reference ledger runs with filesystem sessions
             let resume_session = if new_session || !std::io::stdin().is_terminal() {
                 None
             } else {
-                let found = sessions::list_sessions(&agent, &task.dir);
+                let runs = ledger.task_runs(&name);
+                let found = sessions::list_sessions_for_task(&agent, &task.dir, &runs);
                 if found.is_empty() {
                     None
                 } else {
@@ -220,23 +218,12 @@ async fn main() -> Result<()> {
                 if !task.owned {
                     continue;
                 }
-                // Check if branch is merged
                 if let Ok(root) = tam_worktree::git::repo_root(&task.dir) {
                     if let Ok(default) = tam_worktree::git::default_branch(&root) {
-                        // Check if the task's branch (= name) is merged into the default branch
-                        let check = std::process::Command::new("git")
-                            .args(["branch", "--merged", &default])
-                            .current_dir(&root)
-                            .output();
-                        if let Ok(output) = check {
-                            let merged_branches =
-                                String::from_utf8_lossy(&output.stdout).to_string();
-                            let is_merged = merged_branches
-                                .lines()
-                                .any(|line| line.trim().trim_start_matches("* ") == task.name);
-                            if is_merged {
-                                dropped.push(task.name.clone());
-                            }
+                        if tam_worktree::git::is_branch_merged(&root, &task.name, &default)
+                            .unwrap_or(false)
+                        {
+                            dropped.push(task.name.clone());
                         }
                     }
                 }
@@ -294,6 +281,13 @@ async fn main() -> Result<()> {
                 })
                 .collect();
 
+            // Populate git branch status for owned tasks without a running agent
+            for t in &mut tasks {
+                if t.owned && t.agent_info.is_none() {
+                    t.git_branch_status = task::check_git_branch_status(&t.name, &t.dir);
+                }
+            }
+
             tasks.sort_by_key(|t| (t.status().sort_priority(), t.name.clone()));
 
             if json {
@@ -307,6 +301,8 @@ async fn main() -> Result<()> {
                             "owned": t.owned,
                             "agent": t.agent_info.as_ref().map(|a| &a.provider),
                             "context_percent": t.agent_info.as_ref().and_then(|a| a.context_percent),
+                            "run_count": t.run_count,
+                            "last_activity": t.last_activity,
                         })
                     })
                     .collect();
@@ -315,8 +311,8 @@ async fn main() -> Result<()> {
                 println!("No tasks.");
             } else {
                 println!(
-                    "{:<12} {:<15} {:<10} {:<40} {:>5}",
-                    "STATUS", "TASK", "AGENT", "DIR", "CTX"
+                    "{:<12} {:<15} {:<10} {:>5} {:>5} {:<30} {:>5}",
+                    "STATUS", "TASK", "AGENT", "RUNS", "LAST", "DIR", "CTX"
                 );
                 for t in &tasks {
                     let dir = shorten_home(&t.dir.display().to_string());
@@ -332,10 +328,12 @@ async fn main() -> Result<()> {
                         .map(|p| format!("{}%", p))
                         .unwrap_or_else(|| "-".into());
                     println!(
-                        "{:<12} {:<15} {:<10} {:<40} {:>5}",
+                        "{:<12} {:<15} {:<10} {:>5} {:>5} {:<30} {:>5}",
                         t.status().indicator(),
                         t.name,
                         agent,
+                        t.run_count,
+                        format_age(t.last_activity),
                         dir,
                         ctx,
                     );
@@ -485,6 +483,23 @@ fn resolve_task_name(name: Option<String>, ledger: &Ledger) -> Result<String> {
     match ledger.find_task_by_dir(&cwd) {
         Some(task) => Ok(task.name),
         None => anyhow::bail!("no task in current directory"),
+    }
+}
+
+fn format_age(timestamp: Option<u64>) -> String {
+    let Some(ts) = timestamp else {
+        return "-".into();
+    };
+    let now = ledger::now();
+    let elapsed = now.saturating_sub(ts);
+    if elapsed < 60 {
+        "now".into()
+    } else if elapsed < 3600 {
+        format!("{}m", elapsed / 60)
+    } else if elapsed < 86400 {
+        format!("{}h", elapsed / 3600)
+    } else {
+        format!("{}d", elapsed / 86400)
     }
 }
 

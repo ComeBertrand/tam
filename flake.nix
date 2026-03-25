@@ -15,9 +15,10 @@
           nativeBuildInputs = [ pkgs.installShellFiles ];
           nativeCheckInputs = [ pkgs.git ];
           postInstall = ''
-            installShellCompletion --bash completions/tam.bash
-            installShellCompletion --zsh --name _tam completions/tam.zsh
-            installShellCompletion --fish completions/tam.fish
+            installShellCompletion --bash target/*/build/tam-cli-*/out/completions/tam.bash
+            installShellCompletion --zsh --name _tam target/*/build/tam-cli-*/out/completions/_tam
+            installShellCompletion --fish target/*/build/tam-cli-*/out/completions/tam.fish
+            installManPage target/*/build/tam-cli-*/out/man/tam.1
           '';
         };
       }

@@ -1,0 +1,2 @@
+[init]
+include = [".envrc", "shell.nix"]

@@ -292,7 +292,7 @@ Data flow: load ledger → fetch agents from daemon → build task list → subs
 
 ---
 
-## Phase 6 — Integration & Testing [TODO]
+## Phase 6 — Integration & Testing [DONE]
 
 ### 6.1 Test migration
 - Daemon integration tests from zinc → tam-daemon (rename imports)

@@ -103,6 +103,11 @@ pub fn load_config() -> Result<Config> {
         let content = std::fs::read_to_string(&tam_config)?;
         parse_config(&content)
     } else if yawn_config.exists() {
+        eprintln!(
+            "note: using yawn config at {} — consider copying to {}",
+            yawn_config.display(),
+            tam_config.display()
+        );
         let content = std::fs::read_to_string(&yawn_config)?;
         parse_config(&content)
     } else {

@@ -38,6 +38,11 @@ pub fn load_notify_config() -> Option<NotifyConfig> {
     let config_path = if tam_path.exists() {
         tam_path
     } else if zinc_path.exists() {
+        info!(
+            "using zinc notify config at {} — consider copying to {}",
+            zinc_path.display(),
+            tam_path.display()
+        );
         zinc_path
     } else {
         return None;

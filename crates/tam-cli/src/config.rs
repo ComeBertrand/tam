@@ -122,6 +122,11 @@ pub fn load_config() -> Result<Config> {
         let content = std::fs::read_to_string(&tam_path)?;
         parse_config(&content)
     } else if zinc_path.exists() {
+        eprintln!(
+            "note: using zinc config at {} — consider copying to {}",
+            zinc_path.display(),
+            tam_path.display()
+        );
         let content = std::fs::read_to_string(&zinc_path)?;
         parse_config(&content)
     } else {

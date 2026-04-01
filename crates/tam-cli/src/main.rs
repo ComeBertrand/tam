@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
             name,
             worktree,
             source,
+            no_start,
         } => {
             let mut ledger = Ledger::load()?;
 
@@ -38,7 +39,7 @@ async fn main() -> Result<()> {
 
             let worktree = worktree || source.is_some();
 
-            if worktree {
+            let task_dir = if worktree {
                 // Owned context: create a worktree
                 let wt_config = tam_worktree::config::load_config()?;
                 let cwd = std::fs::canonicalize(".")?;
@@ -57,6 +58,7 @@ async fn main() -> Result<()> {
                 })?;
 
                 println!("Created task '{}' at {}", name, wt_path.display());
+                wt_path
             } else {
                 // Borrowed context: bind to cwd
                 let cwd = std::fs::canonicalize(".")?;
@@ -73,6 +75,41 @@ async fn main() -> Result<()> {
                 })?;
 
                 println!("Created task '{}' in {}", name, cwd.display());
+                cwd
+            };
+
+            if !no_start {
+                let mut client = client::Client::connect().await?;
+                let resp = client
+                    .send(tam_proto::Request::Spawn {
+                        provider: config.default_agent.clone(),
+                        dir: task_dir,
+                        id: Some(name.clone()),
+                        args: vec![],
+                        resume_session: None,
+                        prompt: None,
+                    })
+                    .await?;
+
+                match resp {
+                    tam_proto::Response::Spawned { id } => {
+                        ledger.append(LedgerEvent::AgentRunStarted {
+                            task: name.clone(),
+                            provider: config.default_agent.clone(),
+                            session_id: None,
+                            timestamp: ledger::now(),
+                        })?;
+
+                        // Attach immediately
+                        let client = client::Client::connect().await?;
+                        client.attach(&id).await?;
+                    }
+                    tam_proto::Response::Error { message } => {
+                        eprintln!("Error: {}", message);
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
             }
         }
 

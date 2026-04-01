@@ -13,7 +13,6 @@ pub enum Mode {
         project_dir: PathBuf,
         name: String,
         create_worktree: bool,
-        start_agent: bool,
     },
     RunPickSession {
         task_name: String,

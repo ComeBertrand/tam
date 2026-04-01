@@ -14,7 +14,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Create a new task
+    /// Create a new task and start an agent
     New {
         /// Task name (used as branch name for owned worktrees)
         name: String,
@@ -26,6 +26,10 @@ pub enum Commands {
         /// Branch from a specific ref (implies -w)
         #[arg(short, long)]
         source: Option<String>,
+
+        /// Don't start an agent after creating the task
+        #[arg(long)]
+        no_start: bool,
     },
 
     /// Start or resume an agent in a task

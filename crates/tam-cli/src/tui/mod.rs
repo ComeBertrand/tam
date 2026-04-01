@@ -46,7 +46,6 @@ enum Action {
         name: String,
         dir: PathBuf,
         worktree: bool,
-        start_agent: bool,
     },
     DoRun {
         name: String,
@@ -213,9 +212,8 @@ async fn run_loop(
                 name,
                 dir,
                 worktree,
-                start_agent,
             } => {
-                do_new_task(client, app, &name, &dir, worktree, start_agent, config).await?;
+                do_new_task(client, app, &name, &dir, worktree, config).await?;
                 app.set_tasks(build_task_list(client).await?);
             }
             Action::DoRun {
@@ -420,35 +418,21 @@ fn handle_new_task_name_key(key: KeyEvent, app: &mut App) -> Action {
         (KeyCode::Tab, _) => {
             if let Mode::NewTaskEnterName {
                 ref mut create_worktree,
-                ref mut start_agent,
                 ..
             } = app.mode
             {
-                // Cycle through toggles
-                if !*create_worktree {
-                    *create_worktree = true;
-                } else if !*start_agent {
-                    *start_agent = true;
-                } else {
-                    *create_worktree = false;
-                    *start_agent = false;
-                }
+                *create_worktree = !*create_worktree;
             }
             Action::None
         }
         (KeyCode::Enter, _) => {
-            let (name, dir, worktree, start_agent) = match &app.mode {
+            let (name, dir, worktree) = match &app.mode {
                 Mode::NewTaskEnterName {
                     name,
                     project_dir,
                     create_worktree,
-                    start_agent,
-                } => (
-                    name.clone(),
-                    project_dir.clone(),
-                    *create_worktree,
-                    *start_agent,
-                ),
+                    ..
+                } => (name.clone(), project_dir.clone(), *create_worktree),
                 _ => return Action::None,
             };
             if name.is_empty() {
@@ -459,7 +443,6 @@ fn handle_new_task_name_key(key: KeyEvent, app: &mut App) -> Action {
                 name,
                 dir,
                 worktree,
-                start_agent,
             }
         }
         (KeyCode::Backspace, _) => {
@@ -499,8 +482,7 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
             app.mode = Mode::NewTaskEnterName {
                 project_dir: dir,
                 name: String::new(),
-                create_worktree: false,
-                start_agent: false,
+                create_worktree: true,
             };
             Action::None
         }
@@ -634,8 +616,7 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
                     app.mode = Mode::NewTaskEnterName {
                         project_dir: dir,
                         name: String::new(),
-                        create_worktree: false,
-                        start_agent: false,
+                        create_worktree: true,
                     };
                     Action::None
                 }
@@ -708,7 +689,6 @@ async fn do_new_task(
     name: &str,
     dir: &Path,
     worktree: bool,
-    start_agent: bool,
     config: &Config,
 ) -> Result<()> {
     let mut ledger = Ledger::load()?;
@@ -746,34 +726,30 @@ async fn do_new_task(
         timestamp: crate::ledger::now(),
     })?;
 
-    app.set_status(format!("Created task '{name}'"), Duration::from_secs(3));
-
-    if start_agent {
-        let resp = client
-            .send(tam_proto::Request::Spawn {
+    let resp = client
+        .send(tam_proto::Request::Spawn {
+            provider: config.default_agent.clone(),
+            dir: task_dir,
+            id: Some(name.into()),
+            args: vec![],
+            resume_session: None,
+            prompt: None,
+        })
+        .await?;
+    match resp {
+        tam_proto::Response::Spawned { id } => {
+            ledger.append(LedgerEvent::AgentRunStarted {
+                task: name.into(),
                 provider: config.default_agent.clone(),
-                dir: task_dir,
-                id: Some(name.into()),
-                args: vec![],
-                resume_session: None,
-                prompt: None,
-            })
-            .await?;
-        match resp {
-            tam_proto::Response::Spawned { id } => {
-                ledger.append(LedgerEvent::AgentRunStarted {
-                    task: name.into(),
-                    provider: config.default_agent.clone(),
-                    session_id: None,
-                    timestamp: crate::ledger::now(),
-                })?;
-                app.set_status(format!("Started agent in '{id}'"), Duration::from_secs(3));
-            }
-            tam_proto::Response::Error { message } => {
-                app.set_status(format!("Spawn error: {message}"), Duration::from_secs(5));
-            }
-            _ => {}
+                session_id: None,
+                timestamp: crate::ledger::now(),
+            })?;
+            app.set_status(format!("Created+started '{id}'"), Duration::from_secs(3));
         }
+        tam_proto::Response::Error { message } => {
+            app.set_status(format!("Spawn error: {message}"), Duration::from_secs(5));
+        }
+        _ => {}
     }
 
     Ok(())

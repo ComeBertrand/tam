@@ -62,10 +62,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::NewTaskEnterName {
             name,
             create_worktree,
-            start_agent,
             ..
         } => {
-            render_new_task_popup(frame, name, *create_worktree, *start_agent);
+            render_new_task_popup(frame, name, *create_worktree);
         }
         Mode::SpawnEnterPath(path) => {
             render_enter_path_popup(frame, path);
@@ -372,7 +371,7 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
     frame.render_widget(List::new(items), list_area);
 }
 
-fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool, start_agent: bool) {
+fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool) {
     let area = centered_rect(50, 30, frame.area());
     frame.render_widget(Clear, area);
 
@@ -384,8 +383,7 @@ fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool, s
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [name_area, _, wt_area, agent_area] = Layout::vertical([
-        Constraint::Length(1),
+    let [name_area, _, wt_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -402,10 +400,6 @@ fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool, s
     let wt_check = if create_worktree { "x" } else { " " };
     let wt_line = Line::from(format!("  [{wt_check}] Create worktree"));
     frame.render_widget(wt_line, wt_area);
-
-    let agent_check = if start_agent { "x" } else { " " };
-    let agent_line = Line::from(format!("  [{agent_check}] Start agent immediately"));
-    frame.render_widget(agent_line, agent_area);
 }
 
 fn render_enter_path_popup(frame: &mut Frame, path: &str) {

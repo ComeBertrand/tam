@@ -1,6 +1,7 @@
 # TAM — Terminal Agent Multiplexer
 
 [![CI](https://github.com/ComeBertrand/tam/actions/workflows/ci.yml/badge.svg)](https://github.com/ComeBertrand/tam/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/tam-cli.svg)](https://crates.io/crates/tam-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > Manage units of work, not just processes.

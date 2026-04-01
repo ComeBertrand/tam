@@ -30,8 +30,8 @@ pub enum Commands {
 
     /// Start or resume an agent in a task
     Run {
-        /// Task name
-        name: String,
+        /// Task name (resolved from current directory if omitted)
+        name: Option<String>,
 
         /// Skip session picker, always start a new session
         #[arg(long)]

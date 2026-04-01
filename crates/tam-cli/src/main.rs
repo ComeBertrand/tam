@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
             args,
         } => {
             let mut ledger = Ledger::load()?;
+            let name = resolve_task_name(name, &ledger)?;
             let task = ledger
                 .find_task(&name)
                 .ok_or_else(|| anyhow::anyhow!("task '{}' not found", name))?;

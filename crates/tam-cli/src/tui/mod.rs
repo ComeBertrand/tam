@@ -199,7 +199,15 @@ async fn run_loop(
                 start_new_task_flow(app, config);
             }
             Action::RunAgent { name } => {
-                start_run_flow(app, config, &name);
+                if let Some(Action::DoRun {
+                    name,
+                    dir,
+                    resume_session,
+                }) = start_run_flow(app, config, &name)
+                {
+                    do_run(client, app, config, &name, &dir, resume_session).await?;
+                    app.set_tasks(build_task_list(client).await?);
+                }
             }
             Action::DoNewTask {
                 name,
@@ -561,19 +569,19 @@ fn start_new_task_flow(app: &mut App, _config: &Config) {
     app.mode = Mode::NewTaskPickProject(PickerState::new("Pick project", items));
 }
 
-fn start_run_flow(app: &mut App, config: &Config, task_name: &str) {
-    let task = match app.tasks.iter().find(|t| t.name == task_name) {
-        Some(t) => t,
-        None => return,
-    };
+fn start_run_flow(app: &mut App, config: &Config, task_name: &str) -> Option<Action> {
+    let task = app.tasks.iter().find(|t| t.name == task_name)?;
 
     let runs = Ledger::load()
         .map(|l| l.task_runs(task_name))
         .unwrap_or_default();
     let found = sessions::list_sessions_for_task(&config.default_agent, &task.dir, &runs);
     if found.is_empty() {
-        // No sessions, will spawn directly via Action
-        return; // Caller handles this
+        return Some(Action::DoRun {
+            name: task_name.to_string(),
+            dir: task.dir.clone(),
+            resume_session: None,
+        });
     }
 
     let mut items = vec![PickerItem {
@@ -591,6 +599,7 @@ fn start_run_flow(app: &mut App, config: &Config, task_name: &str) {
         task_name: task_name.to_string(),
         picker: PickerState::new("Pick session", items),
     };
+    None
 }
 
 fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {

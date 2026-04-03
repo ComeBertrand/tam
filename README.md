@@ -34,7 +34,7 @@ tam
 - **Owned**: TAM creates a git worktree for the task. The task name becomes the branch name. `tam drop` cleans up both.
 - **Borrowed**: TAM tracks agents in an existing directory without touching the filesystem.
 
-**Status is always derived**, never stored. TAM checks the daemon (is an agent running?), the filesystem (does the worktree exist?), and git (is the branch merged?) every time you look.
+**Status is always derived**, never stored. TAM checks the daemon (is an agent running?), the filesystem (does the worktree exist?), git (does the branch exist?), and activity timestamps (is the task stale?) every time you look.
 
 ## Commands
 
@@ -56,9 +56,6 @@ tam attach                     Resolve from current directory
 
 tam drop NAME                  Kill agent + remove task (+ delete worktree if owned)
 tam drop NAME -b               Also delete the git branch
-
-tam gc                         Drop all tasks whose branch is merged
-tam gc --dry-run               Preview what would be dropped
 ```
 
 ### Observing
@@ -85,7 +82,7 @@ Running `tam` with no arguments opens the dashboard:
 │  ● run    feat          claude   ~/wt/myapp--feat         34%    │
 │▸ ▲ input  fix-nav       claude   ~/wt/myapp--fix-nav      67%    │
 │  ○ idle   refactor      -        ~/wt/myapp--refac        -      │
-│  ✓ merged old-thing     -        ~/wt/myapp--old          -      │
+│  ◌ stale  old-thing     -        ~/wt/myapp--old          -      │
 ├──────────────────────────────────────────────────────────────────┤
 │  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit     │
 └──────────────────────────────────────────────────────────────────┘

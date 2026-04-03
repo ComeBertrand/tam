@@ -31,22 +31,11 @@ struct NotifySection {
 pub fn load_notify_config() -> Option<NotifyConfig> {
     let config_dir = dirs::config_dir()?;
 
-    // Try tam config first, fall back to zinc config
-    let tam_path = config_dir.join("tam").join("config.toml");
-    let zinc_path = config_dir.join("zinc").join("config.toml");
+    let config_path = config_dir.join("tam").join("config.toml");
 
-    let config_path = if tam_path.exists() {
-        tam_path
-    } else if zinc_path.exists() {
-        info!(
-            "using zinc notify config at {} — consider copying to {}",
-            zinc_path.display(),
-            tam_path.display()
-        );
-        zinc_path
-    } else {
+    if !config_path.exists() {
         return None;
-    };
+    }
 
     let content = std::fs::read_to_string(&config_path).ok()?;
     let file: ConfigFile = toml::from_str(&content).ok()?;

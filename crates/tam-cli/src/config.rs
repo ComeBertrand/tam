@@ -105,18 +105,9 @@ pub fn load_config() -> Result<Config> {
     let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("/"));
 
     let tam_path = config_dir.join("tam").join("config.toml");
-    let zinc_path = config_dir.join("zinc").join("config.toml");
 
     if tam_path.exists() {
         let content = std::fs::read_to_string(&tam_path)?;
-        parse_config(&content)
-    } else if zinc_path.exists() {
-        eprintln!(
-            "note: using zinc config at {} — consider copying to {}",
-            zinc_path.display(),
-            tam_path.display()
-        );
-        let content = std::fs::read_to_string(&zinc_path)?;
         parse_config(&content)
     } else {
         Ok(Config::default())

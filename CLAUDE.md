@@ -27,8 +27,7 @@ Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-pro
   daemon exits after 30s with no agents and no clients.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
   detection, generic/codex use PTY heuristic (5s idle timeout).
-- **Config fallback chain** — tam config -> zinc config -> yawn config, with
-  migration hints printed to stderr on fallback.
+- **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
 
 ## Build & check
 

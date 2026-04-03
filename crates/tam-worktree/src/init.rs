@@ -17,7 +17,7 @@ struct InitConfig {
     commands: Option<Vec<String>>,
 }
 
-/// Parsed `.worktree-init.toml` configuration for initializing new worktrees.
+/// Parsed `.tam.toml` configuration for initializing new worktrees.
 #[derive(Debug, Default)]
 pub struct ProjectInit {
     /// File globs to copy from the main checkout (e.g. `[".env", ".claude/**"]`).
@@ -26,19 +26,13 @@ pub struct ProjectInit {
     pub commands: Vec<String>,
 }
 
-/// Load project init config from `.worktree-init.toml` (preferred) or `.yawn.toml` (fallback).
+/// Load project init config from `.tam.toml`.
 pub fn load_project_config(repo_root: &Path) -> Result<ProjectInit> {
-    let primary = repo_root.join(".worktree-init.toml");
-    let fallback = repo_root.join(".yawn.toml");
+    let config_path = repo_root.join(".tam.toml");
 
-    let config_path = if primary.exists() {
-        primary
-    } else if fallback.exists() {
-        eprintln!("note: using .yawn.toml — consider renaming to .worktree-init.toml");
-        fallback
-    } else {
+    if !config_path.exists() {
         return Ok(ProjectInit::default());
-    };
+    }
 
     let content = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
@@ -153,7 +147,7 @@ fn run_commands(target: &Path, commands: &[String]) -> Result<()> {
 
 /// Run init for the given target directory.
 ///
-/// Resolves the working tree toplevel, then reads `.worktree-init.toml` (or `.yawn.toml`)
+/// Resolves the working tree toplevel, then reads `.tam.toml` (or legacy fallbacks)
 /// from the main repo root. If the toplevel is a worktree (different from the main repo),
 /// copies include files. Then runs commands.
 pub fn run(target: &Path) -> Result<()> {
@@ -162,7 +156,7 @@ pub fn run(target: &Path) -> Result<()> {
     let config = load_project_config(&repo_root)?;
 
     if config.include.is_empty() && config.commands.is_empty() {
-        eprintln!("nothing to do: no [init] config in .worktree-init.toml");
+        eprintln!("nothing to do: no [init] config in .tam.toml");
         return Ok(());
     }
 
@@ -223,7 +217,7 @@ mod tests {
     #[test]
     fn test_load_empty_config() {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join(".worktree-init.toml"), "").unwrap();
+        fs::write(tmp.path().join(".tam.toml"), "").unwrap();
         let config = load_project_config(tmp.path()).unwrap();
         assert!(config.include.is_empty());
         assert!(config.commands.is_empty());
@@ -233,7 +227,7 @@ mod tests {
     fn test_load_include_only() {
         let tmp = TempDir::new().unwrap();
         fs::write(
-            tmp.path().join(".worktree-init.toml"),
+            tmp.path().join(".tam.toml"),
             "[init]\ninclude = [\".env\", \"config/*.toml\"]\n",
         )
         .unwrap();
@@ -246,7 +240,7 @@ mod tests {
     fn test_load_commands_only() {
         let tmp = TempDir::new().unwrap();
         fs::write(
-            tmp.path().join(".worktree-init.toml"),
+            tmp.path().join(".tam.toml"),
             "[init]\ncommands = [\"npm install\"]\n",
         )
         .unwrap();
@@ -259,7 +253,7 @@ mod tests {
     fn test_load_full_config() {
         let tmp = TempDir::new().unwrap();
         fs::write(
-            tmp.path().join(".worktree-init.toml"),
+            tmp.path().join(".tam.toml"),
             "[init]\ninclude = [\".env\"]\ncommands = [\"npm install\", \"cargo build\"]\n",
         )
         .unwrap();
@@ -271,37 +265,25 @@ mod tests {
     #[test]
     fn test_load_invalid_toml() {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join(".worktree-init.toml"), "{{invalid").unwrap();
+        fs::write(tmp.path().join(".tam.toml"), "{{invalid").unwrap();
         assert!(load_project_config(tmp.path()).is_err());
     }
 
     #[test]
-    fn test_load_fallback_to_yawn_toml() {
+    fn test_load_ignores_legacy_files() {
         let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".worktree-init.toml"),
+            "[init]\ninclude = [\".env\"]\n",
+        )
+        .unwrap();
         fs::write(
             tmp.path().join(".yawn.toml"),
             "[init]\ninclude = [\".env\"]\n",
         )
         .unwrap();
         let config = load_project_config(tmp.path()).unwrap();
-        assert_eq!(config.include, vec![".env"]);
-    }
-
-    #[test]
-    fn test_load_prefers_worktree_init_toml() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join(".worktree-init.toml"),
-            "[init]\ninclude = [\"from-new\"]\n",
-        )
-        .unwrap();
-        fs::write(
-            tmp.path().join(".yawn.toml"),
-            "[init]\ninclude = [\"from-old\"]\n",
-        )
-        .unwrap();
-        let config = load_project_config(tmp.path()).unwrap();
-        assert_eq!(config.include, vec!["from-new"]);
+        assert!(config.include.is_empty());
     }
 
     // --- copy_include_files tests ---
@@ -485,9 +467,9 @@ mod tests {
         let repo = tmp.path().join("myproject");
         init_repo(&repo);
 
-        // Set up .worktree-init.toml and include files
+        // Set up .tam.toml and include files
         fs::write(
-            repo.join(".worktree-init.toml"),
+            repo.join(".tam.toml"),
             "[init]\ninclude = [\".env\"]\ncommands = [\"echo done > .init_marker\"]\n",
         )
         .unwrap();
@@ -525,7 +507,7 @@ mod tests {
         init_repo(&repo);
 
         fs::write(
-            repo.join(".worktree-init.toml"),
+            repo.join(".tam.toml"),
             "[init]\ninclude = [\".env\"]\ncommands = [\"echo done > .init_marker\"]\n",
         )
         .unwrap();

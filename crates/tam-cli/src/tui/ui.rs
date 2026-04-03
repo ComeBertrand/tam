@@ -483,7 +483,6 @@ fn status_display(status: &TaskStatus) -> (&'static str, Color) {
         TaskStatus::Block => ("▲ block", Color::Red),
         TaskStatus::Idle => ("○ idle", Color::DarkGray),
         TaskStatus::Stale => ("◌ stale", Color::DarkGray),
-        TaskStatus::Orphan => ("? orphan", Color::Magenta),
         TaskStatus::Gone => ("✗ gone", Color::Red),
     }
 }

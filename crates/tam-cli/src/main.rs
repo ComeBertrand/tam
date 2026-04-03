@@ -209,56 +209,6 @@ async fn main() -> Result<()> {
             println!("Dropped task '{}'", name);
         }
 
-        Commands::Gc { dry_run } => {
-            let mut ledger = Ledger::load()?;
-            let tasks = ledger.active_tasks();
-            let mut dropped = Vec::new();
-
-            for task in &tasks {
-                if !task.owned {
-                    continue;
-                }
-                if let Ok(root) = tam_worktree::git::repo_root(&task.dir) {
-                    if let Ok(default) = tam_worktree::git::default_branch(&root) {
-                        if tam_worktree::git::is_branch_merged(&root, &task.name, &default)
-                            .unwrap_or(false)
-                        {
-                            dropped.push(task.name.clone());
-                        }
-                    }
-                }
-            }
-
-            if dropped.is_empty() {
-                println!("Nothing to clean up.");
-            } else if dry_run {
-                println!("Would drop:");
-                for name in &dropped {
-                    println!("  {}", name);
-                }
-            } else {
-                for name in &dropped {
-                    // Kill agent if running
-                    if let Ok(mut client) = client::Client::connect().await {
-                        let _ = client
-                            .send(tam_proto::Request::Kill { id: name.clone() })
-                            .await;
-                    }
-                    let task = ledger.find_task(name).unwrap();
-                    if task.dir.exists() {
-                        let wt_config = tam_worktree::config::load_config()?;
-                        let _ =
-                            tam_worktree::worktree::delete(name, true, true, &wt_config, &task.dir);
-                    }
-                    ledger.append(LedgerEvent::TaskDropped {
-                        task: name.clone(),
-                        timestamp: ledger::now(),
-                    })?;
-                    println!("Dropped '{}'", name);
-                }
-            }
-        }
-
         Commands::Ps { json } => {
             let ledger = Ledger::load()?;
             let snapshots = ledger.active_tasks();
@@ -654,72 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_detects_merged_branch() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let repo = tmp.path().join("myrepo");
-        init_git_repo(&repo);
-
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap()
-        };
-
-        // Get default branch name
-        let output = git(&["branch", "--show-current"]);
-        let default = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        // Create a branch and merge it
-        git(&["branch", "feat-merged"]);
-
-        // Create an unmerged branch with a new commit
-        git(&["checkout", "-b", "feat-unmerged"]);
-        std::fs::write(repo.join("new.txt"), "content").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-m", "new work"]);
-        git(&["checkout", &default]);
-
-        // Track both in ledger
-        let mut ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
-        ledger
-            .append(LedgerEvent::TaskCreated {
-                name: "feat-merged".into(),
-                dir: repo.clone(),
-                owned: true,
-                timestamp: ledger::now(),
-            })
-            .unwrap();
-        ledger
-            .append(LedgerEvent::TaskCreated {
-                name: "feat-unmerged".into(),
-                dir: repo.clone(),
-                owned: true,
-                timestamp: ledger::now(),
-            })
-            .unwrap();
-
-        // Verify is_branch_merged
-        let root = tam_worktree::git::repo_root(&repo).unwrap();
-        assert!(tam_worktree::git::is_branch_merged(&root, "feat-merged", &default).unwrap());
-        assert!(!tam_worktree::git::is_branch_merged(&root, "feat-unmerged", &default).unwrap());
-
-        // Simulate GC: only merged tasks should be candidates
-        let tasks = ledger.active_tasks();
-        let gc_candidates: Vec<&str> = tasks
-            .iter()
-            .filter(|t| t.owned)
-            .filter(|t| {
-                tam_worktree::git::is_branch_merged(&root, &t.name, &default).unwrap_or(false)
-            })
-            .map(|t| t.name.as_str())
-            .collect();
-
-        assert_eq!(gc_candidates, vec!["feat-merged"]);
-    }
-
-    #[test]
     fn test_task_status_with_git() {
         let tmp = tempfile::TempDir::new().unwrap();
         let repo = tmp.path().join("myrepo");
@@ -750,24 +634,16 @@ mod tests {
             "repo_root should find main repo"
         );
 
-        // Verify the pieces work individually from the resolved root
+        // Fresh branch should be Active
         assert!(tam_worktree::git::local_branch_exists(&root, "test-branch").unwrap());
-        let detected_default = tam_worktree::git::default_branch(&root).unwrap();
-        assert!(
-            tam_worktree::git::is_branch_merged(&root, "test-branch", &detected_default).unwrap(),
-            "branch at same commit as {} should be merged",
-            detected_default,
-        );
-
-        // Now verify the combined check_git_branch_status works
         let status = task::check_git_branch_status("test-branch", &wt_path);
         assert_eq!(
             status,
-            task::GitBranchStatus::Merged,
-            "new branch at same commit should be merged"
+            task::GitBranchStatus::Active,
+            "new branch should be active"
         );
 
-        // Make a commit on the worktree branch so it diverges
+        // Make a commit on the worktree branch — still active
         std::fs::write(wt_path.join("new.txt"), "content").unwrap();
         let git_wt = |args: &[&str]| {
             std::process::Command::new("git")
@@ -779,18 +655,16 @@ mod tests {
         git_wt(&["add", "."]);
         git_wt(&["commit", "-m", "diverge"]);
 
-        // Now it's active (not merged)
         let status = task::check_git_branch_status("test-branch", &wt_path);
         assert_eq!(status, task::GitBranchStatus::Active);
 
-        // Merge it back from the main repo
-        git(&["merge", "test-branch"]);
+        // Merge it back — branch still exists, still Active
+        git(&["merge", "--no-ff", "test-branch", "-m", "Merge test-branch"]);
         let status = task::check_git_branch_status("test-branch", &wt_path);
-        assert_eq!(status, task::GitBranchStatus::Merged);
+        assert_eq!(status, task::GitBranchStatus::Active);
 
         // Remove worktree and delete branch → BranchGone
         tam_worktree::worktree::delete("test-branch", false, true, &wt_config, &wt_path).unwrap();
-        // Delete branch from main repo
         git(&["branch", "-d", "test-branch"]);
         let status = task::check_git_branch_status("test-branch", &repo);
         assert_eq!(status, task::GitBranchStatus::BranchGone);

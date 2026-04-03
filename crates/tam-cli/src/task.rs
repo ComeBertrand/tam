@@ -1,18 +1,20 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tam_proto::{AgentInfo, AgentState};
 
 use crate::ledger::TaskSnapshot;
+
+/// How long (in seconds) without activity before a task is considered stale.
+const STALE_THRESHOLD_SECS: u64 = 30 * 24 * 3600; // 30 days
 
 /// Git branch state for an owned task, populated by callers before status().
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GitBranchStatus {
     #[default]
     Unknown,
-    /// Branch exists, not merged
+    /// Branch exists
     Active,
-    /// Branch is merged into default branch
-    Merged,
     /// Local branch does not exist (deleted externally)
     BranchGone,
 }
@@ -28,8 +30,8 @@ pub enum TaskStatus {
     Block,
     /// No agent running, task exists
     Idle,
-    /// No agent running, branch is merged into default branch
-    Merged,
+    /// No agent running, no activity for a long time
+    Stale,
     /// Worktree exists but branch was deleted
     Orphan,
     /// Worktree was deleted externally
@@ -43,7 +45,7 @@ impl std::fmt::Display for TaskStatus {
             Self::Input => write!(f, "input"),
             Self::Block => write!(f, "block"),
             Self::Idle => write!(f, "idle"),
-            Self::Merged => write!(f, "merged"),
+            Self::Stale => write!(f, "stale"),
             Self::Orphan => write!(f, "orphan"),
             Self::Gone => write!(f, "gone"),
         }
@@ -58,7 +60,7 @@ impl TaskStatus {
             Self::Input => 1,
             Self::Run => 2,
             Self::Idle => 3,
-            Self::Merged => 4,
+            Self::Stale => 4,
             Self::Orphan => 5,
             Self::Gone => 6,
         }
@@ -71,7 +73,7 @@ impl TaskStatus {
             Self::Input => "▲ input",
             Self::Block => "▲ block",
             Self::Idle => "○ idle",
-            Self::Merged => "✓ merged",
+            Self::Stale => "◌ stale",
             Self::Orphan => "? orphan",
             Self::Gone => "✗ gone",
         }
@@ -104,7 +106,7 @@ impl Task {
         }
     }
 
-    /// Compute the current status from daemon state + git branch state.
+    /// Compute the current status from daemon state + git branch state + activity.
     pub fn status(&self) -> TaskStatus {
         if let Some(ref info) = self.agent_info {
             return match info.state {
@@ -120,14 +122,29 @@ impl Task {
             if !self.dir.exists() {
                 return TaskStatus::Gone;
             }
-            match self.git_branch_status {
-                GitBranchStatus::Merged => return TaskStatus::Merged,
-                GitBranchStatus::BranchGone => return TaskStatus::Orphan,
-                _ => {}
+            if self.git_branch_status == GitBranchStatus::BranchGone {
+                return TaskStatus::Orphan;
             }
         }
 
+        // Check staleness based on last activity
+        if self.is_stale() {
+            return TaskStatus::Stale;
+        }
+
         TaskStatus::Idle
+    }
+
+    /// Whether the task has had no activity for longer than the stale threshold.
+    fn is_stale(&self) -> bool {
+        let Some(last) = self.last_activity else {
+            return false;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(last) >= STALE_THRESHOLD_SECS
     }
 }
 
@@ -140,19 +157,8 @@ pub fn check_git_branch_status(task_name: &str, task_dir: &Path) -> GitBranchSta
     };
 
     match tam_worktree::git::local_branch_exists(&root, task_name) {
-        Ok(false) => return GitBranchStatus::BranchGone,
-        Err(_) => return GitBranchStatus::Unknown,
-        Ok(true) => {}
-    }
-
-    let default = match tam_worktree::git::default_branch(&root) {
-        Ok(d) => d,
-        Err(_) => return GitBranchStatus::Unknown,
-    };
-
-    match tam_worktree::git::is_branch_merged(&root, task_name, &default) {
-        Ok(true) => GitBranchStatus::Merged,
-        Ok(false) => GitBranchStatus::Active,
+        Ok(true) => GitBranchStatus::Active,
+        Ok(false) => GitBranchStatus::BranchGone,
         Err(_) => GitBranchStatus::Unknown,
     }
 }
@@ -161,13 +167,20 @@ pub fn check_git_branch_status(task_name: &str, task_dir: &Path) -> GitBranchSta
 mod tests {
     use super::*;
 
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     fn test_snapshot() -> TaskSnapshot {
         TaskSnapshot {
             name: "feat".into(),
             dir: PathBuf::from("/tmp"), // use /tmp which always exists
             owned: true,
             run_count: 3,
-            last_activity: Some(1000),
+            last_activity: Some(now_secs()),
         }
     }
 
@@ -175,6 +188,14 @@ mod tests {
     fn idle_when_no_agent() {
         let task = Task::from_snapshot(test_snapshot(), None);
         assert_eq!(task.status(), TaskStatus::Idle);
+    }
+
+    #[test]
+    fn stale_when_no_recent_activity() {
+        let mut snapshot = test_snapshot();
+        snapshot.last_activity = Some(1000); // epoch 1970 — very old
+        let task = Task::from_snapshot(snapshot, None);
+        assert_eq!(task.status(), TaskStatus::Stale);
     }
 
     #[test]
@@ -237,13 +258,6 @@ mod tests {
     }
 
     #[test]
-    fn merged_when_branch_merged() {
-        let mut task = Task::from_snapshot(test_snapshot(), None);
-        task.git_branch_status = GitBranchStatus::Merged;
-        assert_eq!(task.status(), TaskStatus::Merged);
-    }
-
-    #[test]
     fn orphan_when_branch_gone() {
         let mut task = Task::from_snapshot(test_snapshot(), None);
         task.git_branch_status = GitBranchStatus::BranchGone;
@@ -262,13 +276,13 @@ mod tests {
         let mut snapshot = test_snapshot();
         snapshot.owned = false;
         let mut task = Task::from_snapshot(snapshot, None);
-        task.git_branch_status = GitBranchStatus::Merged;
+        task.git_branch_status = GitBranchStatus::BranchGone;
         // Borrowed tasks stay Idle regardless of git state
         assert_eq!(task.status(), TaskStatus::Idle);
     }
 
     #[test]
-    fn agent_state_overrides_git_status() {
+    fn agent_state_overrides_staleness() {
         let info = AgentInfo {
             id: "feat".into(),
             provider: "claude".into(),
@@ -280,9 +294,10 @@ mod tests {
             context_percent: None,
             task: Some("feat".into()),
         };
-        let mut task = Task::from_snapshot(test_snapshot(), Some(info));
-        task.git_branch_status = GitBranchStatus::Merged;
-        // Agent running takes priority over git state
+        let mut snapshot = test_snapshot();
+        snapshot.last_activity = Some(1000); // very old
+        let task = Task::from_snapshot(snapshot, Some(info));
+        // Agent running takes priority over staleness
         assert_eq!(task.status(), TaskStatus::Run);
     }
 
@@ -291,14 +306,14 @@ mod tests {
         assert!(TaskStatus::Block.sort_priority() < TaskStatus::Input.sort_priority());
         assert!(TaskStatus::Input.sort_priority() < TaskStatus::Run.sort_priority());
         assert!(TaskStatus::Run.sort_priority() < TaskStatus::Idle.sort_priority());
-        assert!(TaskStatus::Idle.sort_priority() < TaskStatus::Merged.sort_priority());
+        assert!(TaskStatus::Idle.sort_priority() < TaskStatus::Stale.sort_priority());
     }
 
     #[test]
     fn indicator_strings() {
         assert_eq!(TaskStatus::Run.indicator(), "● run");
         assert_eq!(TaskStatus::Input.indicator(), "▲ input");
-        assert_eq!(TaskStatus::Merged.indicator(), "✓ merged");
+        assert_eq!(TaskStatus::Stale.indicator(), "◌ stale");
     }
 
     #[test]

@@ -71,13 +71,6 @@ pub enum Commands {
         branch: bool,
     },
 
-    /// Garbage collect tasks whose branch has been merged
-    Gc {
-        /// Show what would be dropped without actually doing it
-        #[arg(long)]
-        dry_run: bool,
-    },
-
     /// List tasks with computed status
     Ps {
         /// Output as JSON

@@ -25,7 +25,7 @@ pub struct DiscoveryConfig {
 pub struct WorktreeConfig {
     /// Parent directory where new worktrees are created.
     pub root: Option<String>,
-    /// Whether to run `.worktree-init.toml` after creating a worktree.
+    /// Whether to run `.tam.toml` after creating a worktree.
     pub auto_init: Option<bool>,
 }
 
@@ -38,7 +38,7 @@ pub struct Config {
     pub ignore: Vec<String>,
     /// Parent directory where new worktrees are created.
     pub worktree_root: PathBuf,
-    /// Whether to run `.worktree-init.toml` after creating a worktree.
+    /// Whether to run `.tam.toml` after creating a worktree.
     pub auto_init: bool,
 }
 
@@ -106,23 +106,13 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     })
 }
 
-/// Load config from the standard path, with fallback to yawn config.
+/// Load config from `$XDG_CONFIG_HOME/tam/config.toml`.
 pub fn load_config() -> Result<Config> {
     let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("/"));
-
     let tam_config = config_dir.join("tam").join("config.toml");
-    let yawn_config = config_dir.join("yawn").join("config.toml");
 
     if tam_config.exists() {
         let content = std::fs::read_to_string(&tam_config)?;
-        parse_config(&content)
-    } else if yawn_config.exists() {
-        eprintln!(
-            "note: using yawn config at {} — consider copying to {}",
-            yawn_config.display(),
-            tam_config.display()
-        );
-        let content = std::fs::read_to_string(&yawn_config)?;
         parse_config(&content)
     } else {
         Ok(Config::default())

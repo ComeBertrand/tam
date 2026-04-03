@@ -663,10 +663,10 @@ mod tests {
         let status = task::check_git_branch_status("test-branch", &wt_path);
         assert_eq!(status, task::GitBranchStatus::Active);
 
-        // Remove worktree and delete branch → BranchGone
+        // Remove worktree and delete branch → Gone
         tam_worktree::worktree::delete("test-branch", false, true, &wt_config, &wt_path).unwrap();
         git(&["branch", "-d", "test-branch"]);
         let status = task::check_git_branch_status("test-branch", &repo);
-        assert_eq!(status, task::GitBranchStatus::BranchGone);
+        assert_eq!(status, task::GitBranchStatus::Gone);
     }
 }

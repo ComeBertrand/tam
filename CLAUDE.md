@@ -18,7 +18,9 @@ Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-pro
 ## Key architecture patterns
 
 - **Task status is always derived** — computed from daemon state + git state +
-  filesystem, never stored. See `task.rs` `GitBranchStatus` + `Task::status()`.
+  filesystem + activity timestamps, never stored. See `task.rs`
+  `GitBranchStatus` + `Task::status()`. Staleness is time-based (30 days
+  without activity), not git-merge-based.
 - **Ledger is append-only JSONL** — `~/.local/share/tam/ledger.jsonl`. Records
   events (TaskCreated, AgentRunStarted, etc.), never states.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,

@@ -155,18 +155,6 @@ pub fn delete_branch(dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Check if a branch is merged into another branch.
-pub fn is_branch_merged(dir: &Path, branch: &str, into: &str) -> Result<bool> {
-    let output = git(dir, &["branch", "--merged", into])?;
-    Ok(output.lines().any(|line| {
-        let name = line
-            .trim()
-            .trim_start_matches("* ")
-            .trim_start_matches("+ ");
-        name == branch
-    }))
-}
-
 /// List worktrees. Returns list of worktree paths.
 pub fn worktree_list(dir: &Path) -> Result<Vec<PathBuf>> {
     let output = git(dir, &["worktree", "list", "--porcelain"])?;
@@ -311,27 +299,6 @@ mod tests {
 
         worktree_remove(&repo, &wt_path).unwrap();
         assert!(!wt_path.exists());
-    }
-
-    #[test]
-    fn test_is_branch_merged() {
-        let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        let default = git(&repo, &["branch", "--show-current"]).unwrap();
-
-        // Create a branch, merge it, then check
-        git(&repo, &["branch", "merged-branch"]).unwrap();
-        assert!(is_branch_merged(&repo, "merged-branch", &default).unwrap());
-
-        // Create a branch with a new commit — not merged
-        git(&repo, &["checkout", "-b", "unmerged-branch"]).unwrap();
-        fs::write(repo.join("new-file.txt"), "content").unwrap();
-        git(&repo, &["add", "."]).unwrap();
-        git(&repo, &["commit", "-m", "new commit"]).unwrap();
-        git(&repo, &["checkout", &default]).unwrap();
-
-        assert!(!is_branch_merged(&repo, "unmerged-branch", &default).unwrap());
     }
 
     #[test]

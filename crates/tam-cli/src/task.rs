@@ -16,7 +16,7 @@ pub enum GitBranchStatus {
     /// Branch exists
     Active,
     /// Local branch does not exist (deleted externally)
-    BranchGone,
+    Gone,
 }
 
 /// Computed task status — always derived, never stored.
@@ -32,9 +32,7 @@ pub enum TaskStatus {
     Idle,
     /// No agent running, no activity for a long time
     Stale,
-    /// Worktree exists but branch was deleted
-    Orphan,
-    /// Worktree was deleted externally
+    /// Worktree or branch deleted externally
     Gone,
 }
 
@@ -46,7 +44,6 @@ impl std::fmt::Display for TaskStatus {
             Self::Block => write!(f, "block"),
             Self::Idle => write!(f, "idle"),
             Self::Stale => write!(f, "stale"),
-            Self::Orphan => write!(f, "orphan"),
             Self::Gone => write!(f, "gone"),
         }
     }
@@ -61,8 +58,7 @@ impl TaskStatus {
             Self::Run => 2,
             Self::Idle => 3,
             Self::Stale => 4,
-            Self::Orphan => 5,
-            Self::Gone => 6,
+            Self::Gone => 5,
         }
     }
 
@@ -74,7 +70,6 @@ impl TaskStatus {
             Self::Block => "▲ block",
             Self::Idle => "○ idle",
             Self::Stale => "◌ stale",
-            Self::Orphan => "? orphan",
             Self::Gone => "✗ gone",
         }
     }
@@ -122,8 +117,8 @@ impl Task {
             if !self.dir.exists() {
                 return TaskStatus::Gone;
             }
-            if self.git_branch_status == GitBranchStatus::BranchGone {
-                return TaskStatus::Orphan;
+            if self.git_branch_status == GitBranchStatus::Gone {
+                return TaskStatus::Gone;
             }
         }
 
@@ -158,7 +153,7 @@ pub fn check_git_branch_status(task_name: &str, task_dir: &Path) -> GitBranchSta
 
     match tam_worktree::git::local_branch_exists(&root, task_name) {
         Ok(true) => GitBranchStatus::Active,
-        Ok(false) => GitBranchStatus::BranchGone,
+        Ok(false) => GitBranchStatus::Gone,
         Err(_) => GitBranchStatus::Unknown,
     }
 }
@@ -258,10 +253,10 @@ mod tests {
     }
 
     #[test]
-    fn orphan_when_branch_gone() {
+    fn gone_when_branch_gone() {
         let mut task = Task::from_snapshot(test_snapshot(), None);
-        task.git_branch_status = GitBranchStatus::BranchGone;
-        assert_eq!(task.status(), TaskStatus::Orphan);
+        task.git_branch_status = GitBranchStatus::Gone;
+        assert_eq!(task.status(), TaskStatus::Gone);
     }
 
     #[test]
@@ -276,7 +271,7 @@ mod tests {
         let mut snapshot = test_snapshot();
         snapshot.owned = false;
         let mut task = Task::from_snapshot(snapshot, None);
-        task.git_branch_status = GitBranchStatus::BranchGone;
+        task.git_branch_status = GitBranchStatus::Gone;
         // Borrowed tasks stay Idle regardless of git state
         assert_eq!(task.status(), TaskStatus::Idle);
     }

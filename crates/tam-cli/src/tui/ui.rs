@@ -70,6 +70,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::SpawnEnterPath(path) => {
             render_enter_path_popup(frame, path);
         }
+        Mode::ConfirmDropTask { name } => {
+            render_confirm_drop_popup(frame, name);
+        }
     }
 }
 
@@ -234,6 +237,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled("tab", Style::new().bold()),
                 Span::raw(":toggle  "),
                 Span::styled("esc", Style::new().bold()),
+                Span::raw(":cancel"),
+            ],
+            Mode::ConfirmDropTask { .. } => vec![
+                Span::styled(" y", Style::new().bold()),
+                Span::raw("/"),
+                Span::styled("enter", Style::new().bold()),
+                Span::raw(":confirm  "),
+                Span::styled("any", Style::new().bold()),
                 Span::raw(":cancel"),
             ],
             _ => vec![
@@ -429,6 +440,30 @@ fn render_enter_path_popup(frame: &mut Frame, path: &str) {
         Span::styled("█", Style::new().fg(Color::DarkGray)),
     ]);
     frame.render_widget(input_line, input_area);
+}
+
+fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
+    let area = centered_rect(50, 20, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Red))
+        .title(" confirm drop ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let y = inner.y + inner.height / 2;
+    let msg = Line::from(vec![
+        Span::raw("  Drop task "),
+        Span::styled(name, Style::new().bold()),
+        Span::raw("? "),
+        Span::styled("y", Style::new().bold().fg(Color::Red)),
+        Span::raw("/"),
+        Span::styled("n", Style::new().bold()),
+    ]);
+    frame.render_widget(msg, Rect::new(inner.x, y, inner.width, 1));
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

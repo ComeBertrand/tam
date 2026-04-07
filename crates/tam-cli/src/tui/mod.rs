@@ -262,6 +262,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::Normal => handle_normal_key(key, app, config),
         Mode::NewTaskEnterName { .. } => handle_new_task_name_key(key, app),
         Mode::SpawnEnterPath(_) => handle_enter_path_key(key, app),
+        Mode::ConfirmDropTask { .. } => handle_confirm_drop_key(key, app),
         _ => handle_picker_key(key, app, config),
     }
 }
@@ -318,12 +319,11 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('p'), _) => Action::TogglePeek,
         (KeyCode::Char('d'), _) => {
             if let Some(task) = app.selected_task() {
-                Action::DropTask {
+                app.mode = Mode::ConfirmDropTask {
                     name: task.name.clone(),
-                }
-            } else {
-                Action::None
+                };
             }
+            Action::None
         }
         (KeyCode::Char(c), _) => {
             if let Some(cmd) = config.commands.iter().find(|cmd| cmd.key_char() == c) {
@@ -499,6 +499,23 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
             Action::None
         }
         _ => Action::None,
+    }
+}
+
+fn handle_confirm_drop_key(key: KeyEvent, app: &mut App) -> Action {
+    match key.code {
+        KeyCode::Char('y') => {
+            let name = match &app.mode {
+                Mode::ConfirmDropTask { name } => name.clone(),
+                _ => return Action::None,
+            };
+            app.mode = Mode::Normal;
+            Action::DropTask { name }
+        }
+        _ => {
+            app.mode = Mode::Normal;
+            Action::None
+        }
     }
 }
 

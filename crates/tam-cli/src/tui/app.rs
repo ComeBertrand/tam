@@ -19,6 +19,7 @@ pub enum Mode {
         picker: PickerState,
     },
     SpawnEnterPath(String),
+    ConfirmDropTask { name: String },
 }
 
 pub struct PickerItem {

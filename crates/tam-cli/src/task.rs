@@ -81,6 +81,7 @@ pub struct Task {
     pub name: String,
     pub dir: PathBuf,
     pub owned: bool,
+    pub repo_name: String,
     pub agent_info: Option<AgentInfo>,
     pub run_count: usize,
     pub last_activity: Option<u64>,
@@ -90,10 +91,12 @@ pub struct Task {
 impl Task {
     /// Build a Task from a ledger snapshot and optional daemon agent info.
     pub fn from_snapshot(snapshot: TaskSnapshot, agent_info: Option<AgentInfo>) -> Self {
+        let repo_name = compute_repo_name(&snapshot.dir);
         Self {
             name: snapshot.name,
             dir: snapshot.dir,
             owned: snapshot.owned,
+            repo_name,
             agent_info,
             run_count: snapshot.run_count,
             last_activity: snapshot.last_activity,
@@ -141,6 +144,21 @@ impl Task {
             .as_secs();
         now.saturating_sub(last) >= STALE_THRESHOLD_SECS
     }
+}
+
+/// Derive the repository name from a task directory.
+///
+/// For worktrees, returns the main repo name (parsed from `.git` file).
+/// Otherwise, returns the directory basename.
+fn compute_repo_name(dir: &Path) -> String {
+    if tam_worktree::pretty::is_worktree(dir) {
+        if let Ok(name) = tam_worktree::pretty::worktree_main_repo_name(dir) {
+            return name;
+        }
+    }
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 /// Query git to determine branch status for an owned task.

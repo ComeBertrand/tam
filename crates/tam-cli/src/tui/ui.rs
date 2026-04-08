@@ -132,8 +132,10 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize) {
     let header = Row::new([
         Cell::from("STATUS"),
+        Cell::from("REPO"),
         Cell::from("TASK"),
         Cell::from("AGENT"),
+        Cell::from("OWN"),
         Cell::from("DIR"),
         Cell::from("CTX"),
     ])
@@ -157,11 +159,18 @@ fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize)
                 .and_then(|a| a.context_percent)
                 .map(|p| context_display(p))
                 .unwrap_or_else(|| Span::raw(""));
+            let owned = if task.owned {
+                Span::styled("✔", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("✘", Style::new().fg(Color::DarkGray))
+            };
 
             Row::new([
                 Cell::from(Span::styled(icon, Style::new().fg(color))),
+                Cell::from(task.repo_name.as_str()),
                 Cell::from(task.name.as_str()),
                 Cell::from(agent),
+                Cell::from(owned),
                 Cell::from(dir),
                 Cell::from(ctx),
             ])
@@ -169,11 +178,13 @@ fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize)
         .collect();
 
     let widths = [
-        Constraint::Length(10),
-        Constraint::Length(15),
-        Constraint::Length(10),
-        Constraint::Fill(1),
-        Constraint::Length(6),
+        Constraint::Length(10),  // STATUS
+        Constraint::Length(15),  // REPO
+        Constraint::Length(15),  // TASK
+        Constraint::Length(10),  // AGENT
+        Constraint::Length(3),   // OWN
+        Constraint::Fill(1),     // DIR
+        Constraint::Length(6),   // CTX
     ];
 
     let table = Table::new(rows, widths)

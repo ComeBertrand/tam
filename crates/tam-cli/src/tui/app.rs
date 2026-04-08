@@ -125,8 +125,13 @@ impl App {
     }
 
     fn sort_tasks(&mut self) {
-        self.tasks
-            .sort_by_key(|t| (t.status().sort_priority(), t.name.clone()));
+        self.tasks.sort_by_key(|t| {
+            (
+                t.repo_name.to_lowercase(),
+                t.status().sort_priority(),
+                t.name.to_lowercase(),
+            )
+        });
     }
 
     pub fn visible_tasks(&self) -> Vec<&Task> {
@@ -138,6 +143,7 @@ impl App {
                 .iter()
                 .filter(|t| {
                     t.name.to_lowercase().contains(&lower)
+                        || t.repo_name.to_lowercase().contains(&lower)
                         || t.dir.to_string_lossy().to_lowercase().contains(&lower)
                         || t.agent_info
                             .as_ref()

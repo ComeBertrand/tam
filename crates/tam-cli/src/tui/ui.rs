@@ -178,13 +178,13 @@ fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize)
         .collect();
 
     let widths = [
-        Constraint::Length(10),  // STATUS
-        Constraint::Length(15),  // REPO
-        Constraint::Length(15),  // TASK
-        Constraint::Length(10),  // AGENT
-        Constraint::Length(3),   // OWN
-        Constraint::Fill(1),     // DIR
-        Constraint::Length(6),   // CTX
+        Constraint::Length(10), // STATUS
+        Constraint::Length(15), // REPO
+        Constraint::Length(15), // TASK
+        Constraint::Length(10), // AGENT
+        Constraint::Length(3),  // OWN
+        Constraint::Fill(1),    // DIR
+        Constraint::Length(6),  // CTX
     ];
 
     let table = Table::new(rows, widths)

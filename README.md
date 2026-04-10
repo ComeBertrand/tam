@@ -36,6 +36,15 @@ tam
 
 **Status is always derived**, never stored. TAM checks the daemon (is an agent running?), the filesystem (does the worktree exist?), git (does the branch exist?), and activity timestamps (is the task stale?) every time you look.
 
+| Status | Meaning |
+|---|---|
+| `● run` | Agent producing output |
+| `▲ input` | Agent waiting for user prompt |
+| `▲ block` | Agent waiting for permission |
+| `○ idle` | No agent running, task exists |
+| `◌ stale` | No activity for 30 days |
+| `✗ gone` | Worktree or branch deleted externally |
+
 ## Commands
 
 ### Task lifecycle
@@ -75,17 +84,17 @@ tam pick                       Fuzzy project picker (prints selected path)
 Running `tam` with no arguments opens the dashboard:
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  tam — 4 tasks (1 needs input)                                   │
-├──────────────────────────────────────────────────────────────────┤
-│  STATUS   TASK          AGENT    DIR                      CTX    │
-│  ● run    feat          claude   ~/wt/myapp--feat         34%    │
-│▸ ▲ input  fix-nav       claude   ~/wt/myapp--fix-nav      67%    │
-│  ○ idle   refactor      -        ~/wt/myapp--refac        -      │
-│  ◌ stale  old-thing     -        ~/wt/myapp--old          -      │
-├──────────────────────────────────────────────────────────────────┤
-│  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit     │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  tam — 4 tasks (1 needs input)                                             │
+├────────────────────────────────────────────────────────────────────────────┤
+│  STATUS    REPO     TASK          AGENT   OWN  DIR                   CTX   │
+│  ● run     myapp    feat          claude   ✔   ~/wt/myapp--feat      34%   │
+│▸ ▲ input   myapp    fix-nav       claude   ✔   ~/wt/myapp--fix-nav   67%   │
+│  ○ idle    myapp    refactor      -        ✔   ~/wt/myapp--refac     -     │
+│  ◌ stale   other    old-thing     -        ✘   ~/projects/other      -     │
+├────────────────────────────────────────────────────────────────────────────┤
+│  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit               │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs an agent, `s` stops, `d` drops, `p` toggles peek (scrollback preview), `/` filters, `q` quits.
@@ -108,7 +117,7 @@ default_agent = "claude"
 
 [worktree]
 root = "~/worktrees"
-auto_init = true
+auto_init = true              # run .tam.toml after worktree creation
 
 [discovery]
 max_depth = 5
@@ -128,6 +137,14 @@ finder = "fzf"
 name = "open in editor"
 key = "o"
 command = "code {dir}"
+```
+
+Per-repo worktree initialization is configured via `.tam.toml` at the project root:
+
+```toml
+[init]
+include = [".env", ".claude/**"]    # copy untracked files from main checkout
+commands = ["npm install"]          # run in the new worktree
 ```
 
 ## Install

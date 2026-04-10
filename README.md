@@ -4,6 +4,8 @@
 [![crates.io](https://img.shields.io/crates/v/tam-cli.svg)](https://crates.io/crates/tam-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+[Features](#features) · [Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Configuration](#configuration) · [Providers](#agent-providers)
+
 > Manage units of work, not just processes.
 
 TAM manages **tasks** — named units of work that bind a directory to a series of AI agent runs. It unifies git worktree management and agent process supervision into a single tool.
@@ -13,19 +15,20 @@ Running multiple AI coding agents means juggling tmux panes, manual worktree cre
 ## Quick start
 
 ```bash
-# Set up Claude Code hooks for state detection
+# One-time: configure Claude Code hooks for state detection
 tam init --agent claude
 
-# Create a task with its own worktree
+# Create a task — this creates branch "fix-auth" and worktree "myapp--fix-auth"
 tam new fix-auth -w
 
-# Start an agent in the task (attaches immediately)
+# Start an agent and attach to it (full-screen, like tmux)
 tam run fix-auth
 
-# Detach with ctrl-], then check all tasks
+# Detach with ctrl-] — the agent keeps running in the background
+# Check all tasks at a glance
 tam ps
 
-# Open the TUI dashboard
+# Or open the interactive TUI dashboard
 tam
 ```
 
@@ -110,7 +113,9 @@ Running `tam` with no arguments opens the dashboard:
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs an agent, `s` stops, `d` drops, `p` toggles peek (scrollback preview), `/` filters, `q` quits.
+Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs an agent, `s` stops, `d` drops, `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
+
+Tasks are sorted by repository name, then by status priority (blocked → input → running → idle → stale → gone), then by task name.
 
 ### Setup
 
@@ -152,12 +157,12 @@ key = "o"
 command = "code {dir}"
 ```
 
-Per-repo worktree initialization is configured via `.tam.toml` at the project root:
+Per-repo worktree initialization is configured via `.tam.toml` at the project root. When `tam new NAME -w` creates a worktree, it copies files matching `include` globs from the main checkout (useful for untracked secrets or editor config) and runs `commands` inside the new worktree:
 
 ```toml
 [init]
-include = [".env", ".claude/**"]    # copy untracked files from main checkout
-commands = ["npm install"]          # run in the new worktree
+include = [".env", ".claude/**"]
+commands = ["npm install"]
 ```
 
 ## Agent providers
@@ -172,20 +177,31 @@ Claude Code uses hooks (`~/.claude/settings.json`) to report state changes insta
 
 ## Install
 
-### From source
+**Requirements**: git is required at runtime for all worktree and branch operations.
+
+### Pre-built binaries
+
+Download a binary for your platform from [GitHub Releases](https://github.com/ComeBertrand/tam/releases) (Linux x86_64/aarch64, macOS x86_64/aarch64).
+
+### Cargo
 
 ```bash
 cargo install tam-cli
 ```
 
-### GitHub Releases
-
-Download a prebuilt binary from [Releases](https://github.com/ComeBertrand/tam/releases).
-
 ### Nix
 
 ```bash
 nix run github:ComeBertrand/tam
+```
+
+### Shell completions and man page
+
+The build generates completions for bash, zsh, and fish, plus a man page (`tam.1`). When installing via `cargo install`, these are not placed automatically. After building from source, find them under the build output directory:
+
+```bash
+cargo build --release
+find target/release/build/tam-cli-* -name 'completions' -o -name 'man'
 ```
 
 ## Architecture

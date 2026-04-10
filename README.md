@@ -1,10 +1,27 @@
-# TAM — Terminal Agent Multiplexer
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo.svg">
+    <img alt="TAM" src="assets/logo.svg" width="243">
+  </picture>
+  <br>
+  <strong>Terminal Agent Multiplexer</strong>
+</p>
 
-[![CI](https://github.com/ComeBertrand/tam/actions/workflows/ci.yml/badge.svg)](https://github.com/ComeBertrand/tam/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/tam-cli.svg)](https://crates.io/crates/tam-cli)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/ComeBertrand/tam/actions/workflows/ci.yml"><img src="https://github.com/ComeBertrand/tam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/tam-cli"><img src="https://img.shields.io/crates/v/tam-cli.svg" alt="crates.io"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
-[Features](#features) · [Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Configuration](#configuration) · [Providers](#agent-providers)
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#agent-providers">Providers</a>
+</p>
 
 > Manage units of work, not just processes.
 

@@ -472,8 +472,8 @@ fn render_enter_path_popup(frame: &mut Frame, path: &str) {
 fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
     // Size to content: "Drop task {name}? y/n" + padding + border
     let content_width = "Drop task ".len() + name.len() + "? y/n".len();
-    let width = (content_width as u16 + 8).max(30); // +8 for padding + border
-    // 1 content row + 2 border + 2 vertical padding = 5
+    // +8 for padding + border, 1 content row + 2 border + 2 vertical padding = 5
+    let width = (content_width as u16 + 8).max(30);
     let area = centered_fixed_rect(width, 5, frame.area());
     frame.render_widget(Clear, area);
 

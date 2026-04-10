@@ -356,7 +356,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Pick => {
+        Commands::Pick { finder } => {
             let wt_config = tam_worktree::config::load_config()?;
             let root = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
             let ignore = tam_worktree::discovery::build_ignore_set(&wt_config.ignore)?;
@@ -367,7 +367,10 @@ async fn main() -> Result<()> {
             use std::io::Write;
             use std::process::{Command, Stdio};
 
-            let finder = config.finder.as_deref().unwrap_or("fzf");
+            let finder = finder
+                .as_deref()
+                .or(config.finder.as_deref())
+                .unwrap_or("fzf");
             let mut child = Command::new("sh")
                 .arg("-c")
                 .arg(finder)

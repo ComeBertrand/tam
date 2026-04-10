@@ -221,18 +221,9 @@ cargo build --release
 find target/release/build/tam-cli-* -name 'completions' -o -name 'man'
 ```
 
-## Architecture
+## Contributing
 
-Four crates:
-
-| Crate | Role |
-|---|---|
-| `tam-proto` | Wire protocol types (daemon ↔ client, JSON over Unix socket) |
-| `tam-daemon` | PTY management, agent lifecycle, state detection, scrollback |
-| `tam-worktree` | Git operations, worktree CRUD, project discovery, pretty names |
-| `tam-cli` | CLI/TUI, task ledger, bridges worktrees and agents |
-
-See [`tam_manifesto.md`](tam_manifesto.md) for the full design.
+Contributions are welcome — open an issue or submit a pull request. For the full design rationale and architecture, see [`tam_manifesto.md`](tam_manifesto.md).
 
 ## License
 

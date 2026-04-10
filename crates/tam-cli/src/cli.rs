@@ -97,7 +97,11 @@ pub enum Commands {
     },
 
     /// Fuzzy project picker
-    Pick,
+    Pick {
+        /// Finder command (overrides config finder, e.g. fzf, "dmenu -l 20")
+        #[arg(short = 'F', long)]
+        finder: Option<String>,
+    },
 
     /// Configure agent hooks for state detection
     Init {

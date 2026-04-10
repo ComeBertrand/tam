@@ -110,6 +110,7 @@ tam ls                         Discover projects and worktrees
 tam ls PATH                    Discover under a specific directory
 
 tam pick                       Fuzzy project picker (prints selected path)
+tam pick -F "dmenu -l 20"     Use a custom finder instead of fzf
 ```
 
 ### TUI
@@ -126,7 +127,7 @@ Running `tam` with no arguments opens the dashboard:
 │  ○ idle    myapp    refactor      -        ✔   ~/wt/myapp--refac     -     │
 │  ◌ stale   other    old-thing     -        ✘   ~/projects/other      -     │
 ├────────────────────────────────────────────────────────────────────────────┤
-│  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit               │
+│  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit                │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 

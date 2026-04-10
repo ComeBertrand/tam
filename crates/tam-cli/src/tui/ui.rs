@@ -2,7 +2,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState,
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table,
+    TableState,
 };
 use ratatui::Frame;
 
@@ -360,8 +361,11 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Cyan))
-        .title(format!(" {} ", picker.title));
+        .title(format!(" {} ", picker.title))
+        .title_style(Style::new().bold().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -394,13 +398,17 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
 }
 
 fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool) {
-    let area = centered_rect(50, 30, frame.area());
+    // 3 content rows + 2 border + 2 vertical padding = 7
+    let area = centered_fixed_rect(50, 7, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Cyan))
-        .title(" new task ");
+        .title(" New Task ")
+        .title_style(Style::new().bold().fg(Color::Cyan))
+        .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -413,62 +421,82 @@ fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool) {
     .areas(inner);
 
     let name_line = Line::from(vec![
-        Span::raw("  Task name: "),
+        Span::raw("Task name: "),
         Span::styled(name, Style::new().bold()),
         Span::styled("█", Style::new().fg(Color::DarkGray)),
     ]);
     frame.render_widget(name_line, name_area);
 
     let wt_check = if create_worktree { "x" } else { " " };
-    let wt_line = Line::from(format!("  [{wt_check}] Create worktree"));
+    let wt_line = Line::from(vec![
+        Span::raw("["),
+        Span::styled(
+            wt_check,
+            Style::new().fg(if create_worktree {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::raw("] Create worktree  "),
+        Span::styled("tab", Style::new().fg(Color::DarkGray)),
+        Span::styled(" toggle", Style::new().fg(Color::DarkGray)),
+    ]);
     frame.render_widget(wt_line, wt_area);
 }
 
 fn render_enter_path_popup(frame: &mut Frame, path: &str) {
-    let area = centered_rect(60, 20, frame.area());
+    // 1 content row + 2 border + 2 vertical padding = 5
+    let area = centered_fixed_rect(60, 5, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Cyan))
-        .title(" Enter path ");
+        .title(" Enter Path ")
+        .title_style(Style::new().bold().fg(Color::Cyan))
+        .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let y = inner.y + inner.height / 2;
-    let input_area = Rect::new(inner.x, y, inner.width, 1);
 
     let input_line = Line::from(vec![
         Span::styled("> ", Style::new().fg(Color::Cyan)),
         Span::raw(path),
         Span::styled("█", Style::new().fg(Color::DarkGray)),
     ]);
-    frame.render_widget(input_line, input_area);
+    frame.render_widget(input_line, inner);
 }
 
 fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
-    let area = centered_rect(50, 20, frame.area());
+    // Size to content: "Drop task {name}? y/n" + padding + border
+    let content_width = "Drop task ".len() + name.len() + "? y/n".len();
+    let width = (content_width as u16 + 8).max(30); // +8 for padding + border
+    // 1 content row + 2 border + 2 vertical padding = 5
+    let area = centered_fixed_rect(width, 5, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Red))
-        .title(" confirm drop ");
+        .title(" Confirm Drop ")
+        .title_style(Style::new().bold().fg(Color::Red))
+        .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let y = inner.y + inner.height / 2;
     let msg = Line::from(vec![
-        Span::raw("  Drop task "),
+        Span::raw("Drop task "),
         Span::styled(name, Style::new().bold()),
         Span::raw("? "),
         Span::styled("y", Style::new().bold().fg(Color::Red)),
         Span::raw("/"),
         Span::styled("n", Style::new().bold()),
     ]);
-    frame.render_widget(msg, Rect::new(inner.x, y, inner.width, 1));
+    frame.render_widget(msg, inner);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -485,6 +513,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     ])
     .areas(center_v);
     center
+}
+
+fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect::new(x, y, w, h)
 }
 
 fn status_display(status: &TaskStatus) -> (&'static str, Color) {

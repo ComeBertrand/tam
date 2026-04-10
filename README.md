@@ -8,6 +8,8 @@
 
 TAM manages **tasks** — named units of work that bind a directory to a series of AI agent runs. It unifies git worktree management and agent process supervision into a single tool.
 
+Running multiple AI coding agents means juggling tmux panes, manual worktree creation, and remembering which session to resume. TAM replaces that with a single abstraction: create a task, and it gets a worktree, a branch, and an agent — all under one name. Status is always derived from reality (daemon, git, filesystem), never stored, so it can't drift.
+
 ## Quick start
 
 ```bash
@@ -44,6 +46,17 @@ tam
 | `○ idle` | No agent running, task exists |
 | `◌ stale` | No activity for 30 days |
 | `✗ gone` | Worktree or branch deleted externally |
+
+## Features
+
+- **Task = worktree + agent** — `tam new feat -w` creates a branch, a worktree, and optionally starts an agent, all under one name
+- **Derived status** — never stores lifecycle state; computes it from the daemon, git, and filesystem every time you look
+- **TUI dashboard** — real-time task table with peek mode (scrollback preview without attaching)
+- **Session resume** — pick up where you left off or start fresh; session history is tracked in an append-only ledger
+- **Auto-daemon** — the daemon starts on first command and shuts down after 30s idle; no manual management
+- **Per-repo init** — `.tam.toml` copies untracked files and runs setup commands in new worktrees
+- **Desktop notifications** — configurable alerts when agents need input or hit permission prompts
+- **Custom TUI commands** — bind keys to shell commands (open editor, run tests, etc.)
 
 ## Commands
 
@@ -146,6 +159,16 @@ Per-repo worktree initialization is configured via `.tam.toml` at the project ro
 include = [".env", ".claude/**"]    # copy untracked files from main checkout
 commands = ["npm install"]          # run in the new worktree
 ```
+
+## Agent providers
+
+| Provider | State detection | Context tracking | Setup |
+|---|---|---|---|
+| **Claude Code** | Hook-based (immediate) | Reads session JSONL for token usage | `tam init --agent claude` |
+| **Codex** | PTY heuristic (5s idle) | Reads session JSONL | None |
+| **Any CLI** | PTY heuristic (5s idle) | None | None |
+
+Claude Code uses hooks (`~/.claude/settings.json`) to report state changes instantly — TAM knows the moment an agent needs input or hits a permission prompt. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
 
 ## Install
 

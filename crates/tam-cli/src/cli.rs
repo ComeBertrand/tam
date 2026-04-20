@@ -94,6 +94,10 @@ pub enum Commands {
         /// Output paths only, one per line
         #[arg(long)]
         raw: bool,
+
+        /// Output pretty names only, one per line (same format as `tam pick`)
+        #[arg(long)]
+        porcelain: bool,
     },
 
     /// Fuzzy project picker

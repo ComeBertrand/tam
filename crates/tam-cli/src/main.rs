@@ -329,7 +329,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Ls { path, json, raw } => {
+        Commands::Ls {
+            path,
+            json,
+            raw,
+            porcelain,
+        } => {
             let wt_config = tam_worktree::config::load_config()?;
             let root = path.unwrap_or_else(|| {
                 dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -338,14 +343,20 @@ async fn main() -> Result<()> {
             let paths = tam_worktree::discovery::discover(&root, &ignore, wt_config.max_depth)?;
 
             if json {
-                let entries: Vec<serde_json::Value> = paths
+                let entries = tam_worktree::pretty::build_pretty_names(&paths);
+                let json_entries: Vec<serde_json::Value> = entries
                     .iter()
-                    .map(|p| serde_json::json!({"path": p}))
+                    .map(|e| serde_json::json!({"path": e.path, "pretty": e.display_name}))
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&entries)?);
+                println!("{}", serde_json::to_string_pretty(&json_entries)?);
             } else if raw {
                 for p in &paths {
                     println!("{}", p.display());
+                }
+            } else if porcelain {
+                let entries = tam_worktree::pretty::build_pretty_names(&paths);
+                for entry in &entries {
+                    println!("{}", entry.display_name);
                 }
             } else {
                 let entries = tam_worktree::pretty::build_pretty_names(&paths);

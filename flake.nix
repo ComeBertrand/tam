@@ -9,7 +9,7 @@
       let pkgs = nixpkgs.legacyPackages.${system}; in {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "tam";
-          version = "0.3.4";
+          version = "0.3.5";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.installShellFiles ];

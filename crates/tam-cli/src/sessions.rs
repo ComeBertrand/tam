@@ -27,7 +27,7 @@ pub fn list_sessions_for_task(
         .iter()
         .filter(|r| r.provider == provider && r.session_id.is_some())
         .collect();
-    matching.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    matching.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
     let mut known_ids: Vec<&str> = matching
         .iter()
         .filter_map(|r| r.session_id.as_deref())
@@ -115,7 +115,7 @@ fn list_claude_sessions(dir: &Path) -> Vec<SessionInfo> {
         });
     }
 
-    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
     sessions
 }
 
@@ -272,7 +272,7 @@ fn list_codex_sessions(dir: &Path) -> Vec<SessionInfo> {
         }
     }
 
-    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
     sessions
 }
 

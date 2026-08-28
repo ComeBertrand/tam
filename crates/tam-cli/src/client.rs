@@ -6,6 +6,7 @@ use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
 use tam_proto::{Request, Response, ServerMessage};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::signal::unix::{signal, SignalKind};
 
 const DETACH_KEY: u8 = 0x1d; // ctrl-]
 
@@ -197,16 +198,19 @@ impl Client {
             }
         }
 
-        self.raw_relay().await
+        self.raw_relay(id).await
     }
 
     /// Bidirectional relay: stdin→socket, socket→stdout.
     /// Intercepts the detach key (ctrl-]) to break out.
-    async fn raw_relay(&mut self) -> Result<()> {
+    async fn raw_relay(&mut self, id: &str) -> Result<()> {
         let mut stdout = tokio::io::stdout();
         let mut socket_buf = [0u8; 4096];
         let mut filter = KbdProtoFilter::new();
         let mut filtered = Vec::with_capacity(4096);
+        // Watch for local terminal resizes so we can keep the agent's PTY in sync.
+        let mut winch =
+            signal(SignalKind::window_change()).context("failed to listen for terminal resize")?;
 
         // Dedicated stdin reader — never cancelled by select!
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -250,6 +254,18 @@ impl Client {
                             stdout.flush().await?;
                         }
                         Err(_) => break,
+                    }
+                }
+                // Terminal resized: tell the daemon to resize the agent's PTY so it
+                // redraws at the new size. Sent on a separate control connection
+                // because this socket is in raw byte-relay mode. try_connect avoids
+                // any stderr noise (the daemon is already up — we're attached to it).
+                _ = winch.recv() => {
+                    let (cols, rows) = terminal_size();
+                    if let Ok(Some(mut c)) = Client::try_connect().await {
+                        let _ = c
+                            .send(Request::Resize { id: id.to_string(), cols, rows })
+                            .await;
                     }
                 }
             }

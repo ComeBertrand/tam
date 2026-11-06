@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "tam-cli"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "tam-daemon"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "dirs",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "tam-proto"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "tam-worktree"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "colored",

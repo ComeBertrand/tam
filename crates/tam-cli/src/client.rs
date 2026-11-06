@@ -4,7 +4,8 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, Result};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
 use tam_proto::{Request, Response, ServerMessage};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::UnixStream;
 
 const DETACH_KEY: u8 = 0x1d; // ctrl-]
@@ -179,6 +180,8 @@ impl Client {
     /// caller is responsible for raw mode and cleanup.
     /// Returns when the user detaches (ctrl-]) or the connection closes.
     pub async fn attach_relay(mut self, id: &str, cols: u16, rows: u16) -> Result<()> {
+        // Before Attach, so a tty failure doesn't abort an established attach.
+        let tty = open_tty_nonblocking()?;
         let resp = self
             .send(Request::Attach {
                 id: id.into(),
@@ -197,47 +200,34 @@ impl Client {
             }
         }
 
-        self.raw_relay().await
+        self.raw_relay(&tty).await
     }
 
     /// Bidirectional relay: stdin→socket, socket→stdout.
     /// Intercepts the detach key (ctrl-]) to break out.
-    async fn raw_relay(&mut self) -> Result<()> {
+    async fn raw_relay(&mut self, tty: &AsyncFd<std::fs::File>) -> Result<()> {
         let mut stdout = tokio::io::stdout();
         let mut socket_buf = [0u8; 4096];
         let mut filter = KbdProtoFilter::new();
         let mut filtered = Vec::with_capacity(4096);
-
-        // Dedicated stdin reader — never cancelled by select!
-        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-        tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let mut buf = [0u8; 4096];
-            loop {
-                match stdin.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stdin_tx.send(buf[..n].to_vec()).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let mut tty_buf = [0u8; 4096];
 
         loop {
             tokio::select! {
                 biased;
                 // Keyboard input → agent (priority: detect detach key promptly)
-                Some(data) = stdin_rx.recv() => {
+                result = read_tty(tty, &mut tty_buf) => {
+                    let data = match result.context("failed to read from terminal")? {
+                        0 => break,
+                        n => &tty_buf[..n],
+                    };
                     if let Some(pos) = data.iter().position(|&b| b == DETACH_KEY) {
                         if pos > 0 {
                             self.writer.write_all(&data[..pos]).await?;
                         }
                         break;
                     }
-                    self.writer.write_all(&data).await?;
+                    self.writer.write_all(data).await?;
                 }
                 // Agent output → terminal (filtered)
                 result = self.reader.read(&mut socket_buf) => {
@@ -341,6 +331,39 @@ impl KbdProtoFilter {
             self.state = FilterState::Normal;
         }
     }
+}
+
+/// Reopen stdin's terminal as a fresh, non-blocking file description.
+///
+/// Reading through tokio's `stdin()` would park a blocking-pool thread in
+/// `read(0)` that cannot be cancelled: after detach it lingers and steals the
+/// next keystroke, and it competes with any other reader of the tty. A
+/// separate open of the tty device lets us set O_NONBLOCK without touching
+/// fd 0's flags, and the reader goes away as soon as the `AsyncFd` is dropped.
+///
+/// Falls back to `/dev/tty` when stdin's device can't be reopened (e.g. a pty
+/// owned by another user under `sudo -u`).
+fn open_tty_nonblocking() -> Result<AsyncFd<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let open = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+    };
+    let file = nix::unistd::ttyname(std::io::stdin())
+        .map_err(std::io::Error::from)
+        .and_then(|path| open(&path))
+        .or_else(|_| open(std::path::Path::new("/dev/tty")))
+        .context("failed to open the terminal")?;
+    AsyncFd::new(file).context("failed to register the terminal with the reactor")
+}
+
+/// Cancel-safe read from the tty: bytes are only consumed once it's readable.
+async fn read_tty(tty: &AsyncFd<std::fs::File>, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    tty.async_io(Interest::READABLE, |mut file| file.read(buf))
+        .await
 }
 
 /// Get the current terminal dimensions.

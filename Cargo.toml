@@ -25,7 +25,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 ratatui = "0.29"
-crossterm = "0.28"
+# use-dev-tty: level-triggered poll(2) source that never blocks on a tty
+# drained by the attach relay (the default mio source does).
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 toml = "0.8"
 dirs = "6"
 colored = "3"

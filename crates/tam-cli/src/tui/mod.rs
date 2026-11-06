@@ -3,8 +3,6 @@ mod ui;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -94,31 +92,80 @@ pub async fn run() -> Result<()> {
     result
 }
 
-fn spawn_crossterm_reader() -> (tokio::sync::mpsc::UnboundedReceiver<Event>, Arc<AtomicBool>) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let active = Arc::new(AtomicBool::new(true));
-    let active_clone = active.clone();
+enum ReaderCtl {
+    /// Stop touching the tty; ack once the thread is out of poll/read.
+    Pause(tokio::sync::oneshot::Sender<()>),
+    Resume,
+}
 
-    std::thread::spawn(move || loop {
-        if !active_clone.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        match event::poll(Duration::from_millis(50)) {
-            Ok(true) => match event::read() {
-                Ok(ev) => {
-                    if tx.send(ev).is_err() {
-                        break;
+/// Crossterm event reader on a dedicated thread, pausable while attached.
+///
+/// Pausing is a handshake: a plain flag would only be checked between polls,
+/// so the thread could still be inside crossterm's (blocking) tty read when
+/// the attach relay starts reading too — and then swallow the user's keys.
+struct InputReader {
+    events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ctl: std::sync::mpsc::Sender<ReaderCtl>,
+}
+
+impl InputReader {
+    fn spawn() -> Self {
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (ctl, ctl_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut paused = false;
+            loop {
+                // Block on the control channel while paused, never on the tty.
+                let ctl = if paused {
+                    ctl_rx
+                        .recv()
+                        .map_err(|_| std::sync::mpsc::TryRecvError::Disconnected)
+                } else {
+                    ctl_rx.try_recv()
+                };
+                match ctl {
+                    Ok(ReaderCtl::Pause(ack)) => {
+                        paused = true;
+                        let _ = ack.send(());
+                        continue;
                     }
+                    Ok(ReaderCtl::Resume) => paused = false,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                 }
-                Err(_) => break,
-            },
-            Ok(false) => {}
-            Err(_) => break,
-        }
-    });
+                match event::poll(Duration::from_millis(50)) {
+                    Ok(true) => match event::read() {
+                        Ok(ev) => {
+                            if tx.send(ev).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    },
+                    Ok(false) => {}
+                    Err(_) => return,
+                }
+            }
+        });
 
-    (rx, active)
+        Self { events, ctl }
+    }
+
+    /// Returns once the reader thread no longer reads the tty.
+    async fn pause(&self) {
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        if self.ctl.send(ReaderCtl::Pause(ack)).is_ok() {
+            // Err means the thread exited — it isn't reading either.
+            let _ = acked.await;
+        }
+    }
+
+    /// Resume reading, dropping any events queued before the pause.
+    fn resume(&mut self) {
+        while self.events.try_recv().is_ok() {}
+        let _ = self.ctl.send(ReaderCtl::Resume);
+    }
 }
 
 async fn run_loop(
@@ -127,7 +174,7 @@ async fn run_loop(
     client: &mut Client,
     config: &Config,
 ) -> Result<()> {
-    let (mut ct_rx, ct_active) = spawn_crossterm_reader();
+    let mut input = InputReader::spawn();
     let mut peek_timer = tokio::time::interval(Duration::from_secs(2));
     peek_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut git_timer = tokio::time::interval(Duration::from_secs(30));
@@ -137,7 +184,7 @@ async fn run_loop(
         terminal.draw(|frame| ui::render(frame, app))?;
 
         let action = tokio::select! {
-            Some(ev) = ct_rx.recv() => {
+            Some(ev) = input.events.recv() => {
                 match ev {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         handle_key_event(key, app, config)
@@ -170,7 +217,7 @@ async fn run_loop(
                 refresh_peek(client, app).await;
             }
             Action::Attach { name } => {
-                ct_active.store(false, Ordering::Relaxed);
+                input.pause().await;
                 let provider = app
                     .tasks
                     .iter()
@@ -178,9 +225,9 @@ async fn run_loop(
                     .and_then(|t| t.agent_info.as_ref())
                     .map(|a| a.provider.clone())
                     .unwrap_or_default();
-                attach_agent(terminal, &name, &provider).await?;
-                ct_active.store(true, Ordering::Relaxed);
-                while ct_rx.try_recv().is_ok() {}
+                let attached = attach_agent(terminal, app, &name, &provider).await;
+                input.resume();
+                attached?;
                 app.set_tasks(build_task_list(client).await?);
                 refresh_peek(client, app).await;
             }
@@ -813,6 +860,7 @@ async fn do_run(
 
 async fn attach_agent(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
     name: &str,
     provider: &str,
 ) -> Result<()> {
@@ -827,13 +875,16 @@ async fn attach_agent(
     let agent_rows = if rows > 2 { rows - 1 } else { rows };
 
     let attach_client = Client::connect().await?;
-    let _result = attach_client.attach_relay(name, cols, agent_rows).await;
+    let result = attach_client.attach_relay(name, cols, agent_rows).await;
 
     client::reset_terminal_state();
 
     terminal.backend_mut().execute(EnterAlternateScreen)?;
     terminal.clear()?;
 
+    if let Err(e) = result {
+        app.set_status(format!("attach failed: {e:#}"), Duration::from_secs(5));
+    }
     Ok(())
 }
 

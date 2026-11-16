@@ -69,11 +69,12 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     std::env::set_var("PATH", path);
 
-    // Fake claude: record its arguments, then wait like an idle session.
+    // Fake claude: record its arguments (written aside then renamed, so the
+    // test never reads a partial list), then wait like an idle session.
     let args_file = root.join("claude-args");
     let script = format!(
-        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexec sleep 3600\n",
-        args_file.display()
+        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{f}.tmp'\nmv '{f}.tmp' '{f}'\nexec sleep 3600\n",
+        f = args_file.display()
     );
     let fake = bin.join("claude");
     std::fs::write(&fake, script).unwrap();

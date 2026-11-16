@@ -1259,12 +1259,21 @@ fn dropped_daemon_leaves_no_agent_behind() {
     }
 }
 
-/// Children of `pid`, from /proc.
+/// Children of `pid` (portable: `ps`, no /proc on macOS).
 fn child_pids(pid: u32) -> Vec<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .unwrap_or_default()
-        .split_whitespace()
-        .filter_map(|p| p.parse().ok())
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace().map(|n| n.parse::<u32>());
+            match (f.next(), f.next()) {
+                (Some(Ok(child)), Some(Ok(parent))) if parent == pid => Some(child),
+                _ => None,
+            }
+        })
         .collect()
 }
 
@@ -1272,17 +1281,14 @@ fn child_pids(pid: u32) -> Vec<u32> {
 fn alive(pid: u32) -> bool {
     // A killed orphan may linger briefly as a zombie until init reaps it
     for _ in 0..50 {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Err(_) => return false,
-            Ok(stat) => {
-                let state = stat
-                    .rsplit(')')
-                    .next()
-                    .and_then(|r| r.split_whitespace().next());
-                if state == Some("Z") {
-                    return false;
-                }
-            }
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        if stat.is_empty() || stat.starts_with('Z') {
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

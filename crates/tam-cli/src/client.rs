@@ -7,8 +7,19 @@ use tam_proto::{Request, Response, ServerMessage};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::UnixStream;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::{sleep_until, Duration, Instant};
 
 const DETACH_KEY: u8 = 0x1d; // ctrl-]
+
+/// Minimum spacing between two PTY resizes sent while attached. Dragging a
+/// window edge fires a burst of SIGWINCH; this coalesces it into a few
+/// requests while still delivering the final size.
+const RESIZE_THROTTLE: Duration = Duration::from_millis(40);
+
+/// Upper bound on a resize round-trip. The relay waits on it, so an
+/// unresponsive daemon must not freeze the attach session.
+const RESIZE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct Client {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -169,7 +180,7 @@ impl Client {
 
         let original = enter_raw_mode()?;
         let (cols, rows) = terminal_size();
-        let result = self.attach_relay(id, cols, rows).await;
+        let result = self.attach_relay(id, cols, rows, terminal_size).await;
         restore_terminal(&original);
         reset_terminal_state();
         eprintln!("[detached from {}]", id);
@@ -179,9 +190,22 @@ impl Client {
     /// Attach handshake + raw byte relay. Does NOT change terminal mode —
     /// caller is responsible for raw mode and cleanup.
     /// Returns when the user detaches (ctrl-]) or the connection closes.
-    pub async fn attach_relay(mut self, id: &str, cols: u16, rows: u16) -> Result<()> {
+    ///
+    /// `cols`/`rows` size the agent's PTY on attach. When the local terminal
+    /// is resized, `on_resize` is called to redraw any caller chrome and
+    /// return the agent's new size, which is forwarded to the daemon.
+    pub async fn attach_relay(
+        mut self,
+        id: &str,
+        cols: u16,
+        rows: u16,
+        on_resize: impl FnMut() -> (u16, u16),
+    ) -> Result<()> {
         // Before Attach, so a tty failure doesn't abort an established attach.
         let tty = open_tty_nonblocking()?;
+        // Before Attach too, so a resize racing the handshake isn't lost.
+        let winch =
+            signal(SignalKind::window_change()).context("failed to listen for terminal resize")?;
         let resp = self
             .send(Request::Attach {
                 id: id.into(),
@@ -200,21 +224,42 @@ impl Client {
             }
         }
 
-        self.raw_relay(&tty).await
+        self.raw_relay(id, &tty, winch, on_resize).await
     }
 
     /// Bidirectional relay: stdin→socket, socket→stdout.
-    /// Intercepts the detach key (ctrl-]) to break out.
-    async fn raw_relay(&mut self, tty: &AsyncFd<std::fs::File>) -> Result<()> {
+    /// Intercepts the detach key (ctrl-]) to break out, and forwards local
+    /// terminal resizes to the agent's PTY.
+    async fn raw_relay(
+        &mut self,
+        id: &str,
+        tty: &AsyncFd<std::fs::File>,
+        mut winch: tokio::signal::unix::Signal,
+        mut on_resize: impl FnMut() -> (u16, u16),
+    ) -> Result<()> {
         let mut stdout = tokio::io::stdout();
         let mut socket_buf = [0u8; 4096];
         let mut filter = KbdProtoFilter::new();
         let mut filtered = Vec::with_capacity(4096);
         let mut tty_buf = [0u8; 4096];
+        // When set, a resize is pending and will be sent at this instant.
+        let mut resize_at: Option<Instant> = None;
 
         loop {
             tokio::select! {
                 biased;
+                // Resizes first: they are rarely ready, and polled last they
+                // would starve behind a steady stream of agent output.
+                _ = winch.recv() => {
+                    resize_at.get_or_insert_with(|| Instant::now() + RESIZE_THROTTLE);
+                }
+                // The deadline expression is evaluated even when the branch is
+                // disabled, hence the fallback instead of an unwrap.
+                _ = sleep_until(resize_at.unwrap_or_else(Instant::now)), if resize_at.is_some() => {
+                    resize_at = None;
+                    let (cols, rows) = on_resize();
+                    send_resize(id, cols, rows).await;
+                }
                 // Keyboard input → agent (priority: detect detach key promptly)
                 result = read_tty(tty, &mut tty_buf) => {
                     let data = match result.context("failed to read from terminal")? {
@@ -247,6 +292,24 @@ impl Client {
 
         Ok(())
     }
+}
+
+/// Resize an agent's PTY. Sent on a separate control connection because the
+/// attach socket is in raw byte-relay mode. Best effort: a failed resize
+/// must not break the attach session.
+async fn send_resize(id: &str, cols: u16, rows: u16) {
+    let request = async {
+        if let Ok(Some(mut control)) = Client::try_connect().await {
+            let _ = control
+                .send(Request::Resize {
+                    id: id.to_string(),
+                    cols,
+                    rows,
+                })
+                .await;
+        }
+    };
+    let _ = tokio::time::timeout(RESIZE_TIMEOUT, request).await;
 }
 
 /// Strips keyboard protocol escape sequences from a byte stream.

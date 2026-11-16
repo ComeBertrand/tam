@@ -77,6 +77,12 @@ pub enum Request {
     Scrollback {
         id: String,
     },
+    /// Resize an agent's PTY (e.g. when a viewer's terminal changes size).
+    Resize {
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
     /// Hook callback from an agent process (e.g. Claude Code hooks).
     HookEvent {
         agent_id: String,
@@ -380,6 +386,29 @@ mod tests {
                 assert_eq!(id, "test");
                 assert_eq!(cols, 120);
                 assert_eq!(rows, 40);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn request_resize_serde() {
+        let req = Request::Resize {
+            id: "test".into(),
+            cols: 100,
+            rows: 30,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"resize","id":"test","cols":100,"rows":30}"#
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::Resize { id, cols, rows } => {
+                assert_eq!(id, "test");
+                assert_eq!(cols, 100);
+                assert_eq!(rows, 30);
             }
             _ => panic!("wrong variant"),
         }

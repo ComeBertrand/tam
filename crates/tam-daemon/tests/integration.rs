@@ -748,3 +748,82 @@ async fn kill_emits_event() {
 
     assert!(got_exit, "expected AgentExited event for kill-evt");
 }
+
+#[tokio::test]
+async fn resize_nonexistent_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut stream = UnixStream::connect(&sock).await.unwrap();
+
+    let resp = send(
+        &mut stream,
+        &Request::Resize {
+            id: "nope".into(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await;
+    match resp {
+        Response::Error { message } => assert!(message.contains("not found")),
+        other => panic!("expected Error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn resize_updates_pty_and_signals_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut stream = UnixStream::connect(&sock).await.unwrap();
+
+    // The agent prints its PTY size whenever it receives SIGWINCH.
+    send(
+        &mut stream,
+        &Request::Spawn {
+            provider: "bash".into(),
+            dir: PathBuf::from("/tmp"),
+            id: Some("resize-test".into()),
+            args: vec![
+                "-c".into(),
+                "trap 'echo \"size=$(stty size)\"' WINCH; while :; do sleep 0.05; done".into(),
+            ],
+            resume_session: None,
+            prompt: None,
+        },
+    )
+    .await;
+
+    // Let bash install the trap before signalling it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let resp = send(
+        &mut stream,
+        &Request::Resize {
+            id: "resize-test".into(),
+            cols: 123,
+            rows: 45,
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok), "got {:?}", resp);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut last = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Response::Scrollback { data } = send(
+            &mut stream,
+            &Request::Scrollback {
+                id: "resize-test".into(),
+            },
+        )
+        .await
+        {
+            if data.contains("size=45 123") {
+                return;
+            }
+            last = data;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("agent never saw the new size; scrollback: {:?}", last);
+}

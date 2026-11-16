@@ -874,8 +874,24 @@ async fn attach_agent(
 
     let agent_rows = if rows > 2 { rows - 1 } else { rows };
 
+    // On resize, redraw the status bar at the new bottom row (keeping the
+    // agent's cursor) and give the agent everything above it.
+    let mut bar_row = (rows > 2).then_some(rows);
+    let on_resize = move || {
+        let (cols, rows) = client::terminal_size();
+        let new_bar_row = (rows > 2).then_some(rows);
+        redraw_status_bar(name, provider, cols, bar_row, new_bar_row);
+        bar_row = new_bar_row;
+        match new_bar_row {
+            Some(rows) => (cols, rows - 1),
+            None => (cols, rows),
+        }
+    };
+
     let attach_client = Client::connect().await?;
-    let result = attach_client.attach_relay(name, cols, agent_rows).await;
+    let result = attach_client
+        .attach_relay(name, cols, agent_rows, on_resize)
+        .await;
 
     client::reset_terminal_state();
 
@@ -888,18 +904,62 @@ async fn attach_agent(
     Ok(())
 }
 
+/// Draw the status bar on the bottom row and confine scrolling above it,
+/// leaving the cursor at the top-left for the agent.
 fn draw_status_bar(name: &str, provider: &str, cols: u16, rows: u16) {
     use std::io::Write;
     let mut out = std::io::stdout();
-
-    let bar = format!(" tam > {name} ({provider})");
-    let hint = "ctrl-]: detach ";
-    let padding = (cols as usize).saturating_sub(bar.len() + hint.len());
-
-    let _ = write!(out, "\x1b[1;{}r", rows - 1);
-    let _ = write!(out, "\x1b[{rows};1H\x1b[7m{bar}{:padding$}{hint}\x1b[m", "");
+    let _ = out.write_all(status_bar_seq(name, provider, cols, rows).as_bytes());
     let _ = write!(out, "\x1b[1;1H");
     let _ = out.flush();
+}
+
+/// Move the status bar after a resize without moving the agent's cursor.
+///
+/// `old_row`/`new_row` are the bar's bottom row before and after the resize,
+/// `None` when the terminal is too short to show it.
+fn redraw_status_bar(
+    name: &str,
+    provider: &str,
+    cols: u16,
+    old_row: Option<u16>,
+    new_row: Option<u16>,
+) {
+    use std::io::Write;
+    let mut seq = String::new();
+    // Growing leaves the old bar inside the agent's area; the agent has not
+    // drawn there yet, so it is ours to clear. (Shrinking pushes it off-screen.)
+    if let Some(old) = old_row {
+        if new_row.is_none_or(|new| old < new) {
+            seq.push_str(&format!("\x1b[{old};1H\x1b[2K"));
+        }
+    }
+    match new_row {
+        Some(rows) => seq.push_str(&status_bar_seq(name, provider, cols, rows)),
+        // No room for a bar: give the agent the whole screen back.
+        None => seq.push_str("\x1b[r"),
+    }
+    let mut out = std::io::stdout();
+    // DECSC/DECRC around the redraw: setting the scroll region homes the cursor.
+    let _ = write!(out, "\x1b7{seq}\x1b8");
+    let _ = out.flush();
+}
+
+/// Scroll region above the bottom row, then the bar itself on the bottom row.
+fn status_bar_seq(name: &str, provider: &str, cols: u16, rows: u16) -> String {
+    let bar = format!(" tam > {name} ({provider})");
+    let hint = "ctrl-]: detach ";
+    let cols = cols as usize;
+    let padding = cols.saturating_sub(bar.chars().count() + hint.len());
+    // Cut to the row width so a narrow terminal doesn't wrap the bar.
+    let line: String = format!("{bar}{:padding$}{hint}", "")
+        .chars()
+        .take(cols)
+        .collect();
+    format!(
+        "\x1b[1;{}r\x1b[{rows};1H\x1b[2K\x1b[7m{line}\x1b[m",
+        rows - 1
+    )
 }
 
 async fn stop_agent(client: &mut Client, app: &mut App, name: &str) -> Result<()> {

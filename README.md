@@ -74,6 +74,7 @@ tam
 - **Auto-daemon** — the daemon starts on first command and shuts down after 30s idle; no manual management
 - **Per-repo init** — `.tam.toml` copies untracked files and runs setup commands in new worktrees
 - **Desktop notifications** — configurable alerts when agents need input or hit permission prompts
+- **Messages** — `tam msg` sends a message to a running session without attaching, from you or from another agent, and can wait for the reply
 - **Custom TUI commands** — bind keys to shell commands (open editor, run tests, etc.)
 
 ## Commands
@@ -124,6 +125,17 @@ tam ls PATH                    Discover under a specific directory
 tam pick                       Fuzzy project picker (prints selected path)
 tam pick -F "dmenu -l 20"     Use a custom finder instead of fzf
 ```
+
+### Messages
+
+```
+tam msg NAME TEXT              Send a message to the member's agent (TEXT or stdin)
+tam msg NAME TEXT --wait       ...and print its reply (--timeout SECS, default 90)
+
+tam history NAME               The task's agent runs and messages
+```
+
+A Claude agent gets a message right away: when idle it wakes up, when busy it reads it at its next step (after a pending permission prompt is answered). Other agents get it typed in once idle. A member with no running agent gets it when its next agent starts. Sent from inside an agent TAM started, a message comes from that agent, which the recipient can answer with `tam msg`; otherwise it comes from you. The reply `--wait` prints is the recipient's next message back, or its response at the end of the turn that got the message. Two agents answering each other are stopped after 6 messages, until you prompt one of them; an agent sends at most 20 messages per 10 minutes.
 
 ### TUI
 
@@ -214,6 +226,8 @@ commands = ["npm install"]
 Claude Code reports state changes through hooks that TAM injects into each agent it spawns (`claude --settings`, nothing is written to your Claude settings): TAM knows the moment an agent finishes, asks a question, needs a permission or fails on an API error. Claude runs no hooks until a folder is trusted, so a new worktree shows `input` while Claude's trust prompt waits. An interrupted turn fires no hook; TAM takes a working agent silent for 10s as back at the prompt. If you ran `tam init --agent claude` with an older version, run it again to remove the global hooks it installed. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
 
 Each task member has a current session per agent, which `tam run` and `r` resume: for Claude Code, the last session the agent had a turn in, as its hooks report it (so a `/clear` followed by a prompt moves it). `tam run --new-session` and `R` start a new one, which becomes current once you use it. A session whose transcript Claude deleted is not resumed: TAM says so and you start a new one. Codex and other agents report no sessions: they start a new session unless given one (`tam run --session ID`, codex only).
+
+Messages (`tam msg`) reach a Claude agent through one more injected hook, which runs in the background and wakes the session (shown as `tam message` in its transcript). Other providers get them typed into their input once idle: as a paste for Codex, as a single line for any other program.
 
 ## Install
 

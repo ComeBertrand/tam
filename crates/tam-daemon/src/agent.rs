@@ -399,6 +399,16 @@ impl Agent {
     pub fn screen_changes(&self) -> watch::Receiver<()> {
         self.screen_changed.subscribe()
     }
+
+    /// Whether messages reach the agent through its inbox hook.
+    pub fn inbox_hook(&self) -> bool {
+        self.provider.inbox_hook()
+    }
+
+    /// Bytes that type `text` into the agent's input (Enter not included).
+    pub fn pty_input(&self, text: &str) -> Vec<u8> {
+        self.provider.pty_input(text)
+    }
 }
 
 impl Drop for Agent {

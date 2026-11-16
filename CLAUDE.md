@@ -129,6 +129,27 @@ adopt). `tam-cli` depends on all three.
   `session_exists()` (Claude deletes old transcripts); codex resumes only an
   explicit id, generic agents never. No session picker, no transcript scanning
   in `tam-cli`.
+- **Messages** — `tam msg` (`SendMessage`; sender = the member of the
+  caller's `$TAM_AGENT_ID`, resolved by the daemon, else the user). Messages
+  are ledger events kept with the recipient member (`MessageSent`,
+  `MessageDelivered`): undelivered ones survive restarts and wait for the
+  member's next agent. Delivery is in `inbox.rs` (daemon handlers at the end
+  of `daemon.rs`). Claude agents get two more per-spawn hooks (`SessionStart`,
+  `Stop`) running `tam inbox-wait` with `asyncRewake` (7-day timeout): it
+  holds a `WaitInbox` connection (handled like Attach), the daemon hands it
+  the queued messages, it prints them on stderr and exits 2, and Claude shows
+  them to the model: waking it when idle, else at its next step (Claude's own
+  queue, also held while a permission dialog is open). The newest waiter
+  wins. Handed over is not delivered: a message is delivered when its id
+  shows in the next `UserPromptSubmit` prompt, and goes back to the queue if
+  the agent exits first. Agents without the hook (codex, generic) get it
+  typed into the PTY once idle (bracketed paste, else one line), written
+  outside the state lock. `WaitReply` (`--wait`): the recipient's next
+  message to the sender, or its last response at the end of the turn that
+  got it (a message a `--wait` returned counts as delivered in the waiting
+  agent's turn, never shown again: two agents waiting on each other each
+  get a reply). Loop guard: hop count (at most 6, reset when the user prompts the
+  agent) and 20 messages per 10 minutes per agent.
 - **Testing hooks by hand** — run the dev daemon with temp `XDG_RUNTIME_DIR`
   (short path: Unix socket limit), `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
@@ -145,11 +166,13 @@ cargo test
 
 ## Testing
 
-- Unit tests are inline in each module (~315 across all crates)
-- Integration tests in `crates/tam-daemon/tests/` (~50 async tests, real
+- Unit tests are inline in each module (~340 across all crates)
+- Integration tests in `crates/tam-daemon/tests/` (~60 async tests, real
   sockets/PTYs/git repos) and `crates/tam-cli/tests/` (`tam hook-notify`
   against a daemon, session resume with a fake `claude`; one test per file:
-  they set process environment)
+  they set process environment; `tam msg`/`inbox-wait`/`history` against a
+  daemon, child processes with temp XDG dirs and no
+  `TAM_AGENT_ID`/`TAM_SOCKET`)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

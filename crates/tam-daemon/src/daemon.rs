@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tam_proto::{
-    AgentInfo, AgentState, Event, MemberHealth, NewMember, Request, Response, SessionChoice,
-    TaskInfo,
+    AgentInfo, AgentState, Event, MemberHealth, MessageInfo, NewMember, Request, Response,
+    SessionChoice, TaskInfo,
 };
 use tam_worktree::worktree;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -17,6 +17,7 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
+use crate::inbox::{self, Handover, Inbox, ReplyOutcome};
 use crate::ledger::Ledger;
 use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
@@ -45,6 +46,8 @@ struct DaemonState {
     connected_clients: Arc<AtomicUsize>,
     /// When set, the daemon will shut down after this instant if still idle.
     idle_deadline: Option<Instant>,
+    /// Message delivery state (the messages are in the ledger).
+    inbox: Inbox,
 }
 
 /// Default idle timeout before daemon auto-shuts down (seconds).
@@ -122,6 +125,7 @@ impl Daemon {
             socket_path: self.socket_path.clone(),
             connected_clients: Arc::new(AtomicUsize::new(0)),
             idle_deadline: None,
+            inbox: Inbox::default(),
         }));
 
         // Create socket directory
@@ -243,6 +247,11 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
                 );
             }
             let _ = state.event_tx.send(Event::StateChange { id, old, new });
+        }
+
+        // Type queued messages into the idle agents without an inbox hook.
+        for delivery in state.pty_deliveries() {
+            tokio::spawn(type_into_pty(state_arc.clone(), delivery));
         }
 
         // Auto-shutdown: if no agents and no clients, start countdown
@@ -370,6 +379,7 @@ impl DaemonState {
             id: id.to_string(),
             exit_code,
         });
+        self.inbox.agent_gone(id, agent.member());
         let Some(member) = agent.member() else {
             return;
         };
@@ -588,6 +598,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         },
                     };
                     write_response(&mut writer, &response).await?;
+                } else if let Request::WaitInbox { agent_id } = request {
+                    // Takes over the connection until messages are handed over.
+                    return handle_wait_inbox(buf_reader, writer, &state, &agent_id).await;
                 } else {
                     let response = dispatch(request, &state).await;
                     write_response(&mut writer, &response).await?;
@@ -742,7 +755,10 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             agent_id,
             event,
             payload,
-        } => handle_hook_event(state, &agent_id, &event, payload.as_ref()).await,
+        } => {
+            handle_inbox_hook(state, &agent_id, &event, payload.as_ref()).await;
+            handle_hook_event(state, &agent_id, &event, payload.as_ref()).await
+        }
         Request::Shutdown => handle_shutdown(state).await,
         Request::CreateTask { name, members } => handle_create_task(state, &name, &members).await,
         Request::ListTasks => Response::Tasks {
@@ -849,6 +865,26 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::WatchScreen { .. } => Response::Error {
             message: "watch_screen should be handled by connection handler".into(),
         },
+        Request::SendMessage { to, text, from } => {
+            handle_send_message(state, &to, &text, from.as_deref()).await
+        }
+        Request::WaitInbox { .. } => Response::Error {
+            message: "wait_inbox should be handled by connection handler".into(),
+        },
+        Request::WaitReply { id, timeout_secs } => {
+            handle_wait_reply(state, &id, timeout_secs).await
+        }
+        Request::ListMessages { task } => {
+            let state = state.lock().await;
+            match task {
+                Some(task) if state.ledger.task(&task).is_none() => Response::Error {
+                    message: format!("task '{}' not found", task),
+                },
+                task => Response::Messages {
+                    messages: state.ledger.messages(task.as_deref()),
+                },
+            }
+        }
     }
 }
 
@@ -1592,4 +1628,432 @@ async fn handle_adopt_worktree(
     }
     let runs = state.ledger.runs(&task.name);
     Response::Task { task, runs }
+}
+
+// ---------------------------------------------------------------------------
+// Messages (see `inbox.rs`)
+// ---------------------------------------------------------------------------
+
+/// Queued messages to type into an agent's PTY, outside the state lock.
+struct PtyDelivery {
+    member: String,
+    ids: Vec<String>,
+    master: Arc<OwnedFd>,
+    input: Vec<u8>,
+}
+
+impl DaemonState {
+    /// The member a caller's agent id stands for: the member its agent runs
+    /// for, or the member with that id. `None`: the user.
+    fn sender_member(&self, agent_id: Option<&str>) -> Option<String> {
+        let id = agent_id?;
+        match self.agents.get(id) {
+            Some(agent) => agent.member().map(str::to_string),
+            None => self.ledger.member(id).map(|(_, m)| m.id),
+        }
+    }
+
+    /// A member's messages waiting to be handed over (queued, not in flight).
+    fn queued_messages(&self, member: &str) -> Vec<MessageInfo> {
+        let flying = self.inbox.in_flight(member);
+        self.ledger
+            .pending_messages(member)
+            .into_iter()
+            .filter(|m| !flying.contains(&m.id))
+            .collect()
+    }
+
+    /// Hand a member's queued messages to its agent's inbox hook, if one
+    /// waits. (A member's agent runs under the member id.)
+    fn hand_over_messages(&mut self, member: &str) {
+        if !self.inbox.has_waiter(member) {
+            return;
+        }
+        let queued = self.queued_messages(member);
+        if queued.is_empty() {
+            return;
+        }
+        let (text, ids) = inbox::batch(&queued);
+        if self.inbox.hand_over(member, member, text, ids.clone()) {
+            info!(member = %member, ids = ?ids, "messages handed to the inbox hook");
+        }
+    }
+
+    /// Messages to type into the idle agents that have no inbox hook: the
+    /// oldest queued one each.
+    fn pty_deliveries(&mut self) -> Vec<PtyDelivery> {
+        let ready: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|(id, agent)| {
+                agent.member() == Some(id.as_str())
+                    && !agent.inbox_hook()
+                    && !self.inbox.has_waiter(id)
+                    && matches!(agent.current_state(), AgentState::Idle | AgentState::Input)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut deliveries = Vec::new();
+        for member in ready {
+            let Some(message) = self.queued_messages(&member).into_iter().next() else {
+                continue;
+            };
+            let agent = &self.agents[&member];
+            let input = agent.pty_input(&inbox::pty_text(std::slice::from_ref(&message)));
+            let ids = vec![message.id];
+            self.inbox.take_off(&member, &ids);
+            deliveries.push(PtyDelivery {
+                master: agent.pty_master(),
+                member,
+                ids,
+                input,
+            });
+        }
+        deliveries
+    }
+
+    /// A message reached its recipient's agent: record it and tell clients.
+    /// `in_turn`: the agent reports the end of the turn that got it (whose
+    /// last response is the reply).
+    fn record_delivery(&mut self, id: &str, in_turn: bool) {
+        match self.ledger.message_delivered(id) {
+            Ok(Some(message)) => {
+                info!(id = %id, to = %message.to, "message delivered");
+                self.inbox.record_hop(&message.to, message.hop);
+                if in_turn {
+                    self.inbox.delivered_this_turn(&message.to, id);
+                }
+                self.broadcast(Event::MessageDelivered { message });
+            }
+            Ok(None) => {}
+            Err(e) => error!(id = %id, "failed to record a message delivery: {e:#}"),
+        }
+    }
+
+    /// Why a message waits; `None` once it reached its agent.
+    fn pending_note(&self, message: &MessageInfo) -> Option<String> {
+        if message.delivered_at.is_some() {
+            return None;
+        }
+        let to = &message.to_label;
+        Some(match self.agents.get(&message.to) {
+            None => format!("no agent is running in '{to}': it gets the message when one starts"),
+            Some(_) if self.inbox.in_flight(&message.to).contains(&message.id) => {
+                format!("handed to the agent of '{to}', which reads it at its next step")
+            }
+            Some(agent) if agent.inbox_hook() => format!(
+                "waiting for the inbox hook of '{to}' (armed when its session starts and after each turn)"
+            ),
+            Some(_) => format!("typed into the agent of '{to}' once it is idle"),
+        })
+    }
+}
+
+async fn handle_send_message(
+    state: &Arc<Mutex<DaemonState>>,
+    to: &str,
+    text: &str,
+    from: Option<&str>,
+) -> Response {
+    let mut state = state.lock().await;
+    match send_message(&mut state, to, text, from) {
+        Ok(message) => {
+            let pending = state.pending_note(&message);
+            Response::Sent {
+                message: Box::new(message),
+                pending,
+            }
+        }
+        Err(message) => Response::Error { message },
+    }
+}
+
+/// Check, record and route a message.
+fn send_message(
+    state: &mut DaemonState,
+    to: &str,
+    text: &str,
+    from: Option<&str>,
+) -> Result<MessageInfo, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("empty message".into());
+    }
+    let len = text.chars().count();
+    if len > inbox::MAX_TEXT {
+        return Err(format!(
+            "message too long: {len} characters (at most {})",
+            inbox::MAX_TEXT
+        ));
+    }
+    let (task, recipient) = state.ledger.resolve(to).map_err(|e| format!("{e:#}"))?;
+    if state.dropping.contains(&task.name) {
+        return Err(format!("task '{}' is being dropped", task.name));
+    }
+    let sender = state.sender_member(from);
+    let (hop, reply_to) = match sender.as_deref() {
+        None => (0, None),
+        Some(sender) if sender == recipient.id => {
+            return Err("cannot send a message to yourself".into())
+        }
+        Some(sender) => {
+            let hop = state.inbox.next_hop(sender);
+            if hop > inbox::MAX_HOPS {
+                let label = state
+                    .ledger
+                    .member_label(sender)
+                    .unwrap_or_else(|| sender.to_string());
+                return Err(format!(
+                    "loop guard: this would be message {hop} of an exchange between agents (at most {}); it starts over once the user prompts '{label}'",
+                    inbox::MAX_HOPS
+                ));
+            }
+            state.inbox.check_rate(sender)?;
+            let since = crate::ledger::now().saturating_sub(inbox::REPLY_WINDOW_SECS);
+            let answered = state
+                .ledger
+                .unanswered_message(&recipient.id, sender, since);
+            (hop, answered)
+        }
+    };
+    let message = state
+        .ledger
+        .send_message(
+            sender.as_deref(),
+            &recipient.id,
+            text,
+            hop,
+            reply_to.as_deref(),
+        )
+        .map_err(|e| format!("cannot record the message: {e:#}"))?;
+    info!(id = %message.id, from = %message.from_label, to = %message.to_label, hop, "message sent");
+    state.broadcast(Event::MessageSent {
+        message: message.clone(),
+    });
+    if let Some(answered) = &message.reply_to {
+        let outcome = ReplyOutcome::Reply {
+            message: Some(message.clone()),
+            text: message.text.clone(),
+        };
+        if state.inbox.replied(answered, outcome) > 0 {
+            // A `tam msg --wait` of the recipient returned it: delivered,
+            // in the recipient's current turn (whose response answers it in
+            // turn), and not shown to its session a second time.
+            state.record_delivery(&message.id, true);
+            return Ok(state.ledger.message(&message.id).unwrap_or(message));
+        }
+    }
+    state.hand_over_messages(&recipient.id);
+    Ok(message)
+}
+
+async fn handle_wait_reply(
+    state: &Arc<Mutex<DaemonState>>,
+    id: &str,
+    timeout_secs: u64,
+) -> Response {
+    let rx = {
+        let mut state = state.lock().await;
+        if state.ledger.message(id).is_none() {
+            return Response::Error {
+                message: format!("message '{id}' not found"),
+            };
+        }
+        match state.inbox.wait_reply(id) {
+            Ok(outcome) => return reply_response(outcome),
+            Err(rx) => rx,
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(outcome)) => reply_response(outcome),
+        _ => {
+            state.lock().await.inbox.prune_reply_waiters(id);
+            Response::Error {
+                message: format!("no reply to {id} within {timeout_secs}s"),
+            }
+        }
+    }
+}
+
+fn reply_response(outcome: ReplyOutcome) -> Response {
+    match outcome {
+        ReplyOutcome::Reply { message, text } => Response::Reply {
+            message: message.map(Box::new),
+            text,
+        },
+        ReplyOutcome::Failed(message) => Response::Error { message },
+    }
+}
+
+/// What the hooks of a member's agent tell about its messages: the prompt
+/// that shows them to the model (delivered), a prompt the user typed (its
+/// agent-to-agent exchanges start over), the end of a turn (the reply to
+/// the messages it got).
+async fn handle_inbox_hook(
+    state: &Arc<Mutex<DaemonState>>,
+    agent_id: &str,
+    event: &str,
+    payload: Option<&serde_json::Value>,
+) {
+    let mut state = state.lock().await;
+    let Some(member) = state
+        .agents
+        .get(agent_id)
+        .and_then(Agent::member)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let field = |key: &str| {
+        payload
+            .and_then(|p| p.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    match event {
+        "UserPromptSubmit" => {
+            let prompt = field("prompt");
+            let ids = inbox::ids_in(prompt, state.inbox.in_flight(&member));
+            if !ids.is_empty() {
+                state.inbox.land(&member, &ids);
+                for id in &ids {
+                    state.record_delivery(id, true);
+                }
+            } else if inbox::is_user_prompt(prompt) {
+                state.inbox.reset_chain(&member);
+            }
+        }
+        "Stop" => {
+            let text = field("last_assistant_message").to_string();
+            for id in state.inbox.turn_ended(&member) {
+                state.inbox.replied(
+                    &id,
+                    ReplyOutcome::Reply {
+                        message: None,
+                        text: text.clone(),
+                    },
+                );
+            }
+        }
+        "StopFailure" => {
+            let error = match field("error") {
+                "" => "unknown error",
+                e => e,
+            }
+            .to_string();
+            let label = state
+                .ledger
+                .member_label(&member)
+                .unwrap_or_else(|| member.clone());
+            for id in state.inbox.turn_ended(&member) {
+                state.inbox.replied(
+                    &id,
+                    ReplyOutcome::Failed(format!(
+                        "the turn of '{label}' that got {id} failed: {error}"
+                    )),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An agent's inbox hook waits for its messages: hold the connection until
+/// messages are handed over (`Inbox`), a newer hook or the agent's exit
+/// releases it (`Ok`), or the hook goes away (its messages stay queued).
+async fn handle_wait_inbox(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    state: &Arc<Mutex<DaemonState>>,
+    agent_id: &str,
+) -> Result<()> {
+    let registered = {
+        let mut state = state.lock().await;
+        match state
+            .agents
+            .get(agent_id)
+            .map(|a| a.member().map(str::to_string))
+        {
+            None => Err(format!("agent '{}' not found", agent_id)),
+            Some(None) => Err(format!("agent '{}' runs for no task member", agent_id)),
+            Some(Some(member)) => {
+                let (token, rx) = state.inbox.register_waiter(agent_id);
+                state.hand_over_messages(&member);
+                Ok((member, token, rx))
+            }
+        }
+    };
+    let (member, token, mut rx) = match registered {
+        Ok(registered) => registered,
+        Err(message) => return write_response(&mut writer, &Response::Error { message }).await,
+    };
+
+    let mut buf = [0u8; 256];
+    let handover = tokio::select! {
+        handover = &mut rx => handover.ok(),
+        _ = reader.read(&mut buf) => {
+            // The hook went away: it takes nothing.
+            let mut state = state.lock().await;
+            state.inbox.unregister_waiter(agent_id, token);
+            if let Ok(Handover::Messages { ids, .. }) = rx.try_recv() {
+                state.inbox.land(&member, &ids);
+            }
+            return Ok(());
+        }
+    };
+    match handover {
+        Some(Handover::Messages { text, ids }) => {
+            let response = Response::Inbox {
+                text,
+                ids: ids.clone(),
+            };
+            if write_response(&mut writer, &response).await.is_err() {
+                state.lock().await.inbox.land(&member, &ids);
+            }
+        }
+        Some(Handover::Released) | None => {
+            let _ = write_response(&mut writer, &Response::Ok).await;
+        }
+    }
+    Ok(())
+}
+
+/// Type messages into an agent's PTY, then press Enter, and record them as
+/// delivered.
+async fn type_into_pty(state: Arc<Mutex<DaemonState>>, delivery: PtyDelivery) {
+    let PtyDelivery {
+        member,
+        ids,
+        master,
+        input,
+    } = delivery;
+    let fd = master.clone();
+    let typed = tokio::task::spawn_blocking(move || write_pty(&fd, &input))
+        .await
+        .unwrap_or(false);
+    if typed {
+        tokio::time::sleep(inbox::SUBMIT_DELAY).await;
+        let _ = tokio::task::spawn_blocking(move || write_pty(&master, b"\r")).await;
+    }
+    let mut state = state.lock().await;
+    state.inbox.land(&member, &ids);
+    if typed {
+        for id in &ids {
+            state.record_delivery(id, false);
+        }
+    } else {
+        warn!(member = %member, "could not type a message into the agent's terminal");
+    }
+}
+
+/// Write all of `data` to a PTY master.
+fn write_pty(fd: &OwnedFd, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        match nix::unistd::write(fd, data) {
+            Ok(n) => data = &data[n..],
+            Err(nix::errno::Errno::EINTR) | Err(nix::errno::Errno::EAGAIN) => continue,
+            Err(_) => return false,
+        }
+    }
+    true
 }

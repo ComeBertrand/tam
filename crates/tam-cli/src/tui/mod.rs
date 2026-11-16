@@ -1074,6 +1074,16 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
         }
         // Followed by the event loop (see `refresh_peek`).
         tam_proto::Event::ScreenUpdated { .. } => {}
+        tam_proto::Event::MessageSent { .. } => {}
+        tam_proto::Event::MessageDelivered { message } => {
+            app.set_status(
+                format!(
+                    "Message {} from {} delivered to {}",
+                    message.id, message.from_label, message.to_label
+                ),
+                Duration::from_secs(5),
+            );
+        }
     }
 }
 

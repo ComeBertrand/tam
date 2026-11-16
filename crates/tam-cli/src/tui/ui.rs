@@ -82,6 +82,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::Notice { title, lines } => {
             render_notice_popup(frame, title, lines);
         }
+        Mode::ConfirmRepairOrDrop {
+            name,
+            lines,
+            repairable,
+            in_place,
+        } => {
+            render_repair_or_drop_popup(frame, name, lines, *repairable, *in_place);
+        }
     }
 }
 
@@ -241,9 +249,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                     hints.push(Span::styled(cmd.key.clone(), Style::new().bold()));
                     hints.push(Span::raw(format!(":{} ", cmd.name)));
                 }
+                // A gone worktree: `d` offers to recreate it too.
+                let gone = selected.is_some_and(|t| {
+                    t.unhealthy_members()
+                        .any(|m| crate::health::repairable(&m.info))
+                });
                 hints.extend([
                     Span::styled("d", Style::new().bold()),
-                    Span::raw(":drop  "),
+                    Span::raw(if gone { ":recreate/drop  " } else { ":drop  " }),
                     Span::styled("q", Style::new().bold()),
                     Span::raw(":quit"),
                 ]);
@@ -275,6 +288,34 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(" any", Style::new().bold()),
                 Span::raw(":close"),
             ],
+            Mode::ConfirmRepairOrDrop {
+                repairable,
+                in_place,
+                ..
+            } => {
+                let mut hints = Vec::new();
+                if repairable {
+                    hints.extend([
+                        Span::styled(" r", Style::new().bold()),
+                        Span::raw(":recreate worktree "),
+                    ]);
+                }
+                hints.extend([
+                    Span::styled(" y", Style::new().bold()),
+                    Span::raw(":drop  "),
+                ]);
+                if in_place {
+                    hints.extend([
+                        Span::styled("b", Style::new().bold()),
+                        Span::raw(":drop + delete branch  "),
+                    ]);
+                }
+                hints.extend([
+                    Span::styled("any", Style::new().bold()),
+                    Span::raw(":cancel"),
+                ]);
+                hints
+            }
             _ => vec![
                 Span::styled(" enter", Style::new().bold()),
                 Span::raw(":select  "),
@@ -600,6 +641,73 @@ fn render_force_drop_popup(frame: &mut Frame, name: &str, report: &[String]) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// A task with gone or unusable worktrees: what is wrong, and the choice
+/// between recreating them (when possible) and dropping the task.
+fn render_repair_or_drop_popup(
+    frame: &mut Frame,
+    name: &str,
+    problems: &[String],
+    repairable: bool,
+    in_place: bool,
+) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("Task "),
+            Span::styled(name, Style::new().bold()),
+            Span::raw(":"),
+        ]),
+        Line::raw(""),
+    ];
+    lines.extend(problems.iter().map(|l| Line::raw(l.as_str())));
+    lines.push(Line::raw(""));
+    let mut keys = Vec::new();
+    if repairable {
+        keys.extend([
+            Span::styled("r", Style::new().bold().fg(Color::Green)),
+            Span::raw(" recreate · "),
+        ]);
+    }
+    keys.extend([
+        Span::styled("y", Style::new().bold().fg(Color::Red)),
+        Span::raw(" drop · "),
+    ]);
+    if in_place {
+        keys.extend([
+            Span::styled("b", Style::new().bold().fg(Color::Red)),
+            Span::raw(" drop + delete branch · "),
+        ]);
+    }
+    keys.extend([Span::styled("n", Style::new().bold()), Span::raw(" cancel")]);
+    lines.push(Line::from(keys));
+
+    // Size to content, wrapped at 100 columns (and the screen): +8 for
+    // padding + border, + 4 rows for border + vertical padding.
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (longest + 8).clamp(30, 100).min(frame.area().width);
+    let inner_width = width.saturating_sub(8).max(1) as usize;
+    let rows: usize = lines
+        .iter()
+        .map(|l| l.width().div_ceil(inner_width).max(1))
+        .sum();
+    let area = frame.area().centered(
+        Constraint::Length(width),
+        Constraint::Length(rows as u16 + 4),
+    );
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(" Worktree Gone ")
+        .title_style(Style::new().bold().fg(Color::Yellow))
+        .padding(Padding::new(2, 2, 1, 1));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 /// A message in a popup, wrapped to fit (at most 100 columns wide).
 fn render_notice_popup(frame: &mut Frame, title: &str, lines: &[String]) {
     // +6 for border + horizontal padding
@@ -745,6 +853,34 @@ mod tests {
         assert!(s.contains("Task feat not dropped:"), "{s}");
         assert!(s.contains("    ?? notes.txt"), "{s}");
         assert!(s.contains("Drop anyway? y/n"), "{s}");
+    }
+
+    #[test]
+    fn repair_or_drop_dialog_says_what_is_wrong() {
+        let mut app = App::new();
+        app.mode = Mode::ConfirmRepairOrDrop {
+            name: "feat".into(),
+            lines: vec!["worktree /w/app--feat is gone, branch 'feat' is still there".into()],
+            repairable: true,
+            in_place: false,
+        };
+        let s = screen(&mut app, 100, 20);
+        assert!(s.contains("Worktree Gone"), "{s}");
+        assert!(s.contains("is gone, branch 'feat' is still there"), "{s}");
+        assert!(s.contains("r recreate · y drop · n cancel"), "{s}");
+
+        app.mode = Mode::ConfirmRepairOrDrop {
+            name: "feat".into(),
+            lines: vec!["worktree /w/app--feat is gone and cannot be recreated: \
+                         branch 'feat' no longer exists"
+                .into()],
+            repairable: false,
+            in_place: true,
+        };
+        let s = screen(&mut app, 60, 20);
+        assert!(!s.contains("recreate ·"), "{s}");
+        assert!(s.contains("y drop · b drop + delete branch"), "{s}");
+        assert!(s.contains("no longer exists"), "wrapped, not cut: {s}");
     }
 
     #[test]

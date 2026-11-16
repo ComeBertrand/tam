@@ -63,7 +63,7 @@ tam
 | `✗ error` | Agent's last turn failed (API error, rate limit…) |
 | `○ idle` | No agent running, task exists |
 | `◌ stale` | No activity for 30 days |
-| `✗ gone` | Worktree or branch deleted externally |
+| `✗ gone` | Worktree deleted outside tam, or no longer a worktree |
 
 ## Features
 
@@ -98,10 +98,19 @@ tam drop NAME                  Stop agents + remove worktrees + forget task
 tam drop NAME -b               Also delete the git branches
 tam drop NAME -f               Drop even if work would be lost
 
+tam adopt [PATH]               Make a worktree created outside tam a task
+tam adopt PATH -n NAME         ... named NAME (default: its branch)
+tam adopt PATH --join TASK     ... or a new member of an existing task
+tam repair NAME                Recreate a worktree deleted outside tam
+
 NAME is a task name, or TASK/MEMBER for one member of the task.
 ```
 
 `tam drop` checks first: it refuses when uncommitted changes would be lost, or, with `-b`, commits that no other branch, tag or remote branch holds. It lists them and, on a terminal, asks before going on. If a worktree cannot be removed, the task is kept.
+
+The daemon checks every task's worktree against git (`git worktree list`) when it starts and every 10 seconds. A worktree deleted outside tam (`rm -rf`, `git worktree remove`) shows as `gone` in `tam ps` and the dashboard, with what can be done. `tam repair` recreates it on its branch: only if the branch still exists, is checked out nowhere else, and git's leftover registration of the directory (if any) has no staged changes. `tam drop` forgets the task. A worktree switched to another branch is not gone; `tam ps` notes the switch. TAM only looks: nothing is recreated or removed unless you ask.
+
+`tam adopt` takes over a worktree made by hand (`git worktree add`), from the worktree or any directory in it: it must be a linked worktree (not the main checkout) on a branch. From then on it is a task like any other: `tam drop` removes it.
 
 ### Observing
 
@@ -134,7 +143,7 @@ Running `tam` with no arguments opens the dashboard:
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation), `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
+Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
 
 Tasks are sorted by repository name, then by status priority (blocked/question → error → input → running → idle → stale → gone), then by task name.
 

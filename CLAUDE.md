@@ -8,12 +8,14 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 ## Crate structure
 
 - `tam-proto`    — wire protocol types (daemon <-> client)
-- `tam-daemon`   — daemon: PTY management, agent lifecycle, state detection, task ledger, task drop
+- `tam-daemon`   — daemon: PTY management, agent lifecycle, state detection, task ledger, task drop,
+  worktree reconciliation (member health, repair, adopt)
 - `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init
 - `tam-cli`      — binary `tam`: CLI, TUI, bridges worktrees and agents
 
 Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-proto`
-and `tam-worktree` (dropping a task removes its worktree). `tam-cli` depends on all three.
+and `tam-worktree` (it runs git on members' worktrees: drop, reconcile, repair,
+adopt). `tam-cli` depends on all three.
 
 ## Key architecture patterns
 
@@ -28,11 +30,11 @@ and `tam-worktree` (dropping a task removes its worktree). `tam-cli` depends on 
   (a future merge) is one ledger event. Names typed by users (task, `task/member`,
   member id, or the cwd) are resolved by the daemon: `Ledger::resolve` /
   `member_at`, request `ResolveMember`.
-- **Task status is always derived** — computed from daemon state + git state +
-  filesystem + activity timestamps, never stored. See `task.rs`
-  `GitBranchStatus` + `Task::status()`: each member has its own status, the
-  task shows the most urgent. Staleness is time-based (30 days without
-  activity), not git-merge-based.
+- **Task status is always derived** — computed from agent state + the
+  member health the daemon observed in git + activity timestamps, never
+  stored. See `task.rs` `Task::status()`: each member has its own status, the
+  task shows the most urgent. Unknown health (`None`) is not gone. Staleness
+  is time-based (30 days without activity), not git-merge-based.
 - **Daemon owns the ledger** — append-only JSONL at
   `$XDG_DATA_HOME/tam/ledger.jsonl` (`tam-daemon/src/ledger.rs`). Records events
   (TaskCreated, MemberAdded, AgentRunStarted keyed by member id, etc.), never
@@ -59,6 +61,32 @@ and `tam-worktree` (dropping a task removes its worktree). `tam-cli` depends on 
   `git branch -D`, then the ledger. The task leaves the ledger only once its
   worktrees are gone; a kept branch is a warning in `Dropped`. Git runs outside the state lock; the task
   sits in `dropping` meanwhile, so Spawn into it is refused.
+- **Reconciliation is the daemon's, and only observes** — each member's
+  worktree is checked against `git worktree list`, one listing per repository
+  (`worktrees::observe`): on start, every 10s (`RECONCILE_INTERVAL`,
+  `Daemon::reconcile_every` in tests), at `CreateTask`/adopt/repair, and on
+  request `Reconcile` (`tam ps` and the TUI send it first). The result is
+  `MemberInfo.health`: `ok` (any branch, or detached, e.g. mid-rebase),
+  `gone` (with `cannot_repair` when it cannot be recreated) or `broken` (the
+  directory is not a worktree of its repository). The ledger keeps it in memory
+  next to the folded tasks (`Ledger::observe`), never in the file; a change is
+  pushed as `TaskUpdated`. Reconciliation never creates, removes or records
+  anything; it skips tasks being dropped. Paths are compared resolved
+  (`worktree::same_path`), as git reports them. The repository of a member
+  migrated without `repo_root` is learned from its directory and kept in memory
+  only, so after a daemon restart such a gone member can only be dropped.
+- **Repair and adopt are explicit** — `RepairMember` (`tam repair`, TUI `d`
+  then `r`) recreates a gone worktree on the member's branch
+  (`worktree::recreate`, a plain `git worktree add`). It clears only a stale
+  registration at the same path on the same branch. `worktree::plan_recreate`
+  is the one place that decides whether this is possible, for both health and
+  repair. It refuses a locked, detached or other-branch registration, a
+  branch that is gone or checked out elsewhere, and a running agent.
+  `AdoptWorktree` (`tam adopt`) makes an existing linked worktree a member:
+  `worktrees::adoptable` reuses drop's `worktree::check`, and refuses a main
+  checkout and a detached HEAD. The new task is named after the branch, or
+  the worktree joins an existing task (`--join`, one `MemberAdded`). A lock
+  (`DaemonState::worktrees`) serialises reconcile passes, repairs and drops.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
   daemon exits after 30s with no agents and no clients.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
@@ -98,8 +126,8 @@ cargo test
 
 ## Testing
 
-- Unit tests are inline in each module (~270 across all crates)
-- Integration tests in `crates/tam-daemon/tests/` (~38 async tests, real
+- Unit tests are inline in each module (~300 across all crates)
+- Integration tests in `crates/tam-daemon/tests/` (~46 async tests, real
   sockets/PTYs/git repos) and `crates/tam-cli/tests/` (`tam hook-notify`
   against a daemon, session resume with a fake `claude`; one test per file:
   they set process environment)

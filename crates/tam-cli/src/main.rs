@@ -7,6 +7,7 @@ mod cli;
 mod client;
 mod config;
 mod drop_report;
+mod health;
 mod hook;
 mod task;
 mod tui;
@@ -174,20 +175,93 @@ async fn main() -> Result<()> {
             }
         }
 
+        Commands::Adopt { path, name, join } => {
+            let mut client = client::Client::connect().await?;
+            let dir = std::fs::canonicalize(path.unwrap_or_else(|| ".".into()))?;
+            let task = client.adopt(&dir, name.as_deref(), join.as_deref()).await?;
+            let member = task.members.last().expect("adopted member");
+            match join {
+                Some(_) => println!(
+                    "Added {} (branch '{}') to task '{}' as '{}'",
+                    member.dir.display(),
+                    member.branch,
+                    task.name,
+                    task.member_label(member)
+                ),
+                None => println!(
+                    "Adopted {} (branch '{}') as task '{}'",
+                    member.dir.display(),
+                    member.branch,
+                    task.name
+                ),
+            }
+            println!(
+                "tam run {} starts an agent in it; tam drop {} would remove it.",
+                task.member_label(member),
+                task.name
+            );
+        }
+
+        Commands::Repair { name } => {
+            let mut client = client::Client::connect().await?;
+            // Fresh health, to know which worktrees are gone.
+            let tasks = client.reconcile().await?;
+            // A task name repairs all its members; TASK/MEMBER, that one.
+            let (task, members) = match tasks.into_iter().find(|t| t.name == name) {
+                Some(task) => {
+                    let gone: Vec<MemberInfo> = task
+                        .members
+                        .iter()
+                        .filter(|m| m.health.as_ref().is_some_and(|h| h.is_unhealthy()))
+                        .cloned()
+                        .collect();
+                    (task, gone)
+                }
+                None => {
+                    let (task, member, _) = resolve_member(&mut client, Some(&name)).await?;
+                    (task, vec![member])
+                }
+            };
+            if members.is_empty() {
+                println!("Nothing to repair: the worktrees of '{name}' are in place.");
+                return Ok(());
+            }
+            let wt_config = tam_worktree::config::load_config()?;
+            let mut failed = false;
+            for member in &members {
+                let label = task.member_label(member);
+                match client.repair_member(&member.id).await {
+                    Ok((_, member)) => {
+                        println!(
+                            "Recreated the worktree of '{label}' at {} (branch '{}')",
+                            member.dir.display(),
+                            member.branch
+                        );
+                        if wt_config.auto_init {
+                            tam_worktree::init::run(&member.dir)?;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e:#}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                std::process::exit(1);
+            }
+        }
+
         Commands::Ps { json } => {
             let mut client = client::Client::connect().await?;
-            let infos = client.list_tasks().await?;
+            // Fresh worktree health from the daemon.
+            let infos = client.reconcile().await?;
             let agents = client.list_agents().await.unwrap_or_default();
 
             let mut tasks: Vec<task::Task> = infos
                 .into_iter()
                 .map(|info| task::Task::from_info(info, &agents))
                 .collect();
-
-            // Populate git branch status for members without a running agent
-            for t in &mut tasks {
-                t.refresh_git_status();
-            }
 
             tasks.sort_by_key(|t| (t.status().sort_priority(), t.name.clone()));
 
@@ -207,6 +281,7 @@ async fn main() -> Result<()> {
                                     "dir": m.info.dir,
                                     "status": t.member_status(m).to_string(),
                                     "agent": m.agent_info.as_ref().map(|a| &a.provider),
+                                    "health": m.info.health,
                                 })
                             })
                             .collect();
@@ -251,6 +326,21 @@ async fn main() -> Result<()> {
                         dir,
                         ctx,
                     );
+                }
+                // What is wrong with the worktrees, and what to do about it.
+                let notes: Vec<String> = tasks
+                    .iter()
+                    .flat_map(|t| {
+                        t.members
+                            .iter()
+                            .filter_map(|m| health::ps_note(&t.member_label(m), &t.name, &m.info))
+                    })
+                    .collect();
+                if !notes.is_empty() {
+                    println!();
+                    for note in notes {
+                        println!("{note}");
+                    }
                 }
             }
         }
@@ -555,72 +645,5 @@ mod tests {
         // Delete worktree
         tam_worktree::worktree::remove(&repo, &wt_path, false).unwrap();
         assert!(!wt_path.exists());
-    }
-
-    #[test]
-    fn test_task_status_with_git() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let repo = tmp.path().join("myrepo");
-        init_git_repo(&repo);
-
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap()
-        };
-
-        // Create a worktree so we have a real owned task dir
-        let wt_config = tam_worktree::config::Config {
-            max_depth: 3,
-            ignore: vec![],
-            worktree_root: tmp.path().to_path_buf(),
-            auto_init: false,
-        };
-        let wt_path =
-            tam_worktree::worktree::create("test-branch", None, &wt_config, &repo).unwrap();
-
-        // check_git_branch_status uses repo_root which resolves from the worktree.
-        let root = tam_worktree::git::repo_root(&wt_path).unwrap();
-        assert!(
-            root.join(".git").exists(),
-            "repo_root should find main repo"
-        );
-
-        // Fresh branch should be Active
-        assert!(tam_worktree::git::local_branch_exists(&root, "test-branch").unwrap());
-        let status = task::check_git_branch_status("test-branch", &wt_path);
-        assert_eq!(
-            status,
-            task::GitBranchStatus::Active,
-            "new branch should be active"
-        );
-
-        // Make a commit on the worktree branch — still active
-        std::fs::write(wt_path.join("new.txt"), "content").unwrap();
-        let git_wt = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&wt_path)
-                .output()
-                .unwrap()
-        };
-        git_wt(&["add", "."]);
-        git_wt(&["commit", "-m", "diverge"]);
-
-        let status = task::check_git_branch_status("test-branch", &wt_path);
-        assert_eq!(status, task::GitBranchStatus::Active);
-
-        // Merge it back — branch still exists, still Active
-        git(&["merge", "--no-ff", "test-branch", "-m", "Merge test-branch"]);
-        let status = task::check_git_branch_status("test-branch", &wt_path);
-        assert_eq!(status, task::GitBranchStatus::Active);
-
-        // Remove worktree and delete branch → Gone
-        tam_worktree::worktree::remove(&repo, &wt_path, false).unwrap();
-        git(&["branch", "-d", "test-branch"]);
-        let status = task::check_git_branch_status("test-branch", &repo);
-        assert_eq!(status, task::GitBranchStatus::Gone);
     }
 }

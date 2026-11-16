@@ -296,6 +296,46 @@ impl Client {
         }
     }
 
+    /// Have the daemon check every member's worktree against git now; the
+    /// tasks with their fresh health.
+    pub async fn reconcile(&mut self) -> Result<Vec<TaskInfo>> {
+        match self.send(Request::Reconcile).await? {
+            Response::Tasks { tasks } => Ok(tasks),
+            other => Err(unexpected("Reconcile", other)),
+        }
+    }
+
+    /// Recreate a gone member's worktree (`member`: what `ResolveMember`
+    /// takes). Returns the member, with its task.
+    pub async fn repair_member(&mut self, member: &str) -> Result<(TaskInfo, MemberInfo)> {
+        let request = Request::RepairMember {
+            member: member.into(),
+        };
+        match self.send(request).await? {
+            Response::Member { task, member, .. } => Ok((task, *member)),
+            other => Err(unexpected("RepairMember", other)),
+        }
+    }
+
+    /// Make the worktree containing `dir` a member: of a new task (`name`,
+    /// default its branch) or of the existing task `join`.
+    pub async fn adopt(
+        &mut self,
+        dir: &Path,
+        name: Option<&str>,
+        join: Option<&str>,
+    ) -> Result<TaskInfo> {
+        let request = Request::AdoptWorktree {
+            dir: dir.to_path_buf(),
+            name: name.map(str::to_string),
+            join: join.map(str::to_string),
+        };
+        match self.send(request).await? {
+            Response::Task { task, .. } => Ok(task),
+            other => Err(unexpected("AdoptWorktree", other)),
+        }
+    }
+
     /// Attach to an agent from the CLI: enter raw mode, relay, restore on exit.
     /// `label` names it in the detach message.
     pub async fn attach(self, id: &str, label: &str) -> Result<()> {

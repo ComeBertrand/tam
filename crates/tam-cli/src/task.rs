@@ -1,21 +1,10 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tam_proto::{AgentInfo, AgentState, MemberInfo, NewMember, TaskInfo};
+use tam_proto::{AgentInfo, AgentState, MemberHealth, MemberInfo, NewMember, TaskInfo};
 
 /// How long (in seconds) without activity before a task is considered stale.
 const STALE_THRESHOLD_SECS: u64 = 30 * 24 * 3600; // 30 days
-
-/// Git branch state of a member, populated by callers before status().
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GitBranchStatus {
-    #[default]
-    Unknown,
-    /// Branch exists
-    Active,
-    /// Local branch does not exist (deleted externally)
-    Gone,
-}
 
 /// Computed task status — always derived, never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +23,7 @@ pub enum TaskStatus {
     Idle,
     /// No agent running, no activity for a long time
     Stale,
-    /// Worktree or branch deleted externally
+    /// Worktree deleted outside tam, or no longer a usable worktree
     Gone,
 }
 
@@ -95,33 +84,28 @@ impl TaskStatus {
 pub struct Member {
     pub info: MemberInfo,
     pub agent_info: Option<AgentInfo>,
-    pub git_branch_status: GitBranchStatus,
 }
 
 impl Member {
     fn new(info: MemberInfo, agents: &[AgentInfo]) -> Self {
         let agent_info = agents.iter().find(|a| a.id == info.id).cloned();
-        Self {
-            info,
-            agent_info,
-            git_branch_status: GitBranchStatus::Unknown,
-        }
+        Self { info, agent_info }
     }
 
     pub fn id(&self) -> &str {
         &self.info.id
     }
 
-    /// Refresh the git branch status (only meaningful without a running
-    /// agent).
-    pub fn refresh_git_status(&mut self) {
-        if self.agent_info.is_none() {
-            self.git_branch_status = check_git_branch_status(&self.info.branch, &self.info.dir);
-        }
+    /// Whether the daemon found the worktree gone or unusable.
+    pub fn is_unhealthy(&self) -> bool {
+        self.info
+            .health
+            .as_ref()
+            .is_some_and(MemberHealth::is_unhealthy)
     }
 
-    /// The member's status: its agent's state, else whether its worktree and
-    /// branch still exist.
+    /// The member's status: its agent's state, else whether the daemon found
+    /// its worktree in place (unknown health counts as in place).
     fn status(&self, stale: bool) -> TaskStatus {
         if let Some(ref info) = self.agent_info {
             return match info.state {
@@ -133,7 +117,7 @@ impl Member {
                 AgentState::Error => TaskStatus::Error,
             };
         }
-        if !self.info.dir.exists() || self.git_branch_status == GitBranchStatus::Gone {
+        if self.is_unhealthy() {
             return TaskStatus::Gone;
         }
         if stale {
@@ -169,8 +153,8 @@ impl Task {
         }
     }
 
-    /// Take the daemon's latest view of the task, keeping the derived state
-    /// (agents, git status) of the members it still has.
+    /// Take the daemon's latest view of the task, keeping the running agents
+    /// of the members it still has.
     pub fn update_info(&mut self, info: TaskInfo) {
         let mut old = std::mem::take(&mut self.members);
         self.members = info
@@ -228,11 +212,9 @@ impl Task {
         }
     }
 
-    /// Refresh the git branch status of the members without a running agent.
-    pub fn refresh_git_status(&mut self) {
-        for m in &mut self.members {
-            m.refresh_git_status();
-        }
+    /// Members whose worktree is gone or unusable.
+    pub fn unhealthy_members(&self) -> impl Iterator<Item = &Member> {
+        self.members.iter().filter(|m| m.is_unhealthy())
     }
 
     /// A member's status.
@@ -285,21 +267,6 @@ pub fn create_worktree(
     })
 }
 
-/// Query git to determine whether a member's branch still exists.
-/// Returns Unknown if git operations fail (graceful degradation).
-pub fn check_git_branch_status(branch: &str, dir: &Path) -> GitBranchStatus {
-    let root = match tam_worktree::git::repo_root(dir) {
-        Ok(r) => r,
-        Err(_) => return GitBranchStatus::Unknown,
-    };
-
-    match tam_worktree::git::local_branch_exists(&root, branch) {
-        Ok(true) => GitBranchStatus::Active,
-        Ok(false) => GitBranchStatus::Gone,
-        Err(_) => GitBranchStatus::Unknown,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +287,7 @@ mod tests {
             repo_root: None,
             branch: "feat".into(),
             dir: PathBuf::from(dir),
+            health: None,
         }
     }
 
@@ -386,26 +354,45 @@ mod tests {
         }
     }
 
+    fn with_health(health: Option<MemberHealth>) -> Task {
+        let mut snapshot = test_snapshot();
+        snapshot.members[0].health = health;
+        Task::from_info(snapshot, &[])
+    }
+
     #[test]
-    fn gone_when_dir_missing() {
+    fn gone_when_the_daemon_found_the_worktree_gone_or_broken() {
+        for health in [
+            MemberHealth::Gone {
+                cannot_repair: None,
+            },
+            MemberHealth::Gone {
+                cannot_repair: Some("branch deleted".into()),
+            },
+            MemberHealth::Broken {
+                problem: "not a worktree".into(),
+            },
+        ] {
+            let task = with_health(Some(health));
+            assert_eq!(task.status(), TaskStatus::Gone);
+            assert_eq!(task.unhealthy_members().count(), 1);
+        }
+    }
+
+    #[test]
+    fn idle_when_the_worktree_is_in_place_or_not_checked_yet() {
+        let on_another_branch = MemberHealth::Ok {
+            branch: Some("other".into()),
+        };
+        for health in [None, Some(on_another_branch)] {
+            let task = with_health(health);
+            assert_eq!(task.status(), TaskStatus::Idle);
+            assert_eq!(task.unhealthy_members().count(), 0);
+        }
+        // Unknown health is not gone, even with the directory missing.
         let mut snapshot = test_snapshot();
         snapshot.members[0].dir = PathBuf::from("/nonexistent/path/that/doesnt/exist");
-        let task = Task::from_info(snapshot, &[]);
-        assert_eq!(task.status(), TaskStatus::Gone);
-    }
-
-    #[test]
-    fn gone_when_branch_gone() {
-        let mut task = Task::from_info(test_snapshot(), &[]);
-        task.members[0].git_branch_status = GitBranchStatus::Gone;
-        assert_eq!(task.status(), TaskStatus::Gone);
-    }
-
-    #[test]
-    fn idle_when_branch_active() {
-        let mut task = Task::from_info(test_snapshot(), &[]);
-        task.members[0].git_branch_status = GitBranchStatus::Active;
-        assert_eq!(task.status(), TaskStatus::Idle);
+        assert_eq!(Task::from_info(snapshot, &[]).status(), TaskStatus::Idle);
     }
 
     #[test]
@@ -438,18 +425,18 @@ mod tests {
     #[test]
     fn update_info_keeps_member_state() {
         let mut task = Task::from_info(test_snapshot(), &[agent("m-1", AgentState::Input)]);
-        task.members[0].git_branch_status = GitBranchStatus::Active;
         let mut info = test_snapshot();
         info.run_count = 4;
         info.members.push(member_info("m-2", "web", "/tmp"));
+        info.members[0].health = Some(MemberHealth::Gone {
+            cannot_repair: None,
+        });
         task.update_info(info);
         assert_eq!(task.run_count, 4);
         assert_eq!(task.members.len(), 2);
         assert!(task.member("m-1").unwrap().agent_info.is_some());
-        assert_eq!(
-            task.member("m-1").unwrap().git_branch_status,
-            GitBranchStatus::Active
-        );
+        // Health comes with the daemon's view.
+        assert!(task.member("m-1").unwrap().is_unhealthy());
         assert!(task.member("m-2").unwrap().agent_info.is_none());
         assert_eq!(task.member_label(&task.members[0]), "feat/app");
     }

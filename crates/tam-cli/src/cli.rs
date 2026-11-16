@@ -88,6 +88,30 @@ pub enum Commands {
         force: bool,
     },
 
+    /// Make a worktree created outside tam a task (or a member of one)
+    ///
+    /// The task owns the worktree from then on: dropping it removes the
+    /// worktree, as for any task.
+    Adopt {
+        /// The worktree, or a directory in it (default: the current directory)
+        path: Option<PathBuf>,
+
+        /// Task name (default: the worktree's branch)
+        #[arg(short, long, conflicts_with = "join")]
+        name: Option<String>,
+
+        /// Add the worktree to this existing task instead
+        #[arg(long)]
+        join: Option<String>,
+    },
+
+    /// Recreate the worktree of a task (or of one member: TASK/MEMBER) that
+    /// was deleted outside tam, on its branch
+    Repair {
+        /// Task name, or TASK/MEMBER
+        name: String,
+    },
+
     /// List tasks with computed status
     Ps {
         /// Output as JSON

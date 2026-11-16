@@ -61,6 +61,10 @@ enum Action {
     RunNewSession {
         member: String,
     },
+    /// Recreate the task's gone worktrees that can be.
+    RepairTask {
+        name: String,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -181,8 +185,6 @@ async fn run_loop(
     let mut input = InputReader::spawn();
     let mut peek_timer = tokio::time::interval(Duration::from_secs(2));
     peek_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut git_timer = tokio::time::interval(Duration::from_secs(30));
-    git_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
@@ -204,10 +206,6 @@ async fn run_loop(
                 Action::None
             }
             _ = peek_timer.tick(), if app.peek.is_some() => Action::RefreshPeek,
-            _ = git_timer.tick() => {
-                app.refresh_git_status();
-                Action::None
-            }
         };
 
         match action {
@@ -277,6 +275,9 @@ async fn run_loop(
             Action::RunNewSession { member } => {
                 do_run(client, app, config, &member, SessionChoice::New).await?;
             }
+            Action::RepairTask { name } => {
+                repair_task(client, app, &name).await;
+            }
             Action::None => {}
         }
     }
@@ -296,6 +297,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::SpawnEnterPath(_) => handle_enter_path_key(key, app),
         Mode::ConfirmDropTask { .. } => handle_confirm_drop_key(key, app),
         Mode::ConfirmForceDrop { .. } => handle_confirm_force_drop_key(key, app),
+        Mode::ConfirmRepairOrDrop { .. } => handle_repair_or_drop_key(key, app),
         Mode::Notice { .. } => {
             app.mode = Mode::Normal;
             Action::None
@@ -341,6 +343,15 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             _ => Action::None,
         },
         (KeyCode::Char('p'), _) => Action::TogglePeek,
+        // A gone worktree: recreate it, or drop the task.
+        (KeyCode::Char('d'), _)
+            if app
+                .selected_task()
+                .is_some_and(|t| t.unhealthy_members().next().is_some()) =>
+        {
+            app.mode = repair_or_drop_dialog(app.selected_task().expect("selected"));
+            Action::None
+        }
         (KeyCode::Char('d'), _) => {
             if let Some(task) = app.selected_task() {
                 app.mode = Mode::ConfirmDropTask {
@@ -540,6 +551,56 @@ fn handle_confirm_force_drop_key(key: KeyEvent, app: &mut App) -> Action {
     Action::DropTask {
         name,
         force: true,
+        delete_branch,
+    }
+}
+
+/// The dialog for a task with gone or unusable worktrees: what is wrong with
+/// each, and whether any can be recreated.
+fn repair_or_drop_dialog(task: &Task) -> Mode {
+    let lines = task
+        .unhealthy_members()
+        .filter_map(|m| {
+            let problem = crate::health::problem(&m.info)?;
+            Some(if task.members.len() == 1 {
+                problem
+            } else {
+                format!("{}: {problem}", m.info.name)
+            })
+        })
+        .collect();
+    Mode::ConfirmRepairOrDrop {
+        name: task.name.clone(),
+        lines,
+        repairable: task
+            .unhealthy_members()
+            .any(|m| crate::health::repairable(&m.info)),
+        in_place: task.members.iter().any(|m| !m.is_unhealthy()),
+    }
+}
+
+/// `r`: recreate the worktrees that can be; `y`: drop, keeping the branches;
+/// `b` (with a worktree in place): drop and delete the branches; anything
+/// else, enter included, cancels.
+fn handle_repair_or_drop_key(key: KeyEvent, app: &mut App) -> Action {
+    let Mode::ConfirmRepairOrDrop {
+        name,
+        repairable,
+        in_place,
+        ..
+    } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return Action::None;
+    };
+    let delete_branch = match key.code {
+        KeyCode::Char('r') if repairable => return Action::RepairTask { name },
+        KeyCode::Char('y') => false,
+        KeyCode::Char('b') if in_place => true,
+        _ => return Action::None,
+    };
+    Action::DropTask {
+        name,
+        force: false,
         delete_branch,
     }
 }
@@ -960,9 +1021,7 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
             app.update_context(&id, context_percent);
         }
         tam_proto::Event::TaskCreated { task } => {
-            let mut task = Task::from_info(task, &[]);
-            task.refresh_git_status();
-            app.upsert_task(task);
+            app.upsert_task(Task::from_info(task, &[]));
         }
         tam_proto::Event::TaskUpdated { task } => {
             app.update_task_info(task);
@@ -974,19 +1033,51 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
 }
 
 async fn build_task_list(client: &mut Client) -> Result<Vec<Task>> {
-    let infos = client.list_tasks().await?;
+    // Fresh worktree health; the daemon pushes its changes from then on.
+    let infos = client.reconcile().await?;
     let agents = client.list_agents().await.unwrap_or_default();
 
-    let mut tasks: Vec<Task> = infos
+    Ok(infos
         .into_iter()
         .map(|info| Task::from_info(info, &agents))
+        .collect())
+}
+
+/// Recreate the task's gone worktrees that can be (running the project's
+/// worktree init when configured, as for a new task). The task list follows
+/// the daemon's events.
+async fn repair_task(client: &mut Client, app: &mut App, name: &str) {
+    let Some(task) = app.tasks.iter().find(|t| t.name == name) else {
+        return;
+    };
+    let members: Vec<(String, String)> = task
+        .unhealthy_members()
+        .filter(|m| crate::health::repairable(&m.info))
+        .map(|m| (m.id().to_string(), task.member_label(m)))
         .collect();
-
-    for t in &mut tasks {
-        t.refresh_git_status();
+    let auto_init = tam_worktree::config::load_config().is_ok_and(|c| c.auto_init);
+    let mut failures = Vec::new();
+    for (id, label) in &members {
+        match client.repair_member(id).await {
+            Ok((_, member)) => {
+                if auto_init {
+                    let _ = tam_worktree::init::run(&member.dir);
+                }
+            }
+            Err(e) => failures.push(format!("{label}: {e:#}")),
+        }
     }
-
-    Ok(tasks)
+    if failures.is_empty() {
+        app.set_status(
+            format!("Recreated the worktree of '{name}'"),
+            Duration::from_secs(3),
+        );
+    } else {
+        app.mode = Mode::Notice {
+            title: "Repair Failed".into(),
+            lines: failures,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -1086,5 +1177,157 @@ mod tests {
         assert!(matches!(action, Action::RunNewSession { ref member } if member == "m-1"));
         // No picker: still in the task list.
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    /// An app showing one task, `feat`, whose only member has `health`.
+    fn app_with(health: Option<tam_proto::MemberHealth>) -> App {
+        let info = tam_proto::TaskInfo {
+            name: "feat".into(),
+            members: vec![tam_proto::MemberInfo {
+                id: "m-1".into(),
+                name: "app".into(),
+                repo: "app".into(),
+                repo_root: None,
+                branch: "feat".into(),
+                dir: PathBuf::from("/w/app--feat"),
+                health,
+            }],
+            created_at: 0,
+            run_count: 0,
+            last_activity: Some(task::now()),
+        };
+        let mut app = App::new();
+        app.set_tasks(vec![Task::from_info(info, &[])]);
+        app
+    }
+
+    #[test]
+    fn drop_key_on_a_gone_worktree_offers_to_recreate_it() {
+        let config = Config::default();
+        let gone = tam_proto::MemberHealth::Gone {
+            cannot_repair: None,
+        };
+        let mut app = app_with(Some(gone));
+        assert!(matches!(
+            handle_normal_key(press('d'), &mut app, &config),
+            Action::None
+        ));
+        match &app.mode {
+            Mode::ConfirmRepairOrDrop {
+                name,
+                lines,
+                repairable,
+                in_place,
+            } => {
+                assert_eq!(name, "feat");
+                assert!(*repairable);
+                assert!(!*in_place);
+                assert_eq!(
+                    lines,
+                    &["worktree /w/app--feat is gone, branch 'feat' is still there"]
+                );
+            }
+            _ => panic!("expected the repair-or-drop dialog"),
+        }
+        assert!(matches!(
+            handle_key_event(press('r'), &mut app, &config),
+            Action::RepairTask { ref name } if name == "feat"
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // It drops too, on an explicit `y` only. With every worktree gone
+        // there is no branch to delete: `b` cancels, like enter.
+        for key in [
+            press('b'),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            app.mode = repair_or_drop_dialog(&app.tasks[0]);
+            assert!(matches!(
+                handle_key_event(key, &mut app, &config),
+                Action::None
+            ));
+        }
+        app.mode = repair_or_drop_dialog(&app.tasks[0]);
+        assert!(matches!(
+            handle_key_event(press('y'), &mut app, &config),
+            Action::DropTask {
+                force: false,
+                delete_branch: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn repair_or_drop_offers_branch_deletion_with_a_worktree_in_place() {
+        let config = Config::default();
+        let mut app = app_with(Some(tam_proto::MemberHealth::Gone {
+            cannot_repair: None,
+        }));
+        let mut info = tam_proto::TaskInfo {
+            name: "feat".into(),
+            members: vec![app.tasks[0].members[0].info.clone()],
+            created_at: 0,
+            run_count: 0,
+            last_activity: Some(task::now()),
+        };
+        let mut web = info.members[0].clone();
+        web.id = "m-2".into();
+        web.name = "web".into();
+        web.health = Some(tam_proto::MemberHealth::Ok {
+            branch: Some("feat".into()),
+        });
+        info.members.push(web);
+        app.set_tasks(vec![Task::from_info(info, &[])]);
+
+        handle_normal_key(press('d'), &mut app, &config);
+        match &app.mode {
+            Mode::ConfirmRepairOrDrop {
+                lines, in_place, ..
+            } => {
+                assert!(*in_place);
+                // Only the gone member is described, by its name.
+                assert_eq!(lines.len(), 1);
+                assert!(lines[0].starts_with("app: worktree "), "{lines:?}");
+            }
+            _ => panic!("expected the repair-or-drop dialog"),
+        }
+        assert!(matches!(
+            handle_key_event(press('b'), &mut app, &config),
+            Action::DropTask {
+                delete_branch: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn drop_key_on_a_lost_worktree_only_drops() {
+        let config = Config::default();
+        let lost = tam_proto::MemberHealth::Gone {
+            cannot_repair: Some("branch 'feat' no longer exists".into()),
+        };
+        let mut app = app_with(Some(lost));
+        handle_normal_key(press('d'), &mut app, &config);
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmRepairOrDrop {
+                repairable: false,
+                ..
+            }
+        ));
+        // No recreate: `r` cancels.
+        assert!(matches!(
+            handle_key_event(press('r'), &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // A healthy (or unchecked) worktree: the plain drop dialog.
+        for health in [None, Some(tam_proto::MemberHealth::Ok { branch: None })] {
+            let mut app = app_with(health);
+            handle_normal_key(press('d'), &mut app, &config);
+            assert!(matches!(app.mode, Mode::ConfirmDropTask { .. }));
+        }
     }
 }

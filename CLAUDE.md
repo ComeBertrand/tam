@@ -8,12 +8,12 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 ## Crate structure
 
 - `tam-proto`    — wire protocol types (daemon <-> client)
-- `tam-daemon`   — daemon: PTY management, agent lifecycle, state detection, task ledger
+- `tam-daemon`   — daemon: PTY management, agent lifecycle, state detection, task ledger, task drop
 - `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init
 - `tam-cli`      — binary `tam`: CLI, TUI, bridges worktrees and agents
 
-Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-proto`.
-`tam-cli` depends on all three.
+Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-proto`
+and `tam-worktree` (dropping a task removes its worktree). `tam-cli` depends on all three.
 
 ## Key architecture patterns
 
@@ -29,6 +29,17 @@ Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-pro
   `ledger.jsonl.rejected`. Clients use task requests (CreateTask, ListTasks,
   GetTask, DropTask) and get TaskCreated/TaskUpdated/TaskDropped events after
   `Subscribe`; `tam-cli` never touches the ledger file.
+- **Drop is the daemon's** — `DropTask { force, delete_branch }` (`handle_drop_task`;
+  git side in `tam-daemon/src/worktrees.rs`, per worktree, over
+  `tam_worktree::worktree::{check, remove, delete_branch}`). Without `force` it
+  replies `DropRefused` with what would be lost — uncommitted changes, and with
+  `delete_branch` commits no other branch/tag/remote holds — or why a directory
+  can't be checked, and changes nothing. Otherwise: stop the agent and wait for
+  it, check again, remove the worktree (`--force`: checked already, and git
+  refuses clean worktrees with submodules otherwise), `git branch -D`, then the
+  ledger. The task leaves the ledger only once its worktree is gone; a
+  kept branch is a warning in `Dropped`. Git runs outside the state lock; the task
+  sits in `dropping` meanwhile, so Spawn into it is refused.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
   daemon exits after 30s with no agents and no clients.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
@@ -55,7 +66,7 @@ cargo test
 ## Testing
 
 - Unit tests are inline in each module (~230 across all crates)
-- Integration tests in `crates/tam-daemon/tests/` (19 async tests, real sockets/PTYs)
+- Integration tests in `crates/tam-daemon/tests/` (~33 async tests, real sockets/PTYs/git repos)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

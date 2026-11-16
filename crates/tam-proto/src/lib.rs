@@ -150,6 +150,27 @@ pub struct RunInfo {
     pub exit_code: Option<i32>,
 }
 
+/// Why the daemon refused to drop one worktree without `force`: the work the
+/// drop would lose (only what is at risk), or why it cannot be checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeReport {
+    pub path: PathBuf,
+    /// Branch checked out in the worktree, `None` on a detached HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Uncommitted changes, as `git status --porcelain` lines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncommitted: Vec<String>,
+    /// Commits (`<short sha> <subject>`) no other branch, tag or remote
+    /// branch holds, lost with the branch (or with a detached HEAD).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmerged: Vec<String>,
+    /// Why the directory cannot be checked (e.g. not a git worktree). A
+    /// forced drop forgets the task and leaves the directory in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
 /// Client -> Daemon request.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -216,13 +237,20 @@ pub enum Request {
     GetTask {
         name: String,
     },
-    /// Stop the task's agent (if running) and forget the task. The client
-    /// removes the worktree first and says so with `worktree_deleted`.
-    /// Replies `Ok`; pushes `TaskDropped`.
+    /// Drop a task: stop its agent, remove its worktree (owned tasks) and
+    /// forget it. Replies `Dropped` and pushes `TaskDropped`; or replies
+    /// `DropRefused`, changing nothing, when the drop would lose work and
+    /// `force` is unset; or replies `Error` when the worktree cannot be
+    /// removed (the agent is stopped then, the task kept).
     DropTask {
         name: String,
+        /// Drop even if uncommitted changes or unmerged commits are lost.
         #[serde(default)]
-        worktree_deleted: bool,
+        force: bool,
+        /// Also delete the worktree's branch (`git branch -D`). Without
+        /// `force`, refused while it has unmerged commits.
+        #[serde(default)]
+        delete_branch: bool,
     },
     /// Receive pushed `Event`s on this connection from now on. Replies `Ok`.
     Subscribe,
@@ -256,6 +284,16 @@ pub enum Response {
         task: TaskInfo,
         #[serde(default)]
         runs: Vec<RunInfo>,
+    },
+    /// The task was dropped. `warnings` tell what was left behind (e.g. a
+    /// branch git refused to delete).
+    Dropped {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
+    /// The drop would lose work: nothing was done. Retry with `force`.
+    DropRefused {
+        worktrees: Vec<WorktreeReport>,
     },
 }
 
@@ -730,12 +768,43 @@ mod tests {
         match req {
             Request::DropTask {
                 name,
-                worktree_deleted,
+                force,
+                delete_branch,
             } => {
                 assert_eq!(name, "feat");
-                assert!(!worktree_deleted);
+                assert!(!force);
+                assert!(!delete_branch);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn drop_responses_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&Response::Dropped { warnings: vec![] }).unwrap(),
+            r#"{"type":"dropped"}"#
+        );
+        let refused = Response::DropRefused {
+            worktrees: vec![WorktreeReport {
+                path: PathBuf::from("/wt/app--feat"),
+                branch: Some("feat".into()),
+                uncommitted: vec!["?? notes.txt".into()],
+                unmerged: vec![],
+                problem: None,
+            }],
+        };
+        let json = serde_json::to_string(&refused).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"drop_refused","worktrees":[{"path":"/wt/app--feat","branch":"feat","uncommitted":["?? notes.txt"]}]}"#
+        );
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::DropRefused { worktrees }) => {
+                assert_eq!(worktrees[0].uncommitted, vec!["?? notes.txt"]);
+                assert!(worktrees[0].unmerged.is_empty());
+            }
+            other => panic!("wrong message: {other:?}"),
         }
     }
 

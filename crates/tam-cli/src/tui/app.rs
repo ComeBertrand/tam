@@ -22,6 +22,18 @@ pub enum Mode {
     ConfirmDropTask {
         name: String,
     },
+    /// The daemon refused the drop: `report` tells why (work it would lose).
+    ConfirmForceDrop {
+        name: String,
+        delete_branch: bool,
+        report: Vec<String>,
+    },
+    /// A message too long for the status line (e.g. a failed drop); any key
+    /// closes it.
+    Notice {
+        title: String,
+        lines: Vec<String>,
+    },
 }
 
 pub struct PickerItem {

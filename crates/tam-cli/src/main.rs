@@ -6,6 +6,7 @@ use clap::Parser;
 mod cli;
 mod client;
 mod config;
+mod drop_report;
 mod hook;
 mod sessions;
 mod task;
@@ -125,23 +126,35 @@ async fn main() -> Result<()> {
             client.attach(&name).await?;
         }
 
-        Commands::Drop { name, branch } => {
+        Commands::Drop {
+            name,
+            branch,
+            force,
+        } => {
             let mut client = client::Client::connect().await?;
-            let (task, _) = client.get_task(&name).await?;
-
-            // Stop the agent before its worktree goes away
-            let _ = client
-                .send(tam_proto::Request::Kill { id: name.clone() })
-                .await;
-
-            // Delete worktree if owned
-            if task.owned && task.dir.exists() {
-                let wt_config = tam_worktree::config::load_config()?;
-                tam_worktree::worktree::delete(&name, branch, true, &wt_config, &task.dir)?;
+            let mut outcome = client.drop_task(&name, force, branch).await?;
+            if let client::DropOutcome::Refused { worktrees } = &outcome {
+                eprintln!("Task '{name}' not dropped:");
+                for line in drop_report::lines(worktrees) {
+                    eprintln!("  {line}");
+                }
+                if !confirm("Drop anyway? [y/N] ")? {
+                    eprintln!("Task '{name}' kept (pass --force to drop anyway).");
+                    std::process::exit(1);
+                }
+                outcome = client.drop_task(&name, true, branch).await?;
             }
-
-            client.drop_task(&name, task.owned).await?;
-            println!("Dropped task '{}'", name);
+            match outcome {
+                client::DropOutcome::Dropped { warnings } => {
+                    for warning in warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                    println!("Dropped task '{name}'");
+                }
+                client::DropOutcome::Refused { .. } => {
+                    anyhow::bail!("the daemon refused a forced drop")
+                }
+            }
         }
 
         Commands::Ps { json } => {
@@ -380,6 +393,19 @@ async fn spawn_and_attach(
     }
 }
 
+/// Ask a yes/no question on the terminal; `false` without one.
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::{BufRead, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(false);
+    }
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
 /// Resolve a task name from explicit argument or from cwd.
 fn resolve_task_name(name: Option<String>, tasks: &[TaskInfo]) -> Result<String> {
     if let Some(name) = name {
@@ -530,7 +556,7 @@ mod tests {
         assert!(wt_path.exists());
 
         // Delete worktree
-        tam_worktree::worktree::delete("test-feat", false, true, &wt_config, &wt_path).unwrap();
+        tam_worktree::worktree::remove(&repo, &wt_path, false).unwrap();
         assert!(!wt_path.exists());
     }
 
@@ -595,7 +621,7 @@ mod tests {
         assert_eq!(status, task::GitBranchStatus::Active);
 
         // Remove worktree and delete branch → Gone
-        tam_worktree::worktree::delete("test-branch", false, true, &wt_config, &wt_path).unwrap();
+        tam_worktree::worktree::remove(&repo, &wt_path, false).unwrap();
         git(&["branch", "-d", "test-branch"]);
         let status = task::check_git_branch_status("test-branch", &repo);
         assert_eq!(status, task::GitBranchStatus::Gone);

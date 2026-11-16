@@ -101,7 +101,9 @@ tam/
 ```rust
 // Worktree lifecycle
 tam_worktree::worktree::create(name, source, config, cwd) -> Result<PathBuf>
-tam_worktree::worktree::delete(name, delete_branch, force, config, cwd) -> Result<()>
+tam_worktree::worktree::check(repo, worktree) -> Result<WorktreeCheck>   // what removing it would lose
+tam_worktree::worktree::remove(repo, worktree, force) -> Result<()>
+tam_worktree::worktree::delete_branch(repo, branch) -> Result<()>
 
 // Project discovery
 tam_worktree::discovery::discover(root, ignore_set, max_depth) -> Result<Vec<PathBuf>>
@@ -205,8 +207,9 @@ tam stop                            # resolve from cwd
 tam attach NAME                     # full-screen attach to running agent
 tam attach                          # resolve from cwd
 
-tam drop NAME                       # kill agent + remove task (+ delete worktree if owned)
+tam drop NAME                       # stop agent + remove worktree + forget task
 tam drop NAME -b                    # also delete the git branch
+tam drop NAME -f                    # drop even if work would be lost
 
 tam gc                              # drop all tasks whose branch is merged
 tam gc --dry-run                    # show what would be dropped
@@ -251,8 +254,10 @@ tam hook-notify                     # hook callback from agent process
 - `tam stop` and `tam attach` without a name resolve from cwd: find the task bound to the current directory. Error if zero or multiple matches.
 - `tam new NAME -w`: name must be a valid git branch name.
 - `tam drop NAME` on a borrowed task: kills agent, removes from ledger. Does not touch directory.
-- `tam drop NAME` on an owned task: kills agent, deletes worktree, removes from ledger.
-- `tam drop NAME -b`: also deletes the local git branch. Only valid for owned tasks.
+- `tam drop NAME` on an owned task: kills agent, deletes worktree, removes from ledger. The daemon does all of it, for the CLI and the TUI alike.
+- `tam drop NAME -b`: also deletes the local git branch (`git branch -D`). Only valid for owned tasks.
+- `tam drop` refuses, changing nothing, when it would lose work: uncommitted changes, or with `-b` commits held by no other branch, tag or remote branch. It reports them; `-f` (or confirming on a terminal) drops anyway.
+- If the worktree cannot be removed, the agent is stopped but the task kept. A branch git refuses to delete is reported, and the task dropped.
 - `tam gc` only operates on owned tasks with merged branches.
 
 ### Session resume flow
@@ -328,7 +333,7 @@ The header shows total task count and how many need attention (input or blocked 
 | `n` | New task flow | Always |
 | `r` | Run/resume agent flow | Task idle (no agent running) |
 | `s` | Stop agent | Agent is running |
-| `d` | Drop task (confirms for owned) | Always |
+| `d` | Drop task: `y` keeps the branch, `b` deletes it; asks again if work would be lost | Always |
 | `p` | Toggle peek panel | Always |
 | `/` | Enter filter mode | Always |
 | `q` | Quit TUI | Always |

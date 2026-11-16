@@ -27,6 +27,27 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run a git command and return its non-empty stdout lines, untrimmed
+/// (porcelain formats carry meaning in leading spaces).
+fn git_lines(dir: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("cannot run git in {}", dir.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Resolve the toplevel of the current working tree (the checkout root).
 /// For the main repo this is the repo root; for a worktree it's the worktree directory.
 pub fn toplevel(dir: &Path) -> Result<PathBuf> {
@@ -149,10 +170,36 @@ pub fn worktree_remove_force(dir: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Delete a local branch with `git branch -d` (safe delete).
-pub fn delete_branch(dir: &Path, name: &str) -> Result<()> {
-    git(dir, &["branch", "-d", name])?;
+/// Delete a local branch: `git branch -d` (refused unless merged), or
+/// `git branch -D` with `force`.
+pub fn delete_branch(dir: &Path, name: &str, force: bool) -> Result<()> {
+    git(dir, &["branch", if force { "-D" } else { "-d" }, name])?;
     Ok(())
+}
+
+/// Branch checked out in the working tree at `dir`, `None` on a detached HEAD.
+pub fn current_branch(dir: &Path) -> Result<Option<String>> {
+    let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    Ok((branch != "HEAD").then_some(branch))
+}
+
+/// Uncommitted changes in the working tree at `dir`, as `git status
+/// --porcelain` lines: modified, staged and untracked files (untracked
+/// directories collapsed), ignored files left out.
+pub fn uncommitted_changes(dir: &Path) -> Result<Vec<String>> {
+    git_lines(dir, &["status", "--porcelain=v1"])
+}
+
+/// Commits (`<short sha> <subject>`, newest first) reachable from the HEAD of
+/// the working tree at `dir` and from no branch other than `branch`, no tag
+/// and no remote-tracking branch: the commits only `branch` (or a detached
+/// HEAD) holds.
+pub fn commits_only_on(dir: &Path, branch: Option<&str>) -> Result<Vec<String>> {
+    let exclude = branch.map(|b| format!("--exclude={b}"));
+    let mut args = vec!["log", "--format=%h %s", "HEAD", "--not"];
+    args.extend(exclude.as_deref());
+    args.extend(["--branches", "--tags", "--remotes"]);
+    git_lines(dir, &args)
 }
 
 /// List worktrees. Returns list of worktree paths.

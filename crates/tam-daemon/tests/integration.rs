@@ -373,7 +373,7 @@ async fn attach_nonexistent_agent() {
 }
 
 #[tokio::test]
-async fn attach_receives_scrollback() {
+async fn attach_replays_the_screen() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
     let mut stream = UnixStream::connect(&sock).await.unwrap();
@@ -393,7 +393,7 @@ async fn attach_receives_scrollback() {
     )
     .await;
 
-    // Wait for output to be captured in scrollback
+    // Wait for the output to reach the agent's screen
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Attach on a fresh connection (the current one will switch to raw mode)
@@ -414,15 +414,17 @@ async fn attach_receives_scrollback() {
     let resp: Response = serde_json::from_str(line.trim()).unwrap();
     assert!(matches!(resp, Response::Attached));
 
-    // Read scrollback — should contain "hello"
+    // The replay: the screen, with "hello" on it
+    let mut output = Vec::new();
     let mut buf = [0u8; 4096];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut buf))
-        .await
-        .expect("timed out reading scrollback")
-        .expect("read failed");
-
-    let output = String::from_utf8_lossy(&buf[..n]);
-    assert!(output.contains("hello"), "scrollback was: {:?}", output);
+    while !String::from_utf8_lossy(&output).contains("hello") {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut buf))
+            .await
+            .expect("timed out reading the replay")
+            .expect("read failed");
+        assert!(n > 0, "replay was: {:?}", String::from_utf8_lossy(&output));
+        output.extend_from_slice(&buf[..n]);
+    }
 }
 
 #[tokio::test]
@@ -2332,4 +2334,71 @@ async fn watched_screen_update_follows_a_single_change() {
         watcher.request(&Request::List).await,
         Response::Agents { .. }
     ));
+}
+
+#[tokio::test]
+async fn attach_replays_history_then_screen_then_live_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut conn = Conn::connect(&sock).await;
+    // 40 lines, then a reply to each line that comes in. Replies end
+    // without a newline: once one shows, nothing moves.
+    spawn_sh(
+        &mut conn,
+        "hist",
+        "seq 1 40; printf '\\033[?2004h'; while read l; do printf 'got %s' \"$l\"; done",
+    )
+    .await;
+    wait_screen_row(&mut conn, "hist", "40").await;
+
+    let mut attach = UnixStream::connect(&sock).await.unwrap();
+    let mut json = serde_json::to_string(&Request::Attach {
+        id: "hist".into(),
+        cols: 30,
+        rows: 10,
+    })
+    .unwrap();
+    json.push('\n');
+    attach.write_all(json.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(attach);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(matches!(
+        serde_json::from_str(line.trim()).unwrap(),
+        Response::Attached
+    ));
+    reader.get_mut().write_all(b"ping\r").await.unwrap();
+
+    // A viewer of the attach size, fed what comes, until the reply shows.
+    let size = |n| std::num::NonZeroU16::new(n).unwrap();
+    let mut viewer = vt100::Parser::new(size(10), size(30), 100);
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !viewer.screen().contents().contains("got ping") {
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut buf))
+            .await
+            .expect("no reply on the attached terminal")
+            .unwrap();
+        assert!(n > 0);
+        viewer.process(&buf[..n]);
+    }
+
+    // The agent's screen, at the attach size, with its modes.
+    let agent = screen(&mut conn, "hist", None).await;
+    assert_eq!((agent.cols, agent.rows), (30, 10));
+    let rows: Vec<String> = viewer.screen().rows(0, 30).collect();
+    assert_eq!(rows, screen_rows(&agent));
+    assert!(viewer.screen().bracketed_paste());
+    // The history went to the viewer's scrollback, oldest first, after the
+    // viewer's own screen (blank here).
+    let mut all = String::new();
+    let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default());
+    viewer
+        .screen()
+        .write_contents_formatted_basic(&mut all, range)
+        .unwrap();
+    let all: String = vt100::capture::basic_formatted_to_plain(&all).collect();
+    let lines: Vec<&str> = all.lines().filter(|l| !l.is_empty()).collect();
+    let expected: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
+    assert_eq!(lines[..40], expected);
 }

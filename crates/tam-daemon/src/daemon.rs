@@ -540,25 +540,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         let state_guard = state.lock().await;
                         match state_guard.agents.get(&id) {
                             Some(agent) => {
+                                // Before the replay: it is drawn at this size.
                                 agent.resize(cols, rows);
-                                Ok((
-                                    agent.subscribe(),
-                                    agent.scrollback_contents(),
-                                    agent.pty_master(),
-                                    agent.viewers(),
-                                ))
+                                let (replay, output_rx) = agent.attach_output();
+                                Ok((output_rx, replay, agent.pty_master(), agent.viewers()))
                             }
                             None => Err(format!("agent '{}' not found", id)),
                         }
                     };
 
                     match attach_resources {
-                        Ok((output_rx, scrollback, master, viewers)) => {
+                        Ok((output_rx, replay, master, viewers)) => {
                             write_response(&mut writer, &Response::Attached).await?;
                             let buffered = buf_reader.buffer().to_vec();
                             let reader = buf_reader.into_inner();
                             return handle_attach_session(
-                                reader, writer, buffered, output_rx, scrollback, master, viewers,
+                                reader, writer, buffered, output_rx, replay, master, viewers,
                             )
                             .await;
                         }
@@ -633,15 +630,13 @@ async fn handle_attach_session(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     buffered: Vec<u8>,
     mut output_rx: broadcast::Receiver<Vec<u8>>,
-    scrollback: Vec<u8>,
+    replay: Vec<u8>,
     master: Arc<OwnedFd>,
     viewers: Arc<AtomicUsize>,
 ) -> Result<()> {
     viewers.fetch_add(1, Ordering::Relaxed);
-    // Send scrollback so the client sees recent context
-    if !scrollback.is_empty() {
-        writer.write_all(&scrollback).await?;
-    }
+    // Bring the client's terminal to the agent's: history, screen, modes.
+    writer.write_all(&replay).await?;
 
     // Forward any data buffered during the JSON handshake
     if !buffered.is_empty() {
@@ -1101,18 +1096,7 @@ async fn handle_kill(state: &Arc<Mutex<DaemonState>>, id: &str) -> Response {
 async fn handle_scrollback(state: &Arc<Mutex<DaemonState>>, id: &str) -> Response {
     let state = state.lock().await;
     match state.agents.get(id) {
-        Some(agent) => {
-            let raw = agent.scrollback_contents();
-            // Return last 64KB as lossy UTF-8 (enough for vt100 to render a full screen)
-            let tail = if raw.len() > 65536 {
-                &raw[raw.len() - 65536..]
-            } else {
-                &raw
-            };
-            Response::Scrollback {
-                data: String::from_utf8_lossy(tail).into_owned(),
-            }
-        }
+        Some(agent) => Response::Scrollback { data: agent.text() },
         None => Response::Error {
             message: format!("agent '{}' not found", id),
         },

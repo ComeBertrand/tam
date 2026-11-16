@@ -87,14 +87,14 @@ tam/
   Cargo.toml                   # workspace root
   crates/
     tam-cli/                   # binary: the tam command
-    tam-daemon/                # library: daemon, agent, provider, scrollback
+    tam-daemon/                # library: daemon, agent, provider, terminal
     tam-proto/                 # library: wire protocol (Request, Response, Event)
     tam-worktree/              # library: git, worktree, discovery, pretty, init
 ```
 
 **`tam-proto`** defines the shared types and wire format for daemon-client communication. All messages are newline-delimited JSON over a Unix domain socket. The protocol is versioned with a handshake on connect. Message types are internally tagged serde enums.
 
-**`tam-daemon`** owns agent processes. Each agent runs in a PTY. A background thread drains PTY output into a scrollback ring buffer and broadcasts to attached viewers. A state monitor polls for exits and state changes every second. The daemon auto-starts on first `tam` command and auto-shuts-down after 30 seconds with no agents and no clients.
+**`tam-daemon`** owns agent processes. Each agent runs in a PTY. A background thread drains PTY output into a terminal emulator kept at the PTY's size (the agent's screen and history, which the preview shows and attach replays) and broadcasts it to attached viewers. A state monitor polls for exits and state changes every second. The daemon auto-starts on first `tam` command and auto-shuts-down after 30 seconds with no agents and no clients.
 
 **`tam-worktree`** is the library extracted from yawn. It handles project discovery, worktree creation/deletion, pretty naming, and worktree initialization. It knows nothing about agents or the daemon. Its public API is:
 
@@ -155,9 +155,6 @@ auto_init = true                            # run .worktree-init.toml after crea
 [discovery]
 max_depth = 5
 ignore = [".*", "node_modules", "target"]
-
-[daemon]
-scrollback = 1048576                        # bytes per agent
 
 [notify]
 command = "notify-send 'tam: {task}' '{kind}: {message}'"
@@ -339,7 +336,7 @@ The footer only shows keys applicable to the currently selected task. If the sel
 
 ### Peek mode
 
-Pressing `p` splits the view. The left panel shows a compressed task list (fewer columns). The right panel renders the selected task's agent scrollback through a `vt100` terminal parser. As the user navigates with `j`/`k`, the right panel updates to show the selected task's output.
+Pressing `p` splits the view. The left panel shows a compressed task list (fewer columns). The right panel renders the selected task's agent screen, as the daemon's terminal emulator keeps it at the agent's own size (scrollable through its history). As the user navigates with `j`/`k`, the right panel updates to show the selected task's output.
 
 ```
 ┌──────────────────────────────────┬───────────────────────────────┐

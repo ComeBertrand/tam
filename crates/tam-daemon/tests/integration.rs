@@ -1158,7 +1158,9 @@ async fn member_agent_runs_in_its_worktree_under_its_id() {
     let sock = start_daemon(dir.path()).await;
     let mut watcher = Conn::subscribed(&sock).await;
     let mut cmd = Conn::connect(&sock).await;
-    let work = dir.path().join("app--feat");
+    // Resolved: `pwd` prints the physical path (macOS temp dirs are under
+    // the /var -> /private/var symlink).
+    let work = dir.path().canonicalize().unwrap().join("app--feat");
     std::fs::create_dir_all(&work).unwrap();
     let member = cmd.create_member("feat", &work).await;
 

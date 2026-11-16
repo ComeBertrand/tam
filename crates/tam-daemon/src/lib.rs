@@ -4,3 +4,4 @@ pub mod ledger;
 pub mod notify;
 pub mod provider;
 pub mod scrollback;
+mod worktrees;

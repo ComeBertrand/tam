@@ -50,7 +50,7 @@ tam
 
 **Task** — a named unit of work binding a directory to agent runs. Tasks have two flavors:
 
-- **Owned**: TAM creates a git worktree for the task. The task name becomes the branch name. `tam drop` cleans up both.
+- **Owned**: TAM creates a git worktree for the task. The task name becomes the branch name. `tam drop` removes the worktree (and with `-b` the branch).
 - **Borrowed**: TAM tracks agents in an existing directory without touching the filesystem.
 
 **Status is always derived**, never stored. TAM checks the daemon (is an agent running?), the filesystem (does the worktree exist?), git (does the branch exist?), and activity timestamps (is the task stale?) every time you look.
@@ -95,9 +95,12 @@ tam stop                       Resolve task from current directory
 tam attach NAME                Full-screen attach to running agent
 tam attach                     Resolve from current directory
 
-tam drop NAME                  Kill agent + remove task (+ delete worktree if owned)
+tam drop NAME                  Stop agent + remove worktree + forget task
 tam drop NAME -b               Also delete the git branch
+tam drop NAME -f               Drop even if work would be lost
 ```
+
+`tam drop` checks first: it refuses when uncommitted changes would be lost, or, with `-b`, commits that no other branch, tag or remote branch holds. It lists them and, on a terminal, asks before going on. If the worktree cannot be removed, the task is kept.
 
 ### Observing
 
@@ -130,7 +133,7 @@ Running `tam` with no arguments opens the dashboard:
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs an agent, `s` stops, `d` drops, `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
+Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs an agent, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation), `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
 
 Tasks are sorted by repository name, then by status priority (blocked/question → error → input → running → idle → stale → gone), then by task name.
 

@@ -65,14 +65,21 @@ pub enum Commands {
         name: Option<String>,
     },
 
-    /// Remove a task and optionally its worktree/branch
+    /// Stop a task's agent, remove its worktree and forget it
+    ///
+    /// Refuses when uncommitted changes would be lost, or with -b commits no
+    /// other branch holds, unless confirmed or forced.
     Drop {
         /// Task name
         name: String,
 
-        /// Also delete the git branch (owned tasks only)
+        /// Also delete the worktree's git branch
         #[arg(short, long)]
         branch: bool,
+
+        /// Drop even if uncommitted changes or unmerged commits are lost
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// List tasks with computed status

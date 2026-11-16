@@ -973,7 +973,8 @@ async fn task_create_list_get_drop() {
     let sock = start_daemon(dir.path()).await;
     let mut conn = Conn::connect(&sock).await;
 
-    let task = conn.create_task("feat", dir.path()).await;
+    // A worktree already gone: dropping just forgets the task.
+    let task = conn.create_task("feat", &dir.path().join("gone")).await;
     assert_eq!(task.name, "feat");
     assert!(task.owned);
     assert_eq!(task.run_count, 0);
@@ -994,13 +995,11 @@ async fn task_create_list_get_drop() {
     }
     assert!(conn.runs("feat").await.is_empty());
 
-    let resp = conn
-        .request(&Request::DropTask {
-            name: "feat".into(),
-            worktree_deleted: true,
-        })
-        .await;
-    assert!(matches!(resp, Response::Ok), "{resp:?}");
+    let resp = conn.request(&drop_request("feat", false, false)).await;
+    assert!(
+        matches!(&resp, Response::Dropped { warnings } if warnings.is_empty()),
+        "{resp:?}"
+    );
     match conn.request(&Request::ListTasks).await {
         Response::Tasks { tasks } => assert!(tasks.is_empty()),
         other => panic!("expected Tasks, got {other:?}"),
@@ -1023,7 +1022,7 @@ async fn task_events_reach_subscribers() {
     let mut watcher = Conn::subscribed(&sock).await;
     let mut cmd = Conn::connect(&sock).await;
 
-    let task = cmd.create_task("feat", dir.path()).await;
+    let task = cmd.create_task("feat", &dir.path().join("gone")).await;
     let event = watcher
         .wait_event(3, |e| matches!(e, tam_proto::Event::TaskCreated { .. }))
         .await;
@@ -1032,11 +1031,7 @@ async fn task_events_reach_subscribers() {
         "{event:?}"
     );
 
-    cmd.request(&Request::DropTask {
-        name: "feat".into(),
-        worktree_deleted: false,
-    })
-    .await;
+    cmd.request(&drop_request("feat", false, false)).await;
     let event = watcher
         .wait_event(3, |e| matches!(e, tam_proto::Event::TaskDropped { .. }))
         .await;
@@ -1095,7 +1090,7 @@ async fn kill_and_drop_record_run_end() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
     let mut cmd = Conn::connect(&sock).await;
-    cmd.create_task("feat", dir.path()).await;
+    cmd.create_task("feat", &dir.path().join("gone")).await;
 
     let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
     assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
@@ -1132,13 +1127,8 @@ async fn kill_and_drop_record_run_end() {
     // A second run, ended by dropping the task.
     let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
     assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
-    let resp = cmd
-        .request(&Request::DropTask {
-            name: "feat".into(),
-            worktree_deleted: false,
-        })
-        .await;
-    assert!(matches!(resp, Response::Ok), "{resp:?}");
+    let resp = cmd.request(&drop_request("feat", false, false)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
     match cmd.request(&Request::List).await {
         Response::Agents { agents } => assert!(agents.is_empty(), "{agents:?}"),
         other => panic!("expected Agents, got {other:?}"),
@@ -1147,6 +1137,232 @@ async fn kill_and_drop_record_run_end() {
     let ledger = std::fs::read_to_string(dir.path().join("ledger.jsonl")).unwrap();
     let ends = ledger.matches("\"agent_run_ended\"").count();
     assert_eq!(ends, 2, "{ledger}");
+}
+
+fn drop_request(name: &str, force: bool, delete_branch: bool) -> Request {
+    Request::DropTask {
+        name: name.into(),
+        force,
+        delete_branch,
+    }
+}
+
+/// Run git in `dir`, asserting success; returns stdout.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A repository under `root` with a worktree on a new branch `branch`.
+/// Returns (repo, worktree).
+fn git_worktree(root: &std::path::Path, branch: &str) -> (PathBuf, PathBuf) {
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@test.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let wt = root.join(format!("repo--{branch}"));
+    git(
+        &repo,
+        &["worktree", "add", "-q", "-b", branch, wt.to_str().unwrap()],
+    );
+    (repo, wt)
+}
+
+fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(repo)
+        .status()
+        .unwrap()
+        .success()
+}
+
+async fn agent_count(conn: &mut Conn) -> usize {
+    match conn.request(&Request::List).await {
+        Response::Agents { agents } => agents.len(),
+        other => panic!("expected Agents, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn drop_refuses_to_lose_uncommitted_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_task("feat", &wt).await;
+    let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
+    assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+    std::fs::write(wt.join("notes.txt"), "wip").unwrap();
+
+    let resp = cmd.request(&drop_request("feat", false, false)).await;
+    match resp {
+        Response::DropRefused { worktrees } => {
+            assert_eq!(worktrees.len(), 1);
+            assert_eq!(worktrees[0].branch.as_deref(), Some("feat"));
+            assert_eq!(worktrees[0].uncommitted, vec!["?? notes.txt"]);
+            assert!(worktrees[0].unmerged.is_empty());
+        }
+        other => panic!("expected DropRefused, got {other:?}"),
+    }
+    // Refused: nothing changed.
+    assert_eq!(agent_count(&mut cmd).await, 1);
+    assert!(wt.join("notes.txt").exists());
+    assert!(cmd.runs("feat").await[0].ended_at.is_none());
+
+    let resp = cmd.request(&drop_request("feat", true, false)).await;
+    assert!(
+        matches!(&resp, Response::Dropped { warnings } if warnings.is_empty()),
+        "{resp:?}"
+    );
+    assert!(!wt.exists());
+    assert!(branch_exists(&repo, "feat"), "branch kept without -b");
+    assert_eq!(agent_count(&mut cmd).await, 0);
+    let resp = cmd
+        .request(&Request::GetTask {
+            name: "feat".into(),
+        })
+        .await;
+    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+}
+
+#[tokio::test]
+async fn drop_deletes_branch_on_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    git(&wt, &["commit", "-q", "--allow-empty", "-m", "only here"]);
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_task("feat", &wt).await;
+
+    // Deleting the branch would lose its commit.
+    let resp = cmd.request(&drop_request("feat", false, true)).await;
+    match resp {
+        Response::DropRefused { worktrees } => {
+            assert!(worktrees[0].uncommitted.is_empty());
+            assert_eq!(worktrees[0].unmerged.len(), 1, "{worktrees:?}");
+            assert!(worktrees[0].unmerged[0].ends_with(" only here"));
+        }
+        other => panic!("expected DropRefused, got {other:?}"),
+    }
+    assert!(wt.exists());
+
+    let resp = cmd.request(&drop_request("feat", true, true)).await;
+    assert!(
+        matches!(&resp, Response::Dropped { warnings } if warnings.is_empty()),
+        "{resp:?}"
+    );
+    assert!(!wt.exists());
+    assert!(!branch_exists(&repo, "feat"));
+}
+
+#[tokio::test]
+async fn drop_keeps_task_when_worktree_cannot_be_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_task("feat", &wt).await;
+    let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
+    assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+    // Clean, but git refuses to remove a locked worktree.
+    git(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+
+    let resp = cmd.request(&drop_request("feat", false, false)).await;
+    assert!(
+        matches!(&resp, Response::Error { message }
+            if message.starts_with("Task 'feat' kept (its agent was stopped): ")
+                && message.contains("locked")),
+        "{resp:?}"
+    );
+    // Consistent: the task and its worktree are there, the agent's run ended.
+    assert!(wt.exists());
+    assert_eq!(agent_count(&mut cmd).await, 0);
+    assert!(cmd.runs("feat").await[0].ended_at.is_some());
+
+    // Once git can remove it, the same drop goes through.
+    git(&repo, &["worktree", "unlock", wt.to_str().unwrap()]);
+    let resp = cmd.request(&drop_request("feat", false, false)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
+    assert!(!wt.exists());
+}
+
+#[tokio::test]
+async fn drop_removes_clean_worktree_with_submodule() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    git(&lib, &["init", "-q", "-b", "main"]);
+    git(&lib, &["config", "user.email", "test@test.com"]);
+    git(&lib, &["config", "user.name", "Test"]);
+    git(&lib, &["commit", "-q", "--allow-empty", "-m", "lib"]);
+    let lib_path = lib.to_str().unwrap();
+    let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
+    git(&wt, &[&add[..], &[lib_path, "lib"]].concat());
+    git(&wt, &["commit", "-q", "-m", "add lib"]);
+    // Plain `git worktree remove` refuses a worktree with submodules.
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_task("feat", &wt).await;
+
+    let resp = cmd.request(&drop_request("feat", false, false)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
+    assert!(!wt.exists());
+    assert!(branch_exists(&repo, "feat"));
+}
+
+#[tokio::test]
+async fn drop_of_missing_or_foreign_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut cmd = Conn::connect(&sock).await;
+
+    // Worktree already removed: forget the task, say the branch stays.
+    cmd.create_task("gone", &dir.path().join("gone")).await;
+    let resp = cmd.request(&drop_request("gone", false, true)).await;
+    assert!(
+        matches!(&resp, Response::Dropped { warnings }
+            if warnings.len() == 1 && warnings[0].contains("no longer exists")),
+        "{resp:?}"
+    );
+
+    // A directory that is not a worktree: refused, then forgotten and left
+    // in place with force.
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    cmd.create_task("plain", &plain).await;
+    let resp = cmd.request(&drop_request("plain", false, false)).await;
+    match resp {
+        Response::DropRefused { worktrees } => {
+            assert_eq!(worktrees[0].path, plain);
+            assert!(worktrees[0].problem.is_some(), "{worktrees:?}");
+        }
+        other => panic!("expected DropRefused, got {other:?}"),
+    }
+    let resp = cmd.request(&drop_request("plain", true, false)).await;
+    assert!(
+        matches!(&resp, Response::Dropped { warnings }
+            if warnings.len() == 1 && warnings[0].contains("left in place")),
+        "{resp:?}"
+    );
+    assert!(plain.exists());
 }
 
 #[tokio::test]

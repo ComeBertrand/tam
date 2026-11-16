@@ -6,7 +6,7 @@ use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
 use std::collections::VecDeque;
 use std::path::Path;
 
-use tam_proto::{AgentInfo, Request, Response, RunInfo, ServerMessage, TaskInfo};
+use tam_proto::{AgentInfo, Request, Response, RunInfo, ServerMessage, TaskInfo, WorktreeReport};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::UnixStream;
@@ -23,6 +23,14 @@ const RESIZE_THROTTLE: Duration = Duration::from_millis(40);
 /// Upper bound on a resize round-trip. The relay waits on it, so an
 /// unresponsive daemon must not freeze the attach session.
 const RESIZE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How a drop request ended (a failure is an `Err`).
+pub enum DropOutcome {
+    /// Dropped; `warnings` tell what was left behind.
+    Dropped { warnings: Vec<String> },
+    /// Nothing done: the drop would lose this work. Retry with `force`.
+    Refused { worktrees: Vec<WorktreeReport> },
+}
 
 pub struct Client {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -221,13 +229,22 @@ impl Client {
         }
     }
 
-    pub async fn drop_task(&mut self, name: &str, worktree_deleted: bool) -> Result<()> {
+    /// Ask the daemon to drop a task (stop its agent, remove its worktree,
+    /// with `delete_branch` its branch too).
+    pub async fn drop_task(
+        &mut self,
+        name: &str,
+        force: bool,
+        delete_branch: bool,
+    ) -> Result<DropOutcome> {
         let request = Request::DropTask {
             name: name.into(),
-            worktree_deleted,
+            force,
+            delete_branch,
         };
         match self.send(request).await? {
-            Response::Ok => Ok(()),
+            Response::Dropped { warnings } => Ok(DropOutcome::Dropped { warnings }),
+            Response::DropRefused { worktrees } => Ok(DropOutcome::Refused { worktrees }),
             other => Err(unexpected("DropTask", other)),
         }
     }

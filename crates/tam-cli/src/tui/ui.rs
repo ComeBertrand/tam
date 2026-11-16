@@ -3,7 +3,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table,
-    TableState,
+    TableState, Wrap,
 };
 use ratatui::Frame;
 use tam_proto::{AgentDetail, AgentState};
@@ -77,6 +77,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         Mode::ConfirmDropTask { name } => {
             render_confirm_drop_popup(frame, name);
+        }
+        Mode::ConfirmForceDrop { name, report, .. } => {
+            render_force_drop_popup(frame, name, report);
+        }
+        Mode::Notice { title, lines } => {
+            render_notice_popup(frame, title, lines);
         }
     }
 }
@@ -259,9 +265,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(" y", Style::new().bold()),
                 Span::raw("/"),
                 Span::styled("enter", Style::new().bold()),
-                Span::raw(":confirm  "),
+                Span::raw(":drop  "),
+                Span::styled("b", Style::new().bold()),
+                Span::raw(":drop + delete branch  "),
                 Span::styled("any", Style::new().bold()),
                 Span::raw(":cancel"),
+            ],
+            Mode::ConfirmForceDrop { .. } => vec![
+                Span::styled(" y", Style::new().bold()),
+                Span::raw(":drop anyway  "),
+                Span::styled("any", Style::new().bold()),
+                Span::raw(":cancel"),
+            ],
+            Mode::Notice { .. } => vec![
+                Span::styled(" any", Style::new().bold()),
+                Span::raw(":close"),
             ],
             _ => vec![
                 Span::styled(" enter", Style::new().bold()),
@@ -524,12 +542,14 @@ fn render_enter_path_popup(frame: &mut Frame, path: &str) {
     frame.render_widget(input_line, inner);
 }
 
+const DROP_KEYS: &str = "y drop · b drop + delete branch · n cancel";
+
 fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
-    // Size to content: "Drop task {name}? y/n" + padding + border
-    let content_width = "Drop task ".len() + name.len() + "? y/n".len();
-    // +8 for padding + border, 1 content row + 2 border + 2 vertical padding = 5
+    // Size to content: question and key line + padding + border
+    let content_width = ("Drop task ".len() + name.len() + 1).max(DROP_KEYS.chars().count());
+    // +8 for padding + border, 2 content rows + 2 border + 2 vertical padding = 6
     let width = (content_width as u16 + 8).max(30);
-    let area = centered_fixed_rect(width, 5, frame.area());
+    let area = centered_fixed_rect(width, 6, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -546,12 +566,86 @@ fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
     let msg = Line::from(vec![
         Span::raw("Drop task "),
         Span::styled(name, Style::new().bold()),
-        Span::raw("? "),
-        Span::styled("y", Style::new().bold().fg(Color::Red)),
-        Span::raw("/"),
-        Span::styled("n", Style::new().bold()),
+        Span::raw("?"),
     ]);
-    frame.render_widget(msg, inner);
+    let keys = Line::from(vec![
+        Span::styled("y", Style::new().bold().fg(Color::Red)),
+        Span::raw(" drop · "),
+        Span::styled("b", Style::new().bold().fg(Color::Red)),
+        Span::raw(" drop + delete branch · "),
+        Span::styled("n", Style::new().bold()),
+        Span::raw(" cancel"),
+    ]);
+    frame.render_widget(Paragraph::new(vec![msg, keys]), inner);
+}
+
+/// The daemon refused a drop: show why (what it would lose), ask to force.
+fn render_force_drop_popup(frame: &mut Frame, name: &str, report: &[String]) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("Task "),
+            Span::styled(name, Style::new().bold()),
+            Span::raw(" not dropped:"),
+        ]),
+        Line::raw(""),
+    ];
+    lines.extend(report.iter().map(|l| Line::raw(l.as_str())));
+    lines.extend([
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("Drop anyway? "),
+            Span::styled("y", Style::new().bold().fg(Color::Red)),
+            Span::raw("/"),
+            Span::styled("n", Style::new().bold()),
+        ]),
+    ]);
+
+    // Size to content (clipped to the screen): +8 / +4 for padding + border
+    let content_width = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (content_width as u16).saturating_add(8).max(30);
+    let height = (lines.len() as u16).saturating_add(4);
+    let area = centered_fixed_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Red))
+        .title(" Drop Refused ")
+        .title_style(Style::new().bold().fg(Color::Red))
+        .padding(Padding::new(2, 2, 1, 1));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A message in a popup, wrapped to fit (at most 100 columns wide).
+fn render_notice_popup(frame: &mut Frame, title: &str, lines: &[String]) {
+    // +6 for border + horizontal padding
+    let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let width = (longest + 6).clamp(30, 100).min(frame.area().width);
+    let inner_width = width.saturating_sub(6).max(1) as usize;
+    // Rows once wrapped (+1 slack for word wrapping), + border and padding
+    let rows: usize = lines
+        .iter()
+        .map(|l| l.chars().count().div_ceil(inner_width).max(1))
+        .sum();
+    let area = centered_fixed_rect(width, rows as u16 + 5, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(format!(" {title} "))
+        .title_style(Style::new().bold().fg(Color::Yellow))
+        .padding(Padding::new(2, 2, 1, 1));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let text: Vec<Line> = lines.iter().map(|l| Line::raw(l.as_str())).collect();
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -656,5 +750,65 @@ mod tests {
             "question: Tea or coffee?"
         );
         assert!(text(AgentState::Input, &AgentDetail::default()).is_none());
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn drop_dialogs_show_choices_and_lost_work() {
+        let mut app = App::new();
+        app.mode = Mode::ConfirmDropTask {
+            name: "feat".into(),
+        };
+        let s = screen(&mut app, 80, 20);
+        assert!(s.contains("Drop task feat?"), "{s}");
+        assert!(s.contains(DROP_KEYS), "{s}");
+
+        app.mode = Mode::ConfirmForceDrop {
+            name: "feat".into(),
+            delete_branch: false,
+            report: vec![
+                "/wt/app--feat (branch feat)".into(),
+                "  1 uncommitted change:".into(),
+                "    ?? notes.txt".into(),
+            ],
+        };
+        let s = screen(&mut app, 80, 20);
+        assert!(s.contains("Task feat not dropped:"), "{s}");
+        assert!(s.contains("    ?? notes.txt"), "{s}");
+        assert!(s.contains("Drop anyway? y/n"), "{s}");
+    }
+
+    #[test]
+    fn failed_drop_notice_shows_the_whole_message() {
+        // The daemon's error for a worktree git cannot remove.
+        let message = "Task 'feat5' kept (its agent was stopped): git worktree remove --force \
+                       /home/someone/.local/share/worktrees/repo--feat5 failed: fatal: cannot \
+                       remove a locked working tree;\nuse 'remove -f -f' to override or unlock first";
+        let mut app = App::new();
+        app.mode = Mode::Notice {
+            title: "Drop Failed".into(),
+            lines: message.lines().map(str::to_string).collect(),
+        };
+        let s = screen(&mut app, 100, 24);
+        assert!(s.contains("Drop Failed"), "{s}");
+        assert!(
+            s.contains("Task 'feat5' kept (its agent was stopped):"),
+            "{s}"
+        );
+        assert!(s.contains("unlock first"), "{s}");
+        // Narrow terminal: still all there, wrapped (down to the last word).
+        let s = screen(&mut app, 50, 24);
+        assert!(s.contains("Task 'feat5' kept"), "{s}");
+        assert!(s.contains("│  first"), "{s}");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +16,7 @@ use crate::agent::Agent;
 use crate::ledger::Ledger;
 use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
+use crate::worktrees::{self, Checked, Removal};
 
 pub struct Daemon {
     socket_path: PathBuf,
@@ -26,6 +27,8 @@ struct DaemonState {
     agents: HashMap<String, Agent>,
     /// Task ledger — the daemon is its only writer.
     ledger: Ledger,
+    /// Tasks being dropped: no agent may start in them meanwhile.
+    dropping: HashSet<String>,
     next_id: u64,
     shutdown: bool,
     event_tx: broadcast::Sender<Event>,
@@ -74,6 +77,7 @@ impl Daemon {
         let state = Arc::new(Mutex::new(DaemonState {
             agents: HashMap::new(),
             ledger,
+            dropping: HashSet::new(),
             next_id: 1,
             shutdown: false,
             event_tx,
@@ -319,6 +323,24 @@ impl DaemonState {
             Ok(None) => {}
             Err(e) => error!(task = %task, "failed to record run end: {e:#}"),
         }
+    }
+
+    /// Take the task's agents out of the table, telling clients and recording
+    /// the end of the run. The caller kills them.
+    fn take_task_agents(&mut self, task: &str) -> Vec<Agent> {
+        let ids: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|(_, a)| a.task() == Some(task))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| {
+                let agent = self.agents.remove(&id)?;
+                self.agent_gone(&id, &agent, -1);
+                Some(agent)
+            })
+            .collect()
     }
 
     /// Agents bound to a task whose current run has no session id yet.
@@ -630,8 +652,9 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         }
         Request::DropTask {
             name,
-            worktree_deleted,
-        } => handle_drop_task(state, &name, worktree_deleted).await,
+            force,
+            delete_branch,
+        } => handle_drop_task(state, &name, force, delete_branch).await,
         Request::Subscribe => Response::Error {
             message: "subscribe should be handled by connection handler".into(),
         },
@@ -679,6 +702,11 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         if state.ledger.task(task).is_none() {
             return Response::Error {
                 message: format!("task '{}' not found", task),
+            };
+        }
+        if state.dropping.contains(task) {
+            return Response::Error {
+                message: format!("task '{}' is being dropped", task),
             };
         }
         if let Some((other, _)) = state
@@ -899,40 +927,127 @@ async fn handle_create_task(
     }
 }
 
+/// Drop a task: check its worktree, stop its agent, remove the worktree (and
+/// branch), then forget the task. Git runs and the agent is waited for
+/// without holding the state lock; the task is claimed meanwhile so no agent
+/// starts in it.
+///
+/// Refuses (changing nothing) when the drop would lose work and `force` is
+/// unset. The task leaves the ledger only once its worktree is gone: if git
+/// cannot remove it, the agent is stopped but the task kept.
 async fn handle_drop_task(
     state: &Arc<Mutex<DaemonState>>,
     name: &str,
-    worktree_deleted: bool,
+    force: bool,
+    delete_branch: bool,
 ) -> Response {
+    let dirs = {
+        let mut state = state.lock().await;
+        let Some(task) = state.ledger.task(name) else {
+            return Response::Error {
+                message: format!("task '{}' not found", name),
+            };
+        };
+        let dirs: Vec<PathBuf> = if task.owned {
+            vec![task.dir.clone()]
+        } else {
+            Vec::new()
+        };
+        if !state.dropping.insert(name.to_string()) {
+            return Response::Error {
+                message: format!("task '{}' is already being dropped", name),
+            };
+        }
+        dirs
+    };
+
+    let removal = stop_and_remove(state, name, dirs, force, delete_branch).await;
+
     let mut state = state.lock().await;
-    if state.ledger.task(name).is_none() {
+    state.dropping.remove(name);
+    let removal = match removal {
+        Ok(removal) => removal,
+        Err(response) => return response,
+    };
+    if let Err(e) = state.ledger.drop_task(name, removal.deleted) {
         return Response::Error {
-            message: format!("task '{}' not found", name),
+            message: format!("cannot record the drop of '{name}': {e:#}; drop it again to finish"),
         };
     }
+    for warning in &removal.warnings {
+        warn!(task = %name, "{warning}");
+    }
+    info!(task = %name, "task dropped");
+    state.broadcast(Event::TaskDropped { name: name.into() });
+    Response::Dropped {
+        warnings: removal.warnings,
+    }
+}
 
-    let ids: Vec<String> = state
-        .agents
+/// The work of a drop before the ledger: check the worktrees (`Err` with
+/// `DropRefused` if work would be lost), stop the task's agents and wait for
+/// them, check again (the agent may have written until it stopped), remove
+/// the worktrees.
+async fn stop_and_remove(
+    state: &Arc<Mutex<DaemonState>>,
+    name: &str,
+    dirs: Vec<PathBuf>,
+    force: bool,
+    delete_branch: bool,
+) -> Result<Removal, Response> {
+    let check = |dirs: Vec<PathBuf>| {
+        blocking(move || dirs.into_iter().map(worktrees::check).collect::<Vec<_>>())
+    };
+    let mut checked = check(dirs.clone()).await?;
+    if !force {
+        refuse_lossy_drop(&checked, delete_branch)?;
+    }
+
+    let agents = state.lock().await.take_task_agents(name);
+    let stopped = !agents.is_empty();
+    if stopped {
+        info!(task = %name, "stopping agent of dropped task");
+        blocking(move || agents.into_iter().for_each(Agent::kill_and_drop)).await?;
+        if !force {
+            checked = check(dirs).await?;
+            refuse_lossy_drop(&checked, delete_branch)?;
+        }
+    }
+
+    blocking(move || worktrees::remove_all(&checked, delete_branch))
+        .await?
+        .map_err(|e| {
+            let agent = if stopped {
+                " (its agent was stopped)"
+            } else {
+                ""
+            };
+            Response::Error {
+                message: format!("Task '{name}' kept{agent}: {e}"),
+            }
+        })
+}
+
+/// Refuse a drop that would lose work, or whose worktree cannot be checked.
+fn refuse_lossy_drop(checked: &[Checked], delete_branch: bool) -> Result<(), Response> {
+    let reports: Vec<_> = checked
         .iter()
-        .filter(|(_, a)| a.task() == Some(name))
-        .map(|(id, _)| id.clone())
+        .filter_map(|c| c.report(delete_branch))
         .collect();
-    for id in ids {
-        if let Some(agent) = state.agents.remove(&id) {
-            info!(id = %id, task = %name, "killing agent of dropped task");
-            state.agent_gone(&id, &agent, -1);
-            tokio::task::spawn_blocking(move || agent.kill_and_drop());
-        }
+    if reports.is_empty() {
+        Ok(())
+    } else {
+        Err(Response::DropRefused { worktrees: reports })
     }
+}
 
-    match state.ledger.drop_task(name, worktree_deleted) {
-        Ok(()) => {
-            info!(task = %name, "task dropped");
-            state.broadcast(Event::TaskDropped { name: name.into() });
-            Response::Ok
-        }
-        Err(e) => Response::Error {
-            message: format!("{e:#}"),
-        },
-    }
+/// Run blocking work (git, waiting for a process) off the async runtime.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Response::Error {
+            message: format!("drop failed: {e}"),
+        })
 }

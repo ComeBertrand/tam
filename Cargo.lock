@@ -971,6 +971,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tam-proto",
+ "tam-worktree",
  "tempfile",
  "tokio",
  "toml",

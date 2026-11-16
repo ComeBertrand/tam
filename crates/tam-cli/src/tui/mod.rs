@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tam_proto::ServerMessage;
 
-use crate::client::{self, Client};
+use crate::client::{self, Client, DropOutcome};
 use crate::config::{self, Config};
 use crate::sessions;
 use crate::task::Task;
@@ -34,6 +34,8 @@ enum Action {
     },
     DropTask {
         name: String,
+        force: bool,
+        delete_branch: bool,
     },
     NewTask,
     RunAgent {
@@ -235,8 +237,12 @@ async fn run_loop(
                 stop_agent(client, app, &name).await?;
                 refresh_peek(client, app).await;
             }
-            Action::DropTask { name } => {
-                drop_task(client, app, &name).await?;
+            Action::DropTask {
+                name,
+                force,
+                delete_branch,
+            } => {
+                drop_task(client, app, &name, force, delete_branch).await;
                 refresh_peek(client, app).await;
             }
             Action::NewTask => {
@@ -305,6 +311,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::NewTaskEnterName { .. } => handle_new_task_name_key(key, app),
         Mode::SpawnEnterPath(_) => handle_enter_path_key(key, app),
         Mode::ConfirmDropTask { .. } => handle_confirm_drop_key(key, app),
+        Mode::ConfirmForceDrop { .. } => handle_confirm_force_drop_key(key, app),
+        Mode::Notice { .. } => {
+            app.mode = Mode::Normal;
+            Action::None
+        }
         _ => handle_picker_key(key, app, config),
     }
 }
@@ -544,20 +555,42 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
     }
 }
 
+/// `y`/enter: drop, keeping the branch; `b`: drop and delete the branch;
+/// anything else cancels.
 fn handle_confirm_drop_key(key: KeyEvent, app: &mut App) -> Action {
-    match key.code {
-        KeyCode::Char('y') => {
-            let name = match &app.mode {
-                Mode::ConfirmDropTask { name } => name.clone(),
-                _ => return Action::None,
-            };
-            app.mode = Mode::Normal;
-            Action::DropTask { name }
-        }
-        _ => {
-            app.mode = Mode::Normal;
-            Action::None
-        }
+    let Mode::ConfirmDropTask { name } = std::mem::replace(&mut app.mode, Mode::Normal) else {
+        return Action::None;
+    };
+    let delete_branch = match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => false,
+        KeyCode::Char('b') => true,
+        _ => return Action::None,
+    };
+    Action::DropTask {
+        name,
+        force: false,
+        delete_branch,
+    }
+}
+
+/// `y`: drop anyway, losing the reported work; anything else cancels.
+fn handle_confirm_force_drop_key(key: KeyEvent, app: &mut App) -> Action {
+    let Mode::ConfirmForceDrop {
+        name,
+        delete_branch,
+        ..
+    } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return Action::None;
+    };
+    if key.code != KeyCode::Char('y') {
+        app.set_status(format!("Kept '{name}'"), Duration::from_secs(3));
+        return Action::None;
+    }
+    Action::DropTask {
+        name,
+        force: true,
+        delete_branch,
     }
 }
 
@@ -966,28 +999,42 @@ async fn stop_agent(client: &mut Client, app: &mut App, name: &str) -> Result<()
     Ok(())
 }
 
-async fn drop_task(client: &mut Client, app: &mut App, name: &str) -> Result<()> {
-    // Stop the agent before its worktree goes away
-    let _ = client
-        .send(tam_proto::Request::Kill { id: name.into() })
-        .await;
-
-    let mut worktree_deleted = false;
-    if let Some(task) = app.tasks.iter().find(|t| t.name == name) {
-        if task.owned {
-            worktree_deleted = true;
-            if task.dir.exists() {
-                let wt_config = tam_worktree::config::load_config()?;
-                let _ = tam_worktree::worktree::delete(name, false, true, &wt_config, &task.dir);
-            }
+/// Ask the daemon to drop a task. A refusal opens the force dialog with what
+/// would be lost, a failure or warnings a notice; the task list follows the
+/// daemon's events.
+async fn drop_task(
+    client: &mut Client,
+    app: &mut App,
+    name: &str,
+    force: bool,
+    delete_branch: bool,
+) {
+    match client.drop_task(name, force, delete_branch).await {
+        Ok(DropOutcome::Dropped { warnings }) if warnings.is_empty() => {
+            app.set_status(format!("Dropped '{name}'"), Duration::from_secs(3));
+        }
+        Ok(DropOutcome::Dropped { warnings }) => {
+            let mut lines = vec![format!("Dropped '{name}', but:")];
+            lines.extend(warnings.iter().map(|w| format!("- {w}")));
+            app.mode = Mode::Notice {
+                title: "Dropped".into(),
+                lines,
+            };
+        }
+        Ok(DropOutcome::Refused { worktrees }) => {
+            app.mode = Mode::ConfirmForceDrop {
+                name: name.into(),
+                delete_branch,
+                report: crate::drop_report::lines(&worktrees),
+            };
+        }
+        Err(e) => {
+            app.mode = Mode::Notice {
+                title: "Drop Failed".into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
         }
     }
-
-    match client.drop_task(name, worktree_deleted).await {
-        Ok(()) => app.set_status(format!("Dropped '{name}'"), Duration::from_secs(3)),
-        Err(e) => app.set_status(format!("Drop failed: {e}"), Duration::from_secs(5)),
-    }
-    Ok(())
 }
 
 fn apply_event(app: &mut App, event: tam_proto::Event) {
@@ -1039,4 +1086,80 @@ async fn build_task_list(client: &mut Client) -> Result<Vec<Task>> {
     }
 
     Ok(tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn confirming(name: &str) -> App {
+        let mut app = App::new();
+        app.mode = Mode::ConfirmDropTask { name: name.into() };
+        app
+    }
+
+    #[test]
+    fn drop_dialog_keys() {
+        let mut app = confirming("feat");
+        let action = handle_confirm_drop_key(press('y'), &mut app);
+        assert!(matches!(
+            action,
+            Action::DropTask { ref name, force: false, delete_branch: false } if name == "feat"
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        let mut app = confirming("feat");
+        let action = handle_confirm_drop_key(press('b'), &mut app);
+        assert!(matches!(
+            action,
+            Action::DropTask {
+                force: false,
+                delete_branch: true,
+                ..
+            }
+        ));
+
+        let mut app = confirming("feat");
+        assert!(matches!(
+            handle_confirm_drop_key(press('n'), &mut app),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn force_drop_dialog_keeps_the_branch_choice() {
+        let force_dialog = || {
+            let mut app = App::new();
+            app.mode = Mode::ConfirmForceDrop {
+                name: "feat".into(),
+                delete_branch: true,
+                report: vec![],
+            };
+            app
+        };
+        let mut app = force_dialog();
+        assert!(matches!(
+            handle_confirm_force_drop_key(press('y'), &mut app),
+            Action::DropTask {
+                force: true,
+                delete_branch: true,
+                ..
+            }
+        ));
+
+        // Enter does not force: only an explicit `y` loses work.
+        let mut app = force_dialog();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_confirm_force_drop_key(enter, &mut app),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status_message(), Some("Kept 'feat'"));
+    }
 }

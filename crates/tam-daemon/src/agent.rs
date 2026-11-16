@@ -347,6 +347,22 @@ impl Agent {
     }
 }
 
+impl Drop for Agent {
+    /// Never leave the agent's processes behind: every daemon path kills an
+    /// agent before dropping it, but a daemon torn down without that (a
+    /// panic, an in-process test daemon going away) would orphan them. The
+    /// agent leads its own session (`setsid`), so its process group is the
+    /// whole tree it started.
+    fn drop(&mut self) {
+        // `try_wait` keeps the status once reaped: no signal to a reused pid.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ =
+                nix::sys::signal::killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// State of a hook-driven agent given how long its PTY has been silent: a
 /// turn interrupted by the user ends without any hook, leaving `working`
 /// stored, so a `working` agent silent for `timeout` is back at the prompt.

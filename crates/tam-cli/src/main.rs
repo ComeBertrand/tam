@@ -6,13 +6,12 @@ use clap::Parser;
 mod cli;
 mod client;
 mod config;
-mod ledger;
 mod sessions;
 mod task;
 mod tui;
 
 use cli::{Cli, Commands};
-use ledger::{Ledger, LedgerEvent};
+use tam_proto::TaskInfo;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,18 +30,17 @@ async fn main() -> Result<()> {
             source,
             no_start,
         } => {
-            let mut ledger = Ledger::load()?;
-
-            if ledger.task_exists(&name) {
+            let mut client = client::Client::connect().await?;
+            if client.list_tasks().await?.iter().any(|t| t.name == name) {
                 anyhow::bail!("task '{}' already exists", name);
             }
 
             let worktree = worktree || source.is_some();
+            let cwd = std::fs::canonicalize(".")?;
 
-            let task_dir = if worktree {
+            let task = if worktree {
                 // Owned context: create a worktree
                 let wt_config = tam_worktree::config::load_config()?;
-                let cwd = std::fs::canonicalize(".")?;
                 let wt_path =
                     tam_worktree::worktree::create(&name, source.as_deref(), &wt_config, &cwd)?;
 
@@ -50,66 +48,26 @@ async fn main() -> Result<()> {
                     tam_worktree::init::run(&wt_path)?;
                 }
 
-                ledger.append(LedgerEvent::TaskCreated {
-                    name: name.clone(),
-                    dir: wt_path.clone(),
-                    owned: true,
-                    timestamp: ledger::now(),
-                })?;
-
-                println!("Created task '{}' at {}", name, wt_path.display());
-                wt_path
+                let task = client.create_task(&name, &wt_path, true).await?;
+                println!("Created task '{}' at {}", name, task.dir.display());
+                task
             } else {
                 // Borrowed context: bind to cwd
-                let cwd = std::fs::canonicalize(".")?;
-
-                if let Some(existing) = ledger.find_task_by_dir(&cwd) {
-                    anyhow::bail!("directory already has an active task: '{}'", existing.name);
-                }
-
-                ledger.append(LedgerEvent::TaskCreated {
-                    name: name.clone(),
-                    dir: cwd.clone(),
-                    owned: false,
-                    timestamp: ledger::now(),
-                })?;
-
-                println!("Created task '{}' in {}", name, cwd.display());
-                cwd
+                let task = client.create_task(&name, &cwd, false).await?;
+                println!("Created task '{}' in {}", name, task.dir.display());
+                task
             };
 
             if !no_start {
-                let mut client = client::Client::connect().await?;
-                let resp = client
-                    .send(tam_proto::Request::Spawn {
-                        provider: config.default_agent.clone(),
-                        dir: task_dir,
-                        id: Some(name.clone()),
-                        args: vec![],
-                        resume_session: None,
-                        prompt: None,
-                    })
-                    .await?;
-
-                match resp {
-                    tam_proto::Response::Spawned { id } => {
-                        ledger.append(LedgerEvent::AgentRunStarted {
-                            task: name.clone(),
-                            provider: config.default_agent.clone(),
-                            session_id: None,
-                            timestamp: ledger::now(),
-                        })?;
-
-                        // Attach immediately
-                        let client = client::Client::connect().await?;
-                        client.attach(&id).await?;
-                    }
-                    tam_proto::Response::Error { message } => {
-                        eprintln!("Error: {}", message);
-                        std::process::exit(1);
-                    }
-                    _ => {}
-                }
+                spawn_and_attach(
+                    &mut client,
+                    &task,
+                    config.default_agent.clone(),
+                    vec![],
+                    None,
+                    None,
+                )
+                .await?;
             }
         }
 
@@ -120,11 +78,9 @@ async fn main() -> Result<()> {
             prompt,
             args,
         } => {
-            let mut ledger = Ledger::load()?;
-            let name = resolve_task_name(name, &ledger)?;
-            let task = ledger
-                .find_task(&name)
-                .ok_or_else(|| anyhow::anyhow!("task '{}' not found", name))?;
+            let mut client = client::Client::connect().await?;
+            let name = resolve_task_name(name, &client.list_tasks().await?)?;
+            let (task, runs) = client.get_task(&name).await?;
 
             let agent = agent.unwrap_or_else(|| config.default_agent.clone());
             config::validate_provider(&agent)?;
@@ -133,7 +89,6 @@ async fn main() -> Result<()> {
             let resume_session = if new_session || !std::io::stdin().is_terminal() {
                 None
             } else {
-                let runs = ledger.task_runs(&name);
                 let found = sessions::list_sessions_for_task(&agent, &task.dir, &runs);
                 if found.is_empty() {
                     None
@@ -142,56 +97,19 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let mut client = client::Client::connect().await?;
-            let resp = client
-                .send(tam_proto::Request::Spawn {
-                    provider: agent.clone(),
-                    dir: task.dir.clone(),
-                    id: Some(name.clone()),
-                    args,
-                    resume_session: resume_session.clone(),
-                    prompt,
-                })
-                .await?;
-
-            match resp {
-                tam_proto::Response::Spawned { id } => {
-                    ledger.append(LedgerEvent::AgentRunStarted {
-                        task: name.clone(),
-                        provider: agent,
-                        session_id: resume_session,
-                        timestamp: ledger::now(),
-                    })?;
-
-                    // Attach immediately
-                    let client = client::Client::connect().await?;
-                    client.attach(&id).await?;
-                }
-                tam_proto::Response::Error { message } => {
-                    eprintln!("Error: {}", message);
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
+            spawn_and_attach(&mut client, &task, agent, args, resume_session, prompt).await?;
         }
 
         Commands::Stop { name } => {
-            let mut ledger = Ledger::load()?;
-            let name = resolve_task_name(name, &ledger)?;
-
             let mut client = client::Client::connect().await?;
+            let name = resolve_task_name(name, &client.list_tasks().await?)?;
+
+            // The daemon records the end of the run.
             let resp = client
                 .send(tam_proto::Request::Kill { id: name.clone() })
                 .await?;
             match resp {
-                tam_proto::Response::Ok => {
-                    ledger.append(LedgerEvent::AgentRunEnded {
-                        task: name.clone(),
-                        exit_code: -1,
-                        timestamp: ledger::now(),
-                    })?;
-                    println!("Stopped agent in task '{}'", name);
-                }
+                tam_proto::Response::Ok => println!("Stopped agent in task '{}'", name),
                 tam_proto::Response::Error { message } => {
                     eprintln!("Error: {}", message);
                     std::process::exit(1);
@@ -201,79 +119,46 @@ async fn main() -> Result<()> {
         }
 
         Commands::Attach { name } => {
-            let ledger = Ledger::load()?;
-            let name = resolve_task_name(name, &ledger)?;
-
-            let client = client::Client::connect().await?;
+            let mut client = client::Client::connect().await?;
+            let name = resolve_task_name(name, &client.list_tasks().await?)?;
             client.attach(&name).await?;
         }
 
         Commands::Drop { name, branch } => {
-            let mut ledger = Ledger::load()?;
-            let task = ledger
-                .find_task(&name)
-                .ok_or_else(|| anyhow::anyhow!("task '{}' not found", name))?;
+            let mut client = client::Client::connect().await?;
+            let (task, _) = client.get_task(&name).await?;
 
-            // Kill agent if running
-            if let Ok(mut client) = client::Client::connect().await {
-                let _ = client
-                    .send(tam_proto::Request::Kill { id: name.clone() })
-                    .await;
-            }
+            // Stop the agent before its worktree goes away
+            let _ = client
+                .send(tam_proto::Request::Kill { id: name.clone() })
+                .await;
 
             // Delete worktree if owned
-            if task.owned {
+            if task.owned && task.dir.exists() {
                 let wt_config = tam_worktree::config::load_config()?;
-                // Find repo root from the worktree dir (or cwd as fallback)
-                let cwd = if task.dir.exists() {
-                    task.dir.clone()
-                } else {
-                    std::fs::canonicalize(".")?
-                };
-                if task.dir.exists() {
-                    tam_worktree::worktree::delete(&name, branch, true, &wt_config, &cwd)?;
-                }
-                ledger.append(LedgerEvent::WorktreeDeleted {
-                    task: name.clone(),
-                    timestamp: ledger::now(),
-                })?;
+                tam_worktree::worktree::delete(&name, branch, true, &wt_config, &task.dir)?;
             }
 
-            ledger.append(LedgerEvent::TaskDropped {
-                task: name.clone(),
-                timestamp: ledger::now(),
-            })?;
-
+            client.drop_task(&name, task.owned).await?;
             println!("Dropped task '{}'", name);
         }
 
         Commands::Ps { json } => {
-            let ledger = Ledger::load()?;
-            let snapshots = ledger.active_tasks();
+            let mut client = client::Client::connect().await?;
+            let infos = client.list_tasks().await?;
+            let agents = client.list_agents().await.unwrap_or_default();
 
-            // Get running agents from daemon
-            let agents = if let Ok(mut client) = client::Client::connect().await {
-                match client.send(tam_proto::Request::List).await {
-                    Ok(tam_proto::Response::Agents { agents }) => agents,
-                    _ => vec![],
-                }
-            } else {
-                vec![]
-            };
-
-            let mut tasks: Vec<task::Task> = snapshots
+            let mut tasks: Vec<task::Task> = infos
                 .into_iter()
-                .map(|s| {
-                    let agent_info = agents.iter().find(|a| a.id == s.name).cloned();
-                    task::Task::from_snapshot(s, agent_info)
+                .map(|info| {
+                    let agent_info = agents.iter().find(|a| a.id == info.name).cloned();
+                    task::Task::from_info(info, agent_info)
                 })
                 .collect();
 
             // Populate git branch status for owned tasks without a running agent
             for t in &mut tasks {
-                if t.owned && t.agent_info.is_none() {
-                    t.git_branch_status = task::check_git_branch_status(&t.name, &t.dir);
-                }
+                t.refresh_git_status();
             }
 
             tasks.sort_by_key(|t| (t.status().sort_priority(), t.name.clone()));
@@ -445,7 +330,8 @@ async fn main() -> Result<()> {
                 let _ = nix::unistd::setsid();
             }
             let socket_path = tam_proto::default_socket_path();
-            let d = tam_daemon::daemon::Daemon::new(socket_path);
+            let ledger_path = tam_daemon::ledger::default_path();
+            let d = tam_daemon::daemon::Daemon::new(socket_path, ledger_path);
             return d.run().await;
         }
 
@@ -476,14 +362,48 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Start an agent for a task (the daemon records the run), then attach.
+async fn spawn_and_attach(
+    client: &mut client::Client,
+    task: &TaskInfo,
+    provider: String,
+    args: Vec<String>,
+    resume_session: Option<String>,
+    prompt: Option<String>,
+) -> Result<()> {
+    let resp = client
+        .send(tam_proto::Request::Spawn {
+            provider,
+            dir: task.dir.clone(),
+            id: Some(task.name.clone()),
+            args,
+            resume_session,
+            prompt,
+            task: Some(task.name.clone()),
+        })
+        .await?;
+
+    match resp {
+        tam_proto::Response::Spawned { id } => {
+            let client = client::Client::connect().await?;
+            client.attach(&id).await
+        }
+        tam_proto::Response::Error { message } => {
+            eprintln!("Error: {}", message);
+            std::process::exit(1);
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Resolve a task name from explicit argument or from cwd.
-fn resolve_task_name(name: Option<String>, ledger: &Ledger) -> Result<String> {
+fn resolve_task_name(name: Option<String>, tasks: &[TaskInfo]) -> Result<String> {
     if let Some(name) = name {
         return Ok(name);
     }
     let cwd = std::fs::canonicalize(".")?;
-    match ledger.find_task_by_dir(&cwd) {
-        Some(task) => Ok(task.name),
+    match tasks.iter().find(|t| t.dir == cwd) {
+        Some(task) => Ok(task.name.clone()),
         None => anyhow::bail!("no task in current directory"),
     }
 }
@@ -492,7 +412,7 @@ fn format_age(timestamp: Option<u64>) -> String {
     let Some(ts) = timestamp else {
         return "-".into();
     };
-    let now = ledger::now();
+    let now = task::now();
     let elapsed = now.saturating_sub(ts);
     if elapsed < 60 {
         "now".into()
@@ -535,61 +455,60 @@ mod tests {
 
     #[test]
     fn test_format_age_recent() {
-        let ts = ledger::now();
+        let ts = task::now();
         assert_eq!(format_age(Some(ts)), "now");
     }
 
     #[test]
     fn test_format_age_minutes() {
-        let ts = ledger::now() - 300; // 5 minutes ago
+        let ts = task::now() - 300; // 5 minutes ago
         assert_eq!(format_age(Some(ts)), "5m");
     }
 
     #[test]
     fn test_format_age_hours() {
-        let ts = ledger::now() - 7200; // 2 hours ago
+        let ts = task::now() - 7200; // 2 hours ago
         assert_eq!(format_age(Some(ts)), "2h");
     }
 
     #[test]
     fn test_format_age_days() {
-        let ts = ledger::now() - 172800; // 2 days ago
+        let ts = task::now() - 172800; // 2 days ago
         assert_eq!(format_age(Some(ts)), "2d");
+    }
+
+    fn task_info(name: &str, dir: std::path::PathBuf) -> TaskInfo {
+        TaskInfo {
+            name: name.into(),
+            dir,
+            owned: false,
+            created_at: task::now(),
+            run_count: 0,
+            last_activity: None,
+        }
     }
 
     #[test]
     fn test_resolve_task_name_explicit() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
-        let name = resolve_task_name(Some("my-task".into()), &ledger).unwrap();
+        let name = resolve_task_name(Some("my-task".into()), &[]).unwrap();
         assert_eq!(name, "my-task");
     }
 
     #[test]
     fn test_resolve_task_name_from_cwd() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
-
         let cwd = std::fs::canonicalize(".").unwrap();
-        ledger
-            .append(LedgerEvent::TaskCreated {
-                name: "cwd-task".into(),
-                dir: cwd,
-                owned: false,
-                timestamp: ledger::now(),
-            })
-            .unwrap();
-
-        let name = resolve_task_name(None, &ledger).unwrap();
+        let tasks = [
+            task_info("other", "/nonexistent".into()),
+            task_info("cwd-task", cwd),
+        ];
+        let name = resolve_task_name(None, &tasks).unwrap();
         assert_eq!(name, "cwd-task");
     }
 
     #[test]
     fn test_resolve_task_name_no_match() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
-        let result = resolve_task_name(None, &ledger);
-        assert!(result.is_err());
+        let tasks = [task_info("other", "/nonexistent".into())];
+        assert!(resolve_task_name(None, &tasks).is_err());
     }
 
     /// Helper: create a git repo with an initial commit.
@@ -626,33 +545,9 @@ mod tests {
         let wt_path = tam_worktree::worktree::create("test-feat", None, &wt_config, &repo).unwrap();
         assert!(wt_path.exists());
 
-        // Track in ledger
-        let mut ledger = Ledger::load_from(tmp.path().join("ledger.jsonl")).unwrap();
-        ledger
-            .append(LedgerEvent::TaskCreated {
-                name: "test-feat".into(),
-                dir: wt_path.clone(),
-                owned: true,
-                timestamp: ledger::now(),
-            })
-            .unwrap();
-
-        let tasks = ledger.active_tasks();
-        assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].owned);
-
         // Delete worktree
         tam_worktree::worktree::delete("test-feat", false, true, &wt_config, &wt_path).unwrap();
         assert!(!wt_path.exists());
-
-        // Drop from ledger
-        ledger
-            .append(LedgerEvent::TaskDropped {
-                task: "test-feat".into(),
-                timestamp: ledger::now(),
-            })
-            .unwrap();
-        assert!(ledger.active_tasks().is_empty());
     }
 
     #[test]

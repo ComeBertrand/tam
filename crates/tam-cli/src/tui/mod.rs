@@ -11,11 +11,10 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tam_proto::{AgentInfo, ServerMessage};
+use tam_proto::ServerMessage;
 
 use crate::client::{self, Client};
 use crate::config::{self, Config};
-use crate::ledger::{Ledger, LedgerEvent};
 use crate::sessions;
 use crate::task::Task;
 
@@ -69,6 +68,8 @@ pub async fn run() -> Result<()> {
 
     let config = config::load_config()?;
     let mut client = Client::connect().await?;
+    // Subscribe before the snapshot: a change racing it is applied after.
+    client.subscribe().await?;
 
     let tasks = build_task_list(&mut client).await?;
 
@@ -228,17 +229,14 @@ async fn run_loop(
                 let attached = attach_agent(terminal, app, &name, &provider).await;
                 input.resume();
                 attached?;
-                app.set_tasks(build_task_list(client).await?);
                 refresh_peek(client, app).await;
             }
             Action::StopAgent { name } => {
                 stop_agent(client, app, &name).await?;
-                app.set_tasks(build_task_list(client).await?);
                 refresh_peek(client, app).await;
             }
             Action::DropTask { name } => {
                 drop_task(client, app, &name).await?;
-                app.set_tasks(build_task_list(client).await?);
                 refresh_peek(client, app).await;
             }
             Action::NewTask => {
@@ -249,10 +247,9 @@ async fn run_loop(
                     name,
                     dir,
                     resume_session,
-                }) = start_run_flow(app, config, &name)
+                }) = start_run_flow(client, app, config, &name).await
                 {
                     do_run(client, app, config, &name, &dir, resume_session).await?;
-                    app.set_tasks(build_task_list(client).await?);
                 }
             }
             Action::DoNewTask {
@@ -261,7 +258,6 @@ async fn run_loop(
                 worktree,
             } => {
                 do_new_task(client, app, &name, &dir, worktree, config).await?;
-                app.set_tasks(build_task_list(client).await?);
             }
             Action::DoRun {
                 name,
@@ -269,7 +265,6 @@ async fn run_loop(
                 resume_session,
             } => {
                 do_run(client, app, config, &name, &dir, resume_session).await?;
-                app.set_tasks(build_task_list(client).await?);
             }
             Action::CustomCommand {
                 name,
@@ -615,12 +610,19 @@ fn start_new_task_flow(app: &mut App, _config: &Config) {
     app.mode = Mode::NewTaskPickProject(PickerState::new("Pick project", items));
 }
 
-fn start_run_flow(app: &mut App, config: &Config, task_name: &str) -> Option<Action> {
+async fn start_run_flow(
+    client: &mut Client,
+    app: &mut App,
+    config: &Config,
+    task_name: &str,
+) -> Option<Action> {
+    let runs = client
+        .get_task(task_name)
+        .await
+        .map(|(_, runs)| runs)
+        .unwrap_or_default();
     let task = app.tasks.iter().find(|t| t.name == task_name)?;
 
-    let runs = Ledger::load()
-        .map(|l| l.task_runs(task_name))
-        .unwrap_or_default();
     let found = sessions::list_sessions_for_task(&config.default_agent, &task.dir, &runs);
     if found.is_empty() {
         return Some(Action::DoRun {
@@ -755,9 +757,7 @@ async fn do_new_task(
     worktree: bool,
     config: &Config,
 ) -> Result<()> {
-    let mut ledger = Ledger::load()?;
-
-    if ledger.task_exists(name) {
+    if app.tasks.iter().any(|t| t.name == name) {
         app.set_status(
             format!("Task '{}' already exists", name),
             Duration::from_secs(3),
@@ -783,12 +783,11 @@ async fn do_new_task(
         dir.to_path_buf()
     };
 
-    ledger.append(LedgerEvent::TaskCreated {
-        name: name.into(),
-        dir: task_dir.clone(),
-        owned: worktree,
-        timestamp: crate::ledger::now(),
-    })?;
+    // The task shows up through the daemon's TaskCreated event.
+    if let Err(e) = client.create_task(name, &task_dir, worktree).await {
+        app.set_status(format!("Create failed: {e}"), Duration::from_secs(5));
+        return Ok(());
+    }
 
     let resp = client
         .send(tam_proto::Request::Spawn {
@@ -798,16 +797,11 @@ async fn do_new_task(
             args: vec![],
             resume_session: None,
             prompt: None,
+            task: Some(name.into()),
         })
         .await?;
     match resp {
         tam_proto::Response::Spawned { id } => {
-            ledger.append(LedgerEvent::AgentRunStarted {
-                task: name.into(),
-                provider: config.default_agent.clone(),
-                session_id: None,
-                timestamp: crate::ledger::now(),
-            })?;
             app.set_status(format!("Created+started '{id}'"), Duration::from_secs(3));
         }
         tam_proto::Response::Error { message } => {
@@ -827,27 +821,20 @@ async fn do_run(
     dir: &Path,
     resume_session: Option<String>,
 ) -> Result<()> {
-    let mut ledger = Ledger::load()?;
-
     let resp = client
         .send(tam_proto::Request::Spawn {
             provider: config.default_agent.clone(),
             dir: dir.to_path_buf(),
             id: Some(name.into()),
             args: vec![],
-            resume_session: resume_session.clone(),
+            resume_session,
             prompt: None,
+            task: Some(name.into()),
         })
         .await?;
 
     match resp {
         tam_proto::Response::Spawned { id } => {
-            ledger.append(LedgerEvent::AgentRunStarted {
-                task: name.into(),
-                provider: config.default_agent.clone(),
-                session_id: resume_session,
-                timestamp: crate::ledger::now(),
-            })?;
             app.set_status(format!("Started agent in '{id}'"), Duration::from_secs(3));
         }
         tam_proto::Response::Error { message } => {
@@ -963,17 +950,12 @@ fn status_bar_seq(name: &str, provider: &str, cols: u16, rows: u16) -> String {
 }
 
 async fn stop_agent(client: &mut Client, app: &mut App, name: &str) -> Result<()> {
+    // The daemon records the end of the run.
     let resp = client
         .send(tam_proto::Request::Kill { id: name.into() })
         .await?;
     match resp {
         tam_proto::Response::Ok => {
-            let mut ledger = Ledger::load()?;
-            ledger.append(LedgerEvent::AgentRunEnded {
-                task: name.into(),
-                exit_code: -1,
-                timestamp: crate::ledger::now(),
-            })?;
             app.set_status(format!("Stopped '{name}'"), Duration::from_secs(3));
         }
         tam_proto::Response::Error { message } => {
@@ -985,25 +967,26 @@ async fn stop_agent(client: &mut Client, app: &mut App, name: &str) -> Result<()
 }
 
 async fn drop_task(client: &mut Client, app: &mut App, name: &str) -> Result<()> {
-    // Kill agent if running
+    // Stop the agent before its worktree goes away
     let _ = client
         .send(tam_proto::Request::Kill { id: name.into() })
         .await;
 
-    let mut ledger = Ledger::load()?;
-    if let Some(task) = ledger.find_task(name) {
-        if task.owned && std::path::Path::new(&task.dir).exists() {
-            let wt_config = tam_worktree::config::load_config()?;
-            let _ = tam_worktree::worktree::delete(name, false, true, &wt_config, &task.dir);
+    let mut worktree_deleted = false;
+    if let Some(task) = app.tasks.iter().find(|t| t.name == name) {
+        if task.owned {
+            worktree_deleted = true;
+            if task.dir.exists() {
+                let wt_config = tam_worktree::config::load_config()?;
+                let _ = tam_worktree::worktree::delete(name, false, true, &wt_config, &task.dir);
+            }
         }
     }
 
-    ledger.append(LedgerEvent::TaskDropped {
-        task: name.into(),
-        timestamp: crate::ledger::now(),
-    })?;
-
-    app.set_status(format!("Dropped '{name}'"), Duration::from_secs(3));
+    match client.drop_task(name, worktree_deleted).await {
+        Ok(()) => app.set_status(format!("Dropped '{name}'"), Duration::from_secs(3)),
+        Err(e) => app.set_status(format!("Drop failed: {e}"), Duration::from_secs(5)),
+    }
     Ok(())
 }
 
@@ -1024,40 +1007,35 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
         } => {
             app.update_context(&id, context_percent);
         }
-        tam_proto::Event::TaskCreated { .. } | tam_proto::Event::TaskDropped { .. } => {
-            // These come from other clients — we'd need to reload, but for now ignore
+        tam_proto::Event::TaskCreated { task } => {
+            let mut task = Task::from_info(task, None);
+            task.refresh_git_status();
+            app.upsert_task(task);
+        }
+        tam_proto::Event::TaskUpdated { task } => {
+            app.update_task_info(task);
+        }
+        tam_proto::Event::TaskDropped { name } => {
+            app.remove_task(&name);
         }
     }
 }
 
 async fn build_task_list(client: &mut Client) -> Result<Vec<Task>> {
-    let ledger = Ledger::load()?;
-    let snapshots = ledger.active_tasks();
+    let infos = client.list_tasks().await?;
+    let agents = client.list_agents().await.unwrap_or_default();
 
-    let agents = fetch_agents(client).await.unwrap_or_default();
-
-    let mut tasks: Vec<Task> = snapshots
+    let mut tasks: Vec<Task> = infos
         .into_iter()
-        .map(|s| {
-            let agent_info = agents.iter().find(|a| a.id == s.name).cloned();
-            Task::from_snapshot(s, agent_info)
+        .map(|info| {
+            let agent_info = agents.iter().find(|a| a.id == info.name).cloned();
+            Task::from_info(info, agent_info)
         })
         .collect();
 
     for t in &mut tasks {
-        if t.owned && t.agent_info.is_none() {
-            t.git_branch_status = crate::task::check_git_branch_status(&t.name, &t.dir);
-        }
+        t.refresh_git_status();
     }
 
     Ok(tasks)
-}
-
-async fn fetch_agents(client: &mut Client) -> Result<Vec<AgentInfo>> {
-    let resp = client.send(tam_proto::Request::List).await?;
-    match resp {
-        tam_proto::Response::Agents { agents } => Ok(agents),
-        tam_proto::Response::Error { message } => anyhow::bail!("daemon error: {message}"),
-        _ => anyhow::bail!("unexpected response to List"),
-    }
 }

@@ -10,19 +10,22 @@ use tam_proto::{AgentState, Event, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::agent::Agent;
+use crate::ledger::Ledger;
 use crate::notify::{self, NotifyConfig};
 use crate::provider;
 
 pub struct Daemon {
-    state: Arc<Mutex<DaemonState>>,
     socket_path: PathBuf,
+    ledger_path: PathBuf,
 }
 
 struct DaemonState {
     agents: HashMap<String, Agent>,
+    /// Task ledger — the daemon is its only writer.
+    ledger: Ledger,
     next_id: u64,
     shutdown: bool,
     event_tx: broadcast::Sender<Event>,
@@ -35,24 +38,50 @@ struct DaemonState {
 /// Default idle timeout before daemon auto-shuts down (seconds).
 const IDLE_TIMEOUT_SECS: u64 = 30;
 
+/// Capacity of the event broadcast channel. A subscriber that falls this far
+/// behind misses events.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
 impl Daemon {
-    pub fn new(socket_path: PathBuf) -> Self {
-        let (event_tx, _) = broadcast::channel(64);
+    /// A daemon serving `socket_path` and owning the ledger at `ledger_path`
+    /// (see [`crate::ledger::default_path`]).
+    pub fn new(socket_path: PathBuf, ledger_path: PathBuf) -> Self {
         Self {
-            state: Arc::new(Mutex::new(DaemonState {
-                agents: HashMap::new(),
-                next_id: 1,
-                shutdown: false,
-                event_tx,
-                socket_path: socket_path.clone(),
-                connected_clients: Arc::new(AtomicUsize::new(0)),
-                idle_deadline: None,
-            })),
             socket_path,
+            ledger_path,
         }
     }
 
     pub async fn run(&self) -> Result<()> {
+        // Lock the ledger before touching the socket: a second daemon must
+        // fail here rather than unlink the running daemon's socket.
+        let ledger_path = self.ledger_path.clone();
+        let (ledger, report) =
+            tokio::task::spawn_blocking(move || Ledger::open(&ledger_path)).await??;
+        for m in &report.malformed {
+            warn!(
+                ledger = %ledger.path().display(),
+                line = m.line,
+                error = %m.error,
+                "malformed ledger line set aside in .rejected"
+            );
+        }
+        if report.compacted > 0 {
+            info!(removed = report.compacted, "compacted ledger");
+        }
+
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let state = Arc::new(Mutex::new(DaemonState {
+            agents: HashMap::new(),
+            ledger,
+            next_id: 1,
+            shutdown: false,
+            event_tx,
+            socket_path: self.socket_path.clone(),
+            connected_clients: Arc::new(AtomicUsize::new(0)),
+            idle_deadline: None,
+        }));
+
         // Create socket directory
         if let Some(parent) = self.socket_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -76,7 +105,7 @@ impl Daemon {
         }
 
         // Spawn background task that monitors agents for state changes and exits
-        let monitor_state = self.state.clone();
+        let monitor_state = state.clone();
         tokio::spawn(async move {
             state_monitor(monitor_state, notify_config).await;
         });
@@ -86,10 +115,9 @@ impl Daemon {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _)) => {
-                            let state = self.state.clone();
-                            let event_rx = state.lock().await.event_tx.subscribe();
+                            let state = state.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, state, event_rx).await {
+                                if let Err(e) = handle_connection(stream, state).await {
                                     error!("client error: {}", e);
                                 }
                             });
@@ -97,7 +125,7 @@ impl Daemon {
                         Err(e) => error!("accept error: {}", e),
                     }
                 }
-                _ = shutdown_signal(self.state.clone()) => {
+                _ = shutdown_signal(state.clone()) => {
                     info!("shutting down");
                     break;
                 }
@@ -138,19 +166,7 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
         }
 
         // Check for exits
-        let exited: Vec<(String, i32)> = state
-            .agents
-            .iter_mut()
-            .filter_map(|(id, agent)| agent.check_exited().map(|code| (id.clone(), code)))
-            .collect();
-        for (id, exit_code) in &exited {
-            info!(id = %id, exit_code = %exit_code, "agent exited");
-            state.agents.remove(id);
-            let _ = state.event_tx.send(Event::AgentExited {
-                id: id.clone(),
-                exit_code: *exit_code,
-            });
-        }
+        state.reap_exited();
 
         // Check for state changes
         let changes: Vec<(String, AgentState, AgentState)> = state
@@ -198,6 +214,7 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
                 .iter()
                 .map(|(id, agent)| agent.context_refresh_job(id))
                 .collect();
+            let session_jobs = state.session_jobs();
 
             let event_tx = state.event_tx.clone();
             // Release lock before disk IO
@@ -212,7 +229,21 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
                 })
                 .collect();
 
+            let sessions: Vec<_> = session_jobs
+                .into_iter()
+                .filter_map(|job| {
+                    let id = provider::resolve(&job.provider).session_id(job.pid)?;
+                    Some((job, id))
+                })
+                .collect();
+
             // Phase 3: write back under lock
+            if !sessions.is_empty() {
+                let mut state = state_arc.lock().await;
+                for (job, session_id) in &sessions {
+                    state.record_session(job, session_id);
+                }
+            }
             if !results.is_empty() {
                 let mut state = state_arc.lock().await;
                 for (id, pct) in &results {
@@ -230,6 +261,85 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
     }
 }
 
+/// An agent whose run has no session id recorded yet.
+struct SessionJob {
+    task: String,
+    pid: u32,
+    provider: String,
+}
+
+impl DaemonState {
+    fn broadcast(&self, event: Event) {
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Remove agents whose process exited, telling clients and recording the
+    /// end of their run.
+    fn reap_exited(&mut self) {
+        let exited: Vec<(String, i32)> = self
+            .agents
+            .iter_mut()
+            .filter_map(|(id, agent)| agent.check_exited().map(|code| (id.clone(), code)))
+            .collect();
+        for (id, exit_code) in exited {
+            info!(id = %id, exit_code = %exit_code, "agent exited");
+            if let Some(agent) = self.agents.remove(&id) {
+                self.agent_gone(&id, &agent, exit_code);
+            }
+        }
+    }
+
+    /// An agent was removed from the table: emit `AgentExited` and record the
+    /// end of its task's run.
+    fn agent_gone(&mut self, id: &str, agent: &Agent, exit_code: i32) {
+        self.broadcast(Event::AgentExited {
+            id: id.to_string(),
+            exit_code,
+        });
+        let Some(task) = agent.task() else {
+            return;
+        };
+        match self.ledger.run_ended(task, exit_code) {
+            Ok(Some(info)) => self.broadcast(Event::TaskUpdated { task: info }),
+            Ok(None) => {}
+            Err(e) => error!(task = %task, "failed to record run end: {e:#}"),
+        }
+    }
+
+    /// Agents bound to a task whose current run has no session id yet.
+    fn session_jobs(&self) -> Vec<SessionJob> {
+        self.agents
+            .values()
+            .filter_map(|agent| {
+                let task = agent.task()?;
+                let run = self.ledger.runs(task).pop()?;
+                (run.ended_at.is_none() && run.session_id.is_none()).then(|| SessionJob {
+                    task: task.to_string(),
+                    pid: agent.pid(),
+                    provider: agent.provider_name().to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// Record a discovered session id, if the agent is still the one running
+    /// for the task.
+    fn record_session(&mut self, job: &SessionJob, session_id: &str) {
+        let still_running = self
+            .agents
+            .values()
+            .any(|a| a.task() == Some(job.task.as_str()) && a.pid() == job.pid);
+        if !still_running {
+            return;
+        }
+        match self.ledger.session_identified(&job.task, session_id) {
+            Ok(true) => info!(task = %job.task, session = %session_id, "session identified"),
+            Ok(false) => {}
+            Err(e) => error!(task = %job.task, "failed to record session: {e:#}"),
+        }
+    }
+}
+
 /// Guard that decrements connected_clients on drop.
 struct ClientGuard {
     counter: Arc<AtomicUsize>,
@@ -241,15 +351,23 @@ impl Drop for ClientGuard {
     }
 }
 
+/// Next event for a subscribed connection; never resolves otherwise.
+async fn next_event(
+    rx: &mut Option<broadcast::Receiver<Event>>,
+) -> Result<Event, broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Handle a single client connection.
 /// Starts as newline-delimited JSON request/response.
 /// If the client sends an Attach request, switches to raw byte streaming.
-/// Events from the daemon are pushed to the client as JSON lines.
-async fn handle_connection(
-    stream: UnixStream,
-    state: Arc<Mutex<DaemonState>>,
-    mut event_rx: broadcast::Receiver<Event>,
-) -> Result<()> {
+/// After a Subscribe request, daemon events are pushed to the client as JSON
+/// lines between responses.
+async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> Result<()> {
+    let mut event_rx: Option<broadcast::Receiver<Event>> = None;
     // Track connected clients for auto-shutdown
     let client_counter = state.lock().await.connected_clients.clone();
     client_counter.fetch_add(1, Ordering::Relaxed);
@@ -312,6 +430,10 @@ async fn handle_connection(
                             write_response(&mut writer, &Response::Error { message: msg }).await?;
                         }
                     }
+                } else if let Request::Subscribe = request {
+                    // Subscribe before replying: no event after the Ok is missed.
+                    event_rx = Some(state.lock().await.event_tx.subscribe());
+                    write_response(&mut writer, &Response::Ok).await?;
                 } else {
                     let response = dispatch(request, &state).await;
                     write_response(&mut writer, &response).await?;
@@ -323,12 +445,15 @@ async fn handle_connection(
                     break;
                 }
             }
-            event = event_rx.recv() => {
+            event = next_event(&mut event_rx) => {
                 match event {
                     Ok(event) => {
                         write_event(&mut writer, &event).await?;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(missed = n, "client lagging behind, events dropped");
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -428,7 +553,22 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             args,
             resume_session,
             prompt,
-        } => handle_spawn(state, provider, dir, id, args, resume_session, prompt).await,
+            task,
+        } => {
+            handle_spawn(
+                state,
+                SpawnSpec {
+                    provider,
+                    dir,
+                    id,
+                    args,
+                    resume_session,
+                    prompt,
+                    task,
+                },
+            )
+            .await
+        }
         Request::List => handle_list(state).await,
         Request::Kill { id } => handle_kill(state, &id).await,
         Request::Attach { id, .. } => Response::Error {
@@ -441,6 +581,31 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::Resize { id, cols, rows } => handle_resize(state, &id, cols, rows).await,
         Request::HookEvent { agent_id, event } => handle_hook_event(state, &agent_id, &event).await,
         Request::Shutdown => handle_shutdown(state).await,
+        Request::CreateTask { name, dir, owned } => {
+            handle_create_task(state, &name, &dir, owned).await
+        }
+        Request::ListTasks => Response::Tasks {
+            tasks: state.lock().await.ledger.tasks(),
+        },
+        Request::GetTask { name } => {
+            let state = state.lock().await;
+            match state.ledger.task(&name) {
+                Some(task) => Response::Task {
+                    task: task.clone(),
+                    runs: state.ledger.runs(&name),
+                },
+                None => Response::Error {
+                    message: format!("task '{}' not found", name),
+                },
+            }
+        }
+        Request::DropTask {
+            name,
+            worktree_deleted,
+        } => handle_drop_task(state, &name, worktree_deleted).await,
+        Request::Subscribe => Response::Error {
+            message: "subscribe should be handled by connection handler".into(),
+        },
         Request::Hello { protocol_version } => {
             if protocol_version == tam_proto::PROTOCOL_VERSION {
                 Response::Hello {
@@ -459,16 +624,44 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
     }
 }
 
-async fn handle_spawn(
-    state: &Arc<Mutex<DaemonState>>,
+struct SpawnSpec {
     provider: String,
     dir: PathBuf,
     id: Option<String>,
     args: Vec<String>,
     resume_session: Option<String>,
     prompt: Option<String>,
-) -> Response {
+    task: Option<String>,
+}
+
+async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Response {
     let mut state = state.lock().await;
+    let SpawnSpec {
+        provider,
+        dir,
+        id,
+        args,
+        resume_session,
+        prompt,
+        task,
+    } = spec;
+
+    if let Some(task) = &task {
+        if state.ledger.task(task).is_none() {
+            return Response::Error {
+                message: format!("task '{}' not found", task),
+            };
+        }
+        if let Some((other, _)) = state
+            .agents
+            .iter()
+            .find(|(_, a)| a.task() == Some(task.as_str()))
+        {
+            return Response::Error {
+                message: format!("task '{}' already has a running agent ('{}')", task, other),
+            };
+        }
+    }
 
     let id = id.unwrap_or_else(|| {
         let id = format!("agent-{}", state.next_id);
@@ -497,14 +690,21 @@ async fn handle_spawn(
         prompt.as_deref(),
         &env_vars,
     ) {
-        Ok(agent) => {
+        Ok(mut agent) => {
             info!(id = %id, provider = %provider, dir = %dir.display(), "spawned agent");
+            agent.set_task(task.clone());
             let info = agent.info(&id);
             state.agents.insert(id.clone(), agent);
-            let _ = state.event_tx.send(Event::AgentSpawned {
+            state.broadcast(Event::AgentSpawned {
                 id: id.clone(),
                 info,
             });
+            if let Some(task) = task {
+                match state.ledger.run_started(&task, &provider, resume_session) {
+                    Ok(info) => state.broadcast(Event::TaskUpdated { task: info }),
+                    Err(e) => error!(task = %task, "failed to record run start: {e:#}"),
+                }
+            }
             Response::Spawned { id }
         }
         Err(e) => Response::Error {
@@ -517,15 +717,7 @@ async fn handle_list(state: &Arc<Mutex<DaemonState>>) -> Response {
     let mut state = state.lock().await;
 
     // Remove exited agents — exit is an event, not a state
-    let exited: Vec<String> = state
-        .agents
-        .iter_mut()
-        .filter_map(|(id, agent)| agent.check_exited().map(|_| id.clone()))
-        .collect();
-    for id in &exited {
-        info!(id = %id, "agent exited, removing");
-        state.agents.remove(id);
-    }
+    state.reap_exited();
 
     // Use cached context values — background monitor refreshes every 10s
     let agents = state
@@ -543,10 +735,7 @@ async fn handle_kill(state: &Arc<Mutex<DaemonState>>, id: &str) -> Response {
     match state.agents.remove(id) {
         Some(agent) => {
             info!(id = %id, "killing agent");
-            let _ = state.event_tx.send(Event::AgentExited {
-                id: id.into(),
-                exit_code: -1,
-            });
+            state.agent_gone(id, &agent, -1);
             // Kill process in background — don't block the lock
             tokio::task::spawn_blocking(move || {
                 agent.kill_and_drop();
@@ -625,7 +814,11 @@ async fn handle_shutdown(state: &Arc<Mutex<DaemonState>>) -> Response {
     let mut state = state.lock().await;
 
     // Remove all agents and kill in background
-    let agents: Vec<_> = state.agents.drain().map(|(_, agent)| agent).collect();
+    let agents: Vec<_> = state.agents.drain().collect();
+    for (id, agent) in &agents {
+        state.agent_gone(id, agent, -1);
+    }
+    let agents: Vec<_> = agents.into_iter().map(|(_, agent)| agent).collect();
     state.shutdown = true;
 
     if !agents.is_empty() {
@@ -638,4 +831,64 @@ async fn handle_shutdown(state: &Arc<Mutex<DaemonState>>) -> Response {
 
     info!("shutdown requested");
     Response::Ok
+}
+
+async fn handle_create_task(
+    state: &Arc<Mutex<DaemonState>>,
+    name: &str,
+    dir: &std::path::Path,
+    owned: bool,
+) -> Response {
+    let mut state = state.lock().await;
+    match state.ledger.create_task(name, dir, owned) {
+        Ok(task) => {
+            info!(task = %name, dir = %dir.display(), "task created");
+            state.broadcast(Event::TaskCreated { task: task.clone() });
+            Response::Task {
+                task,
+                runs: Vec::new(),
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
+}
+
+async fn handle_drop_task(
+    state: &Arc<Mutex<DaemonState>>,
+    name: &str,
+    worktree_deleted: bool,
+) -> Response {
+    let mut state = state.lock().await;
+    if state.ledger.task(name).is_none() {
+        return Response::Error {
+            message: format!("task '{}' not found", name),
+        };
+    }
+
+    let ids: Vec<String> = state
+        .agents
+        .iter()
+        .filter(|(_, a)| a.task() == Some(name))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        if let Some(agent) = state.agents.remove(&id) {
+            info!(id = %id, task = %name, "killing agent of dropped task");
+            state.agent_gone(&id, &agent, -1);
+            tokio::task::spawn_blocking(move || agent.kill_and_drop());
+        }
+    }
+
+    match state.ledger.drop_task(name, worktree_deleted) {
+        Ok(()) => {
+            info!(task = %name, "task dropped");
+            state.broadcast(Event::TaskDropped { name: name.into() });
+            Response::Ok
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
 }

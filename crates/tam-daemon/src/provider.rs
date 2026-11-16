@@ -55,6 +55,12 @@ pub trait Provider: Send + Sync {
     fn context_usage(&self, _pid: u32, _dir: &Path) -> Option<ContextUsage> {
         None
     }
+
+    /// Session id of the running agent process, if the provider can tell.
+    /// Used to record new sessions in the ledger so they can be resumed.
+    fn session_id(&self, _pid: u32) -> Option<String> {
+        None
+    }
 }
 
 /// Claude Code provider.
@@ -111,6 +117,10 @@ impl Provider for ClaudeProvider {
     fn context_usage(&self, pid: u32, dir: &Path) -> Option<ContextUsage> {
         claude_context_usage(pid, dir)
     }
+
+    fn session_id(&self, pid: u32) -> Option<String> {
+        claude_session_id(pid)
+    }
 }
 
 // --- Claude context usage parsing ---
@@ -144,6 +154,18 @@ struct ClaudeUsage {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+}
+
+/// Read the session id Claude writes to `~/.claude/sessions/<pid>.json`.
+fn claude_session_id(pid: u32) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home)
+        .join(".claude")
+        .join("sessions")
+        .join(format!("{pid}.json"));
+    let content = std::fs::read_to_string(path).ok()?;
+    let session: ClaudeSessionFile = serde_json::from_str(&content).ok()?;
+    Some(session.session_id)
 }
 
 fn claude_context_usage(pid: u32, dir: &Path) -> Option<ContextUsage> {

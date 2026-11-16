@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tam_proto::{AgentInfo, AgentState};
-
-use crate::ledger::TaskSnapshot;
+use tam_proto::{AgentInfo, AgentState, TaskInfo};
 
 /// How long (in seconds) without activity before a task is considered stale.
 const STALE_THRESHOLD_SECS: u64 = 30 * 24 * 3600; // 30 days
@@ -89,18 +87,38 @@ pub struct Task {
 }
 
 impl Task {
-    /// Build a Task from a ledger snapshot and optional daemon agent info.
-    pub fn from_snapshot(snapshot: TaskSnapshot, agent_info: Option<AgentInfo>) -> Self {
-        let repo_name = compute_repo_name(&snapshot.dir);
+    /// Build a Task from the daemon's task info and optional agent info.
+    pub fn from_info(info: TaskInfo, agent_info: Option<AgentInfo>) -> Self {
+        let repo_name = compute_repo_name(&info.dir);
         Self {
-            name: snapshot.name,
-            dir: snapshot.dir,
-            owned: snapshot.owned,
+            name: info.name,
+            dir: info.dir,
+            owned: info.owned,
             repo_name,
             agent_info,
-            run_count: snapshot.run_count,
-            last_activity: snapshot.last_activity,
+            run_count: info.run_count,
+            last_activity: info.last_activity,
             git_branch_status: GitBranchStatus::Unknown,
+        }
+    }
+
+    /// Take the daemon's latest view of the task, keeping the derived state
+    /// (agent, git status).
+    pub fn update_info(&mut self, info: TaskInfo) {
+        if info.dir != self.dir {
+            self.repo_name = compute_repo_name(&info.dir);
+        }
+        self.dir = info.dir;
+        self.owned = info.owned;
+        self.run_count = info.run_count;
+        self.last_activity = info.last_activity;
+    }
+
+    /// Refresh the git branch status (only meaningful for owned tasks
+    /// without a running agent).
+    pub fn refresh_git_status(&mut self) {
+        if self.owned && self.agent_info.is_none() {
+            self.git_branch_status = check_git_branch_status(&self.name, &self.dir);
         }
     }
 
@@ -138,12 +156,16 @@ impl Task {
         let Some(last) = self.last_activity else {
             return false;
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now.saturating_sub(last) >= STALE_THRESHOLD_SECS
+        now().saturating_sub(last) >= STALE_THRESHOLD_SECS
     }
+}
+
+/// Current Unix timestamp in seconds.
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Derive the repository name from a task directory.
@@ -187,11 +209,12 @@ mod tests {
             .as_secs()
     }
 
-    fn test_snapshot() -> TaskSnapshot {
-        TaskSnapshot {
+    fn test_snapshot() -> TaskInfo {
+        TaskInfo {
             name: "feat".into(),
             dir: PathBuf::from("/tmp"), // use /tmp which always exists
             owned: true,
+            created_at: now_secs(),
             run_count: 3,
             last_activity: Some(now_secs()),
         }
@@ -199,7 +222,7 @@ mod tests {
 
     #[test]
     fn idle_when_no_agent() {
-        let task = Task::from_snapshot(test_snapshot(), None);
+        let task = Task::from_info(test_snapshot(), None);
         assert_eq!(task.status(), TaskStatus::Idle);
     }
 
@@ -207,7 +230,7 @@ mod tests {
     fn stale_when_no_recent_activity() {
         let mut snapshot = test_snapshot();
         snapshot.last_activity = Some(1000); // epoch 1970 — very old
-        let task = Task::from_snapshot(snapshot, None);
+        let task = Task::from_info(snapshot, None);
         assert_eq!(task.status(), TaskStatus::Stale);
     }
 
@@ -224,7 +247,7 @@ mod tests {
             context_percent: None,
             task: Some("feat".into()),
         };
-        let task = Task::from_snapshot(test_snapshot(), Some(info));
+        let task = Task::from_info(test_snapshot(), Some(info));
         assert_eq!(task.status(), TaskStatus::Run);
     }
 
@@ -241,7 +264,7 @@ mod tests {
             context_percent: None,
             task: Some("feat".into()),
         };
-        let task = Task::from_snapshot(test_snapshot(), Some(info));
+        let task = Task::from_info(test_snapshot(), Some(info));
         assert_eq!(task.status(), TaskStatus::Input);
     }
 
@@ -258,7 +281,7 @@ mod tests {
             context_percent: None,
             task: Some("feat".into()),
         };
-        let task = Task::from_snapshot(test_snapshot(), Some(info));
+        let task = Task::from_info(test_snapshot(), Some(info));
         assert_eq!(task.status(), TaskStatus::Block);
     }
 
@@ -266,20 +289,20 @@ mod tests {
     fn gone_when_dir_missing() {
         let mut snapshot = test_snapshot();
         snapshot.dir = PathBuf::from("/nonexistent/path/that/doesnt/exist");
-        let task = Task::from_snapshot(snapshot, None);
+        let task = Task::from_info(snapshot, None);
         assert_eq!(task.status(), TaskStatus::Gone);
     }
 
     #[test]
     fn gone_when_branch_gone() {
-        let mut task = Task::from_snapshot(test_snapshot(), None);
+        let mut task = Task::from_info(test_snapshot(), None);
         task.git_branch_status = GitBranchStatus::Gone;
         assert_eq!(task.status(), TaskStatus::Gone);
     }
 
     #[test]
     fn idle_when_branch_active() {
-        let mut task = Task::from_snapshot(test_snapshot(), None);
+        let mut task = Task::from_info(test_snapshot(), None);
         task.git_branch_status = GitBranchStatus::Active;
         assert_eq!(task.status(), TaskStatus::Idle);
     }
@@ -288,7 +311,7 @@ mod tests {
     fn borrowed_task_ignores_git_status() {
         let mut snapshot = test_snapshot();
         snapshot.owned = false;
-        let mut task = Task::from_snapshot(snapshot, None);
+        let mut task = Task::from_info(snapshot, None);
         task.git_branch_status = GitBranchStatus::Gone;
         // Borrowed tasks stay Idle regardless of git state
         assert_eq!(task.status(), TaskStatus::Idle);
@@ -309,7 +332,7 @@ mod tests {
         };
         let mut snapshot = test_snapshot();
         snapshot.last_activity = Some(1000); // very old
-        let task = Task::from_snapshot(snapshot, Some(info));
+        let task = Task::from_info(snapshot, Some(info));
         // Agent running takes priority over staleness
         assert_eq!(task.status(), TaskStatus::Run);
     }

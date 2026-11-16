@@ -290,6 +290,37 @@ pub struct ScreenInfo {
     pub live: u64,
 }
 
+/// A message to a task member's agent, as the daemon recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageInfo {
+    /// `msg-` and 8 hex digits.
+    pub id: String,
+    /// Id of the sending member; `None` when the user sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// How to name the sender: `user`, or its member label (see
+    /// `TaskInfo::member_label`), or its id once it no longer exists.
+    pub from_label: String,
+    /// Id of the recipient member.
+    pub to: String,
+    /// How to name the recipient (its member label).
+    pub to_label: String,
+    pub text: String,
+    /// Agent-to-agent hops leading to this message (0 when the user sent
+    /// it): the loop guard refuses messages past a limit.
+    #[serde(default)]
+    pub hop: u32,
+    /// The message this one answers, when the sender had an unanswered
+    /// message from the recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// Unix timestamp (seconds).
+    pub sent_at: u64,
+    /// When the recipient's agent got it; `None` while queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<u64>,
+}
+
 /// Client -> Daemon request.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -447,6 +478,39 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    /// Send a message to a task member's agent. Replies `Sent`; pushes
+    /// `MessageSent`, then `MessageDelivered` once the agent has it. A member
+    /// with no running agent gets it when its next agent starts.
+    SendMessage {
+        /// Recipient: a task name (its only member), `<task>/<member>` or a
+        /// member id.
+        to: String,
+        text: String,
+        /// The caller's agent id (`$TAM_AGENT_ID`): the message comes from
+        /// that agent's member. Without one (or an unknown one), from the user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
+    /// Wait for an agent's messages (sent by its inbox hook, `tam
+    /// inbox-wait`). Holds the connection: replies `Inbox` once messages are
+    /// handed over, `Ok` when a newer waiter or the agent's exit releases it.
+    WaitInbox {
+        agent_id: String,
+    },
+    /// Wait for the reply to a message: the recipient's next message to the
+    /// sender, or its last response at the end of the turn that got the
+    /// message, whichever comes first. Replies `Reply`, or `Error` once
+    /// `timeout_secs` have passed.
+    WaitReply {
+        id: String,
+        timeout_secs: u64,
+    },
+    /// Messages to or from the members of a task (of all tasks without one),
+    /// oldest first. Replies `Messages`.
+    ListMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+    },
 }
 
 /// Which session a member's agent starts in.
@@ -521,6 +585,30 @@ pub enum Response {
     Screen {
         screen: ScreenInfo,
     },
+    /// A message was recorded.
+    Sent {
+        message: Box<MessageInfo>,
+        /// Why it is not delivered yet, while it waits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending: Option<String>,
+    },
+    /// Messages handed to an agent's inbox hook: `text` is what the agent
+    /// is shown.
+    Inbox {
+        text: String,
+        ids: Vec<String>,
+    },
+    /// The reply to a message.
+    Reply {
+        /// The reply message, when the recipient answered with a message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<Box<MessageInfo>>,
+        /// The reply message's text, or the recipient's last response.
+        text: String,
+    },
+    Messages {
+        messages: Vec<MessageInfo>,
+    },
 }
 
 /// Daemon -> Client pushed event (unsolicited).
@@ -563,6 +651,14 @@ pub enum Event {
     /// `Request::WatchScreen`); throttled, the last change always comes.
     ScreenUpdated {
         id: String,
+    },
+    /// A message was sent (queued for its recipient).
+    MessageSent {
+        message: MessageInfo,
+    },
+    /// A message reached its recipient's agent.
+    MessageDelivered {
+        message: MessageInfo,
     },
 }
 
@@ -1435,5 +1531,109 @@ mod tests {
             serde_json::from_str::<ServerMessage>(&json).unwrap(),
             ServerMessage::Event(Event::ScreenUpdated { .. })
         ));
+    }
+
+    fn sample_message() -> MessageInfo {
+        MessageInfo {
+            id: "msg-0000002a".into(),
+            from: None,
+            from_label: "user".into(),
+            to: "m-1".into(),
+            to_label: "feat".into(),
+            text: "hello".into(),
+            hop: 0,
+            reply_to: None,
+            sent_at: 100,
+            delivered_at: None,
+        }
+    }
+
+    #[test]
+    fn message_requests_wire_format() {
+        let req = Request::SendMessage {
+            to: "feat/api".into(),
+            text: "hi".into(),
+            from: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"type":"send_message","to":"feat/api","text":"hi"}"#
+        );
+        let req: Request =
+            serde_json::from_str(r#"{"type":"send_message","to":"a","text":"t","from":"m-1"}"#)
+                .unwrap();
+        assert!(matches!(req, Request::SendMessage { from: Some(f), .. } if f == "m-1"));
+        let req: Request =
+            serde_json::from_str(r#"{"type":"wait_inbox","agent_id":"m-1"}"#).unwrap();
+        assert!(matches!(req, Request::WaitInbox { agent_id } if agent_id == "m-1"));
+        let req: Request =
+            serde_json::from_str(r#"{"type":"wait_reply","id":"msg-1","timeout_secs":5}"#).unwrap();
+        assert!(matches!(
+            req,
+            Request::WaitReply {
+                timeout_secs: 5,
+                ..
+            }
+        ));
+        let req: Request = serde_json::from_str(r#"{"type":"list_messages"}"#).unwrap();
+        assert!(matches!(req, Request::ListMessages { task: None }));
+    }
+
+    #[test]
+    fn message_info_omits_empty_fields() {
+        let json = serde_json::to_string(&sample_message()).unwrap();
+        for field in ["\"from\"", "reply_to", "delivered_at"] {
+            assert!(!json.contains(field), "{field} in {json}");
+        }
+        let back: MessageInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sample_message());
+    }
+
+    /// `ServerMessage` is untagged and tries `Response` first: message
+    /// events must not decode as a response, nor message responses as events.
+    #[test]
+    fn message_events_and_responses_are_told_apart() {
+        for event in [
+            Event::MessageSent {
+                message: sample_message(),
+            },
+            Event::MessageDelivered {
+                message: sample_message(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+                ServerMessage::Event(back) => {
+                    assert_eq!(serde_json::to_string(&back).unwrap(), json)
+                }
+                other => panic!("{json} decoded as {other:?}"),
+            }
+        }
+        for resp in [
+            Response::Sent {
+                message: Box::new(sample_message()),
+                pending: Some("no agent".into()),
+            },
+            Response::Inbox {
+                text: "hi".into(),
+                ids: vec!["msg-1".into()],
+            },
+            Response::Reply {
+                message: None,
+                text: "done".into(),
+            },
+            Response::Messages {
+                messages: vec![sample_message()],
+            },
+        ] {
+            let json = serde_json::to_string(&resp).unwrap();
+            assert!(
+                matches!(
+                    serde_json::from_str::<ServerMessage>(&json).unwrap(),
+                    ServerMessage::Response(_)
+                ),
+                "{json}"
+            );
+        }
     }
 }

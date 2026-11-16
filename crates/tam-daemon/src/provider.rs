@@ -127,6 +127,19 @@ pub trait Provider: Send + Sync {
     fn session_exists(&self, _session: &str) -> bool {
         true
     }
+
+    /// Whether messages reach the agent through its inbox hook (`tam
+    /// inbox-wait`) rather than typed into its PTY.
+    fn inbox_hook(&self) -> bool {
+        false
+    }
+
+    /// Bytes that type `text` into the agent's input, before Enter. By
+    /// default one line: a program may take each line as a separate input,
+    /// and the bracketed paste markers literally.
+    fn pty_input(&self, text: &str) -> Vec<u8> {
+        crate::inbox::one_line(text).into_bytes()
+    }
 }
 
 /// Claude Code provider.
@@ -137,6 +150,9 @@ pub trait Provider: Send + Sync {
 pub struct ClaudeProvider {
     /// Shell command the injected hooks run. `None` disables injection.
     hook_command: Option<String>,
+    /// Shell command the injected inbox hooks run (`tam inbox-wait`), with
+    /// `hook_command`. `None`: messages are typed into the PTY instead.
+    inbox_command: Option<String>,
 }
 
 /// How long a working Claude agent's PTY may stay silent before the turn is
@@ -152,17 +168,27 @@ const MAX_SUMMARY_LEN: usize = 200;
 impl ClaudeProvider {
     /// A provider whose hooks run `hook_command`.
     pub fn new(hook_command: Option<String>) -> Self {
-        Self { hook_command }
+        Self {
+            hook_command,
+            inbox_command: None,
+        }
     }
 
     /// A provider whose hooks call back into this executable
     /// (`<current exe> hook-notify`), so they reach the daemon that spawned
     /// the agent whatever `tam` is on the PATH.
     pub fn with_current_exe() -> Self {
-        let command = std::env::current_exe()
+        let exe = std::env::current_exe()
             .ok()
-            .map(|exe| format!("{} hook-notify", shell_quote(&exe.to_string_lossy())));
-        Self::new(command)
+            .map(|exe| shell_quote(&exe.to_string_lossy()));
+        let command = exe.as_ref().map(|exe| format!("{exe} hook-notify"));
+        Self::new(command).with_inbox(exe.map(|exe| format!("{exe} inbox-wait")))
+    }
+
+    /// Deliver messages through inbox hooks running `command`.
+    pub fn with_inbox(mut self, command: Option<String>) -> Self {
+        self.inbox_command = command;
+        self
     }
 }
 
@@ -198,6 +224,46 @@ pub fn claude_hook_settings(command: &str) -> String {
     serde_json::json!({ "hooks": hooks }).to_string()
 }
 
+/// Events whose firing arms an inbox hook: one waits for messages after the
+/// session starts (or is resumed, cleared, compacted) and after each turn.
+const CLAUDE_INBOX_HOOKS: &[&str] = &["SessionStart", "Stop"];
+
+/// How long an inbox hook waits (seconds). Claude kills it then, and only
+/// the next session start or turn end arms another: an agent idle longer
+/// gets its messages after its next turn.
+const CLAUDE_INBOX_TIMEOUT: u64 = 7 * 24 * 3600;
+
+/// The `--settings` JSON: tam's hooks (see [`claude_hook_settings`]) and,
+/// with an `inbox_command`, the inbox hooks that deliver messages. An inbox
+/// hook runs in the background (`asyncRewake`): exiting 2, it shows its
+/// stderr to the model, waking an idle session. `rewakeSummary` and
+/// `rewakeMessage` (the line the user sees, the prefix the model sees) are
+/// undocumented; Claude ignores hook fields it does not know.
+pub fn claude_settings(hook_command: &str, inbox_command: Option<&str>) -> String {
+    let settings = claude_hook_settings(hook_command);
+    let Some(inbox_command) = inbox_command else {
+        return settings;
+    };
+    let mut settings: Value = serde_json::from_str(&settings).expect("hook settings are JSON");
+    for event in CLAUDE_INBOX_HOOKS {
+        let entry = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": inbox_command,
+                "asyncRewake": true,
+                "timeout": CLAUDE_INBOX_TIMEOUT,
+                "rewakeSummary": crate::inbox::REWAKE_SUMMARY,
+                "rewakeMessage": crate::inbox::REWAKE_PREFIX,
+            }]
+        });
+        match settings["hooks"][*event].as_array_mut() {
+            Some(entries) => entries.push(entry),
+            None => settings["hooks"][*event] = Value::Array(vec![entry]),
+        }
+    }
+    settings.to_string()
+}
+
 /// Quote a string for `sh -c`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -219,7 +285,7 @@ impl Provider for ClaudeProvider {
         cmd.current_dir(dir);
         if let Some(hook_command) = &self.hook_command {
             cmd.arg("--settings")
-                .arg(claude_hook_settings(hook_command));
+                .arg(claude_settings(hook_command, self.inbox_command.as_deref()));
         }
         if let Some(id) = resume_session {
             cmd.arg("--resume").arg(id);
@@ -276,6 +342,14 @@ impl Provider for ClaudeProvider {
             Some(dir) => claude_transcript_exists(&dir, session),
             None => true,
         }
+    }
+
+    fn inbox_hook(&self) -> bool {
+        self.hook_command.is_some() && self.inbox_command.is_some()
+    }
+
+    fn pty_input(&self, text: &str) -> Vec<u8> {
+        crate::inbox::bracketed_paste(text)
     }
 }
 
@@ -673,6 +747,11 @@ impl Provider for CodexProvider {
 
     fn can_resume(&self) -> bool {
         true
+    }
+
+    // Codex's TUI turns bracketed paste on (not tried with a live codex).
+    fn pty_input(&self, text: &str) -> Vec<u8> {
+        crate::inbox::bracketed_paste(text)
     }
 }
 
@@ -1517,5 +1596,64 @@ mod tests {
             claude,
             "../projects/-w-app-feat/s1"
         ));
+    }
+
+    #[test]
+    fn claude_injects_inbox_hooks() {
+        let p = ClaudeProvider::new(Some("'/bin/tam' hook-notify".into()))
+            .with_inbox(Some("'/bin/tam' inbox-wait".into()));
+        assert!(p.inbox_hook());
+        let cmd = p.build_command(&PathBuf::from("/tmp"), &[], None, None);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let settings: Value = serde_json::from_str(&args[1]).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        for event in CLAUDE_INBOX_HOOKS {
+            // After the event's hook-notify entry.
+            assert_eq!(
+                hooks[*event][0]["hooks"][0]["command"],
+                "'/bin/tam' hook-notify"
+            );
+            let inbox = &hooks[*event][1]["hooks"][0];
+            assert_eq!(inbox["command"], "'/bin/tam' inbox-wait", "{event}");
+            assert_eq!(inbox["asyncRewake"], true);
+            assert_eq!(inbox["timeout"], CLAUDE_INBOX_TIMEOUT);
+            assert_eq!(inbox["rewakeSummary"], "tam message");
+        }
+        assert_eq!(hooks["UserPromptSubmit"].as_array().unwrap().len(), 1);
+        // JavaScript timers overflow past 2^31 ms.
+        assert!(CLAUDE_INBOX_TIMEOUT * 1000 < i32::MAX as u64);
+    }
+
+    #[test]
+    fn inbox_hook_needs_both_commands() {
+        assert!(!ClaudeProvider::new(None).inbox_hook());
+        assert!(!ClaudeProvider::new(None)
+            .with_inbox(Some("x".into()))
+            .inbox_hook());
+        assert!(!ClaudeProvider::new(Some("x".into())).inbox_hook());
+        let p = ClaudeProvider::with_current_exe();
+        assert!(p.inbox_hook());
+        assert!(p.inbox_command.unwrap().ends_with("' inbox-wait"));
+        assert!(!CodexProvider.inbox_hook());
+        assert!(!GenericProvider::new("x").inbox_hook());
+    }
+
+    #[test]
+    fn pty_input_per_provider() {
+        let text = "[tam] Message msg-1 from the user:\nhi";
+        assert_eq!(
+            GenericProvider::new("x").pty_input(text),
+            b"[tam] Message msg-1 from the user: hi".to_vec()
+        );
+        for paste in [
+            CodexProvider.pty_input(text),
+            ClaudeProvider::new(None).pty_input(text),
+        ] {
+            assert!(paste.starts_with(b"\x1b[200~[tam] Message"));
+            assert!(paste.ends_with(b"user:\nhi\x1b[201~"));
+        }
     }
 }

@@ -9,6 +9,7 @@ mod config;
 mod drop_report;
 mod health;
 mod hook;
+mod msg;
 mod task;
 mod tui;
 
@@ -471,6 +472,20 @@ async fn main() -> Result<()> {
             socket,
             event,
         } => hook::notify(agent, socket, event).await,
+
+        Commands::Msg {
+            target,
+            text,
+            wait,
+            timeout,
+            from,
+        } => msg::send(&target, text, wait.then_some(timeout), from).await?,
+
+        Commands::History { task, json } => msg::history(task, json).await?,
+
+        Commands::InboxWait { agent, socket } => {
+            std::process::exit(msg::inbox_wait(agent, socket).await)
+        }
     }
 
     Ok(())

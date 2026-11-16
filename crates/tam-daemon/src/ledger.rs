@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tam_proto::{MemberHealth, MemberInfo, NewMember, RunInfo, TaskInfo};
+use tam_proto::{MemberHealth, MemberInfo, MessageInfo, NewMember, RunInfo, TaskInfo};
 
 /// A single event recorded in the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +90,29 @@ pub enum LedgerEvent {
     AgentSessionChanged {
         member: String,
         session_id: String,
+        timestamp: u64,
+    },
+    /// A message to a member's agent. Kept with the recipient member.
+    MessageSent {
+        id: String,
+        /// Sending member; absent when the user sent it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// Recipient member.
+        to: String,
+        text: String,
+        #[serde(default)]
+        hop: u32,
+        /// The message this one answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        timestamp: u64,
+    },
+    /// The recipient's agent got the message.
+    MessageDelivered {
+        id: String,
+        /// Recipient member.
+        to: String,
         timestamp: u64,
     },
 }
@@ -176,6 +199,22 @@ struct MemberRecord {
     runs: Vec<RunInfo>,
     /// Member events, kept for compaction, tagged with their order.
     events: Vec<(usize, LedgerEvent)>,
+    /// Messages to this member, in the order they were sent.
+    messages: Vec<MessageRecord>,
+}
+
+/// A message folded from its events (kept by its recipient).
+#[derive(Debug, Clone)]
+struct MessageRecord {
+    id: String,
+    from: Option<String>,
+    text: String,
+    hop: u32,
+    reply_to: Option<String>,
+    sent_at: u64,
+    delivered_at: Option<u64>,
+    /// Order of its `MessageSent` event.
+    seq: usize,
 }
 
 /// Active tasks and members.
@@ -648,6 +687,137 @@ impl Ledger {
         }
         Ok(())
     }
+
+    /// How to name a member to the user (see `TaskInfo::member_label`).
+    pub fn member_label(&self, id: &str) -> Option<String> {
+        let (task, member) = self.member(id)?;
+        Some(task.member_label(&member))
+    }
+
+    /// Record a message to member `to`, from member `from` (`None`: the
+    /// user).
+    pub fn send_message(
+        &mut self,
+        from: Option<&str>,
+        to: &str,
+        text: &str,
+        hop: u32,
+        reply_to: Option<&str>,
+    ) -> Result<MessageInfo> {
+        self.require_member(to)?;
+        let id = new_message_id(|id| self.message_record(id).is_some());
+        self.append(LedgerEvent::MessageSent {
+            id: id.clone(),
+            from: from.map(str::to_string),
+            to: to.into(),
+            text: text.into(),
+            hop,
+            reply_to: reply_to.map(str::to_string),
+            timestamp: now(),
+        })?;
+        Ok(self.message(&id).expect("message just recorded"))
+    }
+
+    /// Record that a message reached its recipient's agent. Returns the
+    /// message, or `None` when it was delivered already or is unknown.
+    pub fn message_delivered(&mut self, id: &str) -> Result<Option<MessageInfo>> {
+        let to = match self.message_record(id) {
+            Some((to, record)) if record.delivered_at.is_none() => to.to_string(),
+            _ => return Ok(None),
+        };
+        self.append(LedgerEvent::MessageDelivered {
+            id: id.into(),
+            to,
+            timestamp: now(),
+        })?;
+        Ok(self.message(id))
+    }
+
+    pub fn message(&self, id: &str) -> Option<MessageInfo> {
+        let (to, record) = self.message_record(id)?;
+        Some(self.message_info(to, record))
+    }
+
+    /// Messages to a member that its agent has not got yet, oldest first.
+    pub fn pending_messages(&self, member: &str) -> Vec<MessageInfo> {
+        let Some(record) = self.state.members.get(member) else {
+            return Vec::new();
+        };
+        record
+            .messages
+            .iter()
+            .filter(|m| m.delivered_at.is_none())
+            .map(|m| self.message_info(member, m))
+            .collect()
+    }
+
+    /// Messages to or from the members of `task` (of every task: `None`),
+    /// oldest first.
+    pub fn messages(&self, task: Option<&str>) -> Vec<MessageInfo> {
+        let members = task.map(|t| self.member_ids(t));
+        let involved = |id: &str| members.as_ref().is_none_or(|ms| ms.iter().any(|m| m == id));
+        let mut found: Vec<(usize, MessageInfo)> = self
+            .state
+            .members
+            .values()
+            .flat_map(|r| r.messages.iter().map(move |m| (r.id.as_str(), m)))
+            .filter(|(to, m)| involved(to) || m.from.as_deref().is_some_and(involved))
+            .map(|(to, m)| (m.seq, self.message_info(to, m)))
+            .collect();
+        found.sort_by_key(|(seq, _)| *seq);
+        found.into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// The latest message from member `from` to member `to`, sent at or after
+    /// `since`, that no message from `to` answers yet.
+    pub fn unanswered_message(&self, from: &str, to: &str, since: u64) -> Option<String> {
+        let sent = &self.state.members.get(to)?.messages;
+        let answers = self
+            .state
+            .members
+            .get(from)
+            .map(|r| r.messages.as_slice())
+            .unwrap_or_default();
+        sent.iter()
+            .rev()
+            .filter(|m| m.from.as_deref() == Some(from) && m.sent_at >= since)
+            .find(|m| {
+                !answers
+                    .iter()
+                    .any(|a| a.reply_to.as_deref() == Some(m.id.as_str()))
+            })
+            .map(|m| m.id.clone())
+    }
+
+    /// A message and its recipient.
+    fn message_record(&self, id: &str) -> Option<(&str, &MessageRecord)> {
+        self.state.members.values().find_map(|r| {
+            r.messages
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| (r.id.as_str(), m))
+        })
+    }
+
+    fn message_info(&self, to: &str, m: &MessageRecord) -> MessageInfo {
+        let label = |id: &str| self.member_label(id).unwrap_or_else(|| id.to_string());
+        MessageInfo {
+            id: m.id.clone(),
+            from: m.from.clone(),
+            from_label: m
+                .from
+                .as_deref()
+                .map(label)
+                .unwrap_or_else(|| "user".into()),
+            to: to.to_string(),
+            to_label: label(to),
+            text: m.text.clone(),
+            hop: m.hop,
+            reply_to: m.reply_to.clone(),
+            sent_at: m.sent_at,
+            delivered_at: m.delivered_at,
+        }
+    }
 }
 
 impl State {
@@ -694,6 +864,7 @@ impl State {
                     dir: dir.clone(),
                     runs: Vec::new(),
                     events: Vec::new(),
+                    messages: Vec::new(),
                 };
                 let id = member.id.clone();
                 self.members.insert(id.clone(), member);
@@ -756,6 +927,46 @@ impl State {
                 if let Some(run) = record.runs.last_mut() {
                     run.session_id = Some(session_id.clone());
                 }
+                record.events.push((seq, event));
+            }
+            LedgerEvent::MessageSent {
+                id,
+                from,
+                to,
+                text,
+                hop,
+                reply_to,
+                timestamp,
+            } => {
+                let Some(record) = self.members.get_mut(to) else {
+                    return; // to an unknown or dropped member
+                };
+                if record.messages.iter().any(|m| m.id == *id) {
+                    return;
+                }
+                record.messages.push(MessageRecord {
+                    id: id.clone(),
+                    from: from.clone(),
+                    text: text.clone(),
+                    hop: *hop,
+                    reply_to: reply_to.clone(),
+                    sent_at: *timestamp,
+                    delivered_at: None,
+                    seq,
+                });
+                record.events.push((seq, event));
+            }
+            LedgerEvent::MessageDelivered { id, to, timestamp } => {
+                let Some(record) = self.members.get_mut(to) else {
+                    return;
+                };
+                let Some(message) = record.messages.iter_mut().find(|m| m.id == *id) else {
+                    return; // its message was compacted away or never recorded
+                };
+                if message.delivered_at.is_some() {
+                    return;
+                }
+                message.delivered_at = Some(*timestamp);
                 record.events.push((seq, event));
             }
         }
@@ -913,6 +1124,16 @@ fn member_names(members: &[&MemberRecord]) -> Vec<String> {
 fn new_member_id(taken: impl Fn(&str) -> bool) -> String {
     loop {
         let id = format!("m-{:08x}", random_u32());
+        if !taken(&id) {
+            return id;
+        }
+    }
+}
+
+/// A fresh message id (`msg-` and 8 hex digits) for which `taken` is false.
+fn new_message_id(taken: impl Fn(&str) -> bool) -> String {
+    loop {
+        let id = format!("msg-{:08x}", random_u32());
         if !taken(&id) {
             return id;
         }
@@ -1308,6 +1529,7 @@ mod tests {
             dir: "/1".into(),
             runs: vec![],
             events: vec![],
+            messages: vec![],
         };
         let two = MemberRecord {
             id: "m-2".into(),
@@ -2002,5 +2224,106 @@ mod tests {
             ledger.current_session("m-1", "claude").as_deref(),
             Some("s0")
         );
+    }
+
+    fn ids(messages: Vec<MessageInfo>) -> Vec<String> {
+        messages.into_iter().map(|m| m.id).collect()
+    }
+
+    #[test]
+    fn messages_survive_a_reopen_until_delivered() {
+        let tmp = TempDir::new().unwrap();
+        let (a, b, first, second) = {
+            let mut ledger = open(&tmp);
+            let a = create(&mut ledger, "a", "/w/a");
+            let b = create(&mut ledger, "b", "/w/b");
+            let first = ledger.send_message(None, &b, "hello", 0, None).unwrap();
+            assert!(first.id.starts_with("msg-"));
+            assert_eq!(
+                (first.from_label.as_str(), first.to_label.as_str()),
+                ("user", "b")
+            );
+            let second = ledger
+                .send_message(Some(&b), &a, "hi back", 1, None)
+                .unwrap();
+            assert_eq!(second.from_label, "b");
+            assert_eq!(second.hop, 1);
+            assert_eq!(ids(ledger.pending_messages(&b)), [first.id.as_str()]);
+
+            let delivered = ledger.message_delivered(&first.id).unwrap().unwrap();
+            assert!(delivered.delivered_at.is_some());
+            // Once only
+            assert!(ledger.message_delivered(&first.id).unwrap().is_none());
+            assert!(ledger.message_delivered("msg-nope").unwrap().is_none());
+            assert!(ledger.pending_messages(&b).is_empty());
+            assert!(ledger.send_message(None, "m-nobody", "x", 0, None).is_err());
+            (a, b, first, second)
+        };
+
+        let (ledger, report) = Ledger::open(&tmp.path().join("ledger.jsonl")).unwrap();
+        assert_eq!(report.compacted, 0);
+        assert_eq!(ids(ledger.pending_messages(&a)), [second.id.as_str()]);
+        assert!(ledger.pending_messages(&b).is_empty());
+        assert!(ledger.message(&first.id).unwrap().delivered_at.is_some());
+        // To or from the task's members, oldest first.
+        assert_eq!(ids(ledger.messages(Some("a"))), [second.id.as_str()]);
+        assert_eq!(
+            ids(ledger.messages(Some("b"))),
+            [first.id.clone(), second.id.clone()]
+        );
+        assert_eq!(ids(ledger.messages(None)), [first.id, second.id]);
+    }
+
+    #[test]
+    fn messages_go_with_their_recipients_task() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = open(&tmp);
+        let a = create(&mut ledger, "a", "/w/a");
+        let b = create(&mut ledger, "b", "/w/b");
+        let to_b = ledger.send_message(Some(&a), &b, "x", 1, None).unwrap();
+        let to_a = ledger.send_message(Some(&b), &a, "y", 1, None).unwrap();
+        ledger.message_delivered(&to_b.id).unwrap();
+        ledger.drop_task("b", false).unwrap();
+        assert!(ledger.message(&to_b.id).is_none());
+        // A gone sender is named by its id.
+        assert_eq!(ledger.message(&to_a.id).unwrap().from_label, b);
+        drop(ledger);
+
+        let (ledger, report) = Ledger::open(&path).unwrap();
+        assert!(report.compacted > 0);
+        assert!(ledger.message(&to_b.id).is_none());
+        assert_eq!(ids(ledger.pending_messages(&a)), [to_a.id]);
+        let types = event_types(&path);
+        assert_eq!(types.iter().filter(|t| *t == "message_sent").count(), 1);
+        assert!(!types.iter().any(|t| t == "message_delivered"));
+    }
+
+    #[test]
+    fn a_message_answers_the_latest_unanswered_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = open(&tmp);
+        let a = create(&mut ledger, "a", "/w/a");
+        let b = create(&mut ledger, "b", "/w/b");
+        assert_eq!(ledger.unanswered_message(&a, &b, 0), None);
+        let question = ledger.send_message(Some(&a), &b, "?", 1, None).unwrap();
+        // Only messages from a to b, sent in the window, count.
+        ledger
+            .send_message(None, &b, "from the user", 0, None)
+            .unwrap();
+        assert_eq!(
+            ledger.unanswered_message(&a, &b, 0),
+            Some(question.id.clone())
+        );
+        assert_eq!(ledger.unanswered_message(&b, &a, 0), None);
+        assert_eq!(
+            ledger.unanswered_message(&a, &b, question.sent_at + 1),
+            None
+        );
+        let answer = ledger
+            .send_message(Some(&b), &a, "!", 2, Some(&question.id))
+            .unwrap();
+        assert_eq!(answer.reply_to.as_deref(), Some(question.id.as_str()));
+        assert_eq!(ledger.unanswered_message(&a, &b, 0), None);
     }
 }

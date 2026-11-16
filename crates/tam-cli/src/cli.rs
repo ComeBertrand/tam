@@ -181,4 +181,55 @@ pub enum Commands {
         #[arg(short, long)]
         event: Option<String>,
     },
+
+    /// Send a message to the agent of a task member
+    ///
+    /// A Claude agent gets it right away: when idle it wakes up, when busy it
+    /// reads it at its next step. Other agents get it typed in once idle. A
+    /// member with no running agent gets it when its next agent starts. Sent
+    /// from an agent tam started, it comes from that agent's member; else
+    /// from the user.
+    Msg {
+        /// Recipient: task name, TASK/MEMBER or member id
+        target: String,
+
+        /// Message text (read from stdin when omitted)
+        text: Vec<String>,
+
+        /// Wait for the reply and print it: the recipient's next message back,
+        /// or its response at the end of the turn that got the message
+        #[arg(short, long)]
+        wait: bool,
+
+        /// How long --wait waits for the reply, in seconds
+        #[arg(long, default_value_t = 90, requires = "wait")]
+        timeout: u64,
+
+        /// Agent id of the sender (set by tam in the agents it starts)
+        #[arg(long, env = "TAM_AGENT_ID", hide = true)]
+        from: Option<String>,
+    },
+
+    /// Show a task's history: its agent runs and messages
+    History {
+        /// Task name (resolved from current directory if omitted)
+        task: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Wait for the agent's messages and print them (run in the background
+    /// by the inbox hooks tam injects into the Claude agents it spawns)
+    #[command(hide = true)]
+    InboxWait {
+        /// Agent ID (defaults to $TAM_AGENT_ID; exits quietly if absent)
+        #[arg(short, long, env = "TAM_AGENT_ID")]
+        agent: Option<String>,
+
+        /// Daemon socket (defaults to $TAM_SOCKET)
+        #[arg(long, env = "TAM_SOCKET")]
+        socket: Option<PathBuf>,
+    },
 }

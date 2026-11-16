@@ -151,7 +151,8 @@ impl Terminal {
     /// screen), then its screen. Wrapped rows are joined.
     pub fn text(&self) -> String {
         let mut formatted = String::new();
-        let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default());
+        let mut state = vt100::capture::BasicFormattedCaptureState::new();
+        let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut state);
         let _ = self
             .parser
             .screen()
@@ -423,7 +424,8 @@ mod tests {
         // wrapped line joined (and wrapped again at the viewer's width). A
         // line wrapped from history onto the screen would come in two.
         let mut all = String::new();
-        let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default());
+        let mut state = vt100::capture::BasicFormattedCaptureState::new();
+        let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut state);
         v.screen()
             .write_contents_formatted_basic(&mut all, range)
             .unwrap();

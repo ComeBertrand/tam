@@ -2392,7 +2392,8 @@ async fn attach_replays_history_then_screen_then_live_output() {
     // The history went to the viewer's scrollback, oldest first, after the
     // viewer's own screen (blank here).
     let mut all = String::new();
-    let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default());
+    let mut state = vt100::capture::BasicFormattedCaptureState::new();
+    let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut state);
     viewer
         .screen()
         .write_contents_formatted_basic(&mut all, range)

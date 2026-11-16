@@ -98,26 +98,36 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
         &mut stream,
         &Request::CreateTask {
             name: "feat".into(),
-            dir: work.clone(),
-            owned: false,
+            members: vec![tam_proto::NewMember {
+                repo_root: root.join("app"),
+                branch: "feat".into(),
+                dir: work.clone(),
+            }],
         },
     )
     .await;
-    assert!(matches!(resp, Response::Task { .. }), "{resp:?}");
+    let member = match resp {
+        Response::Task { task, .. } => task.members[0].id.clone(),
+        other => panic!("expected Task, got {other:?}"),
+    };
+    // The agent runs under the member id: its hooks report with it.
     let resp = send(
         &mut stream,
         &Request::Spawn {
             provider: "claude".into(),
             dir: work.clone(),
-            id: Some("feat".into()),
+            id: None,
             args: vec![],
             resume_session: None,
             prompt: Some("go".into()),
-            task: Some("feat".into()),
+            member: Some(member.clone()),
         },
     )
     .await;
-    assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+    assert!(
+        matches!(&resp, Response::Spawned { id } if *id == member),
+        "{resp:?}"
+    );
 
     // Events, to check AgentUpdated
     let mut events = UnixStream::connect(&sock).await.unwrap();
@@ -147,7 +157,7 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
     let transcript = root.join("session.jsonl");
     hook_notify(
         &sock,
-        "feat",
+        &member,
         &serde_json::json!({
             "hook_event_name": "SessionStart",
             "session_id": "sess-1",
@@ -172,7 +182,7 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
 
     hook_notify(
         &sock,
-        "feat",
+        &member,
         &serde_json::json!({
             "hook_event_name": "PermissionRequest",
             "session_id": "sess-1",
@@ -180,7 +190,7 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
             "tool_input": {"command": "cargo test"},
         }),
     );
-    let info = agent(&mut stream, "feat").await;
+    let info = agent(&mut stream, &member).await;
     assert_eq!(info.state, AgentState::Blocked);
     assert_eq!(info.detail.session_id.as_deref(), Some("sess-1"));
     assert_eq!(info.detail.pending.as_ref().unwrap().summary, "cargo test");
@@ -210,27 +220,27 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
 
     hook_notify(
         &sock,
-        "feat",
+        &member,
         &serde_json::json!({
             "hook_event_name": "PostToolUse",
             "tool_name": "Bash",
             "tool_response": {"stdout": "x".repeat(100_000)},
         }),
     );
-    let info = agent(&mut stream, "feat").await;
+    let info = agent(&mut stream, &member).await;
     assert_eq!(info.state, AgentState::Working);
     assert!(info.detail.pending.is_none());
 
     hook_notify(
         &sock,
-        "feat",
+        &member,
         &serde_json::json!({
             "hook_event_name": "StopFailure",
             "error": "rate_limit",
             "last_assistant_message": "API Error: Rate limit reached",
         }),
     );
-    let info = agent(&mut stream, "feat").await;
+    let info = agent(&mut stream, &member).await;
     assert_eq!(info.state, AgentState::Error);
     assert_eq!(info.detail.error.as_ref().unwrap().kind, "rate_limit");
 
@@ -238,13 +248,13 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
     // or a payload; hook-notify always exits 0.
     let status = Command::new(env!("CARGO_BIN_EXE_tam"))
         .args(["hook-notify", "--event", "stop"])
-        .env("TAM_AGENT_ID", "feat")
+        .env("TAM_AGENT_ID", &member)
         .env("TAM_SOCKET", &sock)
         .stdin(Stdio::null())
         .status()
         .unwrap();
     assert!(status.success());
-    assert_eq!(agent(&mut stream, "feat").await.state, AgentState::Error);
+    assert_eq!(agent(&mut stream, &member).await.state, AgentState::Error);
     hook_notify(
         &sock,
         "nobody",
@@ -254,10 +264,10 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
     let missing = root.join("missing.sock");
     hook_notify(
         &missing,
-        "feat",
+        &member,
         &serde_json::json!({"hook_event_name": "Stop"}),
     );
     assert!(!missing.exists());
 
-    let _ = send(&mut stream, &Request::Kill { id: "feat".into() }).await;
+    let _ = send(&mut stream, &Request::Kill { id: member }).await;
 }

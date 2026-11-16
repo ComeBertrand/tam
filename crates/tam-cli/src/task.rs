@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tam_proto::{AgentInfo, AgentState, TaskInfo};
+use tam_proto::{AgentInfo, AgentState, MemberInfo, NewMember, TaskInfo};
 
 /// How long (in seconds) without activity before a task is considered stale.
 const STALE_THRESHOLD_SECS: u64 = 30 * 24 * 3600; // 30 days
 
-/// Git branch state for an owned task, populated by callers before status().
+/// Git branch state of a member, populated by callers before status().
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GitBranchStatus {
     #[default]
@@ -90,57 +90,39 @@ impl TaskStatus {
     }
 }
 
-/// A task with its computed status and optional running agent info.
+/// A member of a task: one worktree, with its running agent if any.
 #[derive(Debug, Clone)]
-pub struct Task {
-    pub name: String,
-    pub dir: PathBuf,
-    pub owned: bool,
-    pub repo_name: String,
+pub struct Member {
+    pub info: MemberInfo,
     pub agent_info: Option<AgentInfo>,
-    pub run_count: usize,
-    pub last_activity: Option<u64>,
     pub git_branch_status: GitBranchStatus,
 }
 
-impl Task {
-    /// Build a Task from the daemon's task info and optional agent info.
-    pub fn from_info(info: TaskInfo, agent_info: Option<AgentInfo>) -> Self {
-        let repo_name = compute_repo_name(&info.dir);
+impl Member {
+    fn new(info: MemberInfo, agents: &[AgentInfo]) -> Self {
+        let agent_info = agents.iter().find(|a| a.id == info.id).cloned();
         Self {
-            name: info.name,
-            dir: info.dir,
-            owned: info.owned,
-            repo_name,
+            info,
             agent_info,
-            run_count: info.run_count,
-            last_activity: info.last_activity,
             git_branch_status: GitBranchStatus::Unknown,
         }
     }
 
-    /// Take the daemon's latest view of the task, keeping the derived state
-    /// (agent, git status).
-    pub fn update_info(&mut self, info: TaskInfo) {
-        if info.dir != self.dir {
-            self.repo_name = compute_repo_name(&info.dir);
-        }
-        self.dir = info.dir;
-        self.owned = info.owned;
-        self.run_count = info.run_count;
-        self.last_activity = info.last_activity;
+    pub fn id(&self) -> &str {
+        &self.info.id
     }
 
-    /// Refresh the git branch status (only meaningful for owned tasks
-    /// without a running agent).
+    /// Refresh the git branch status (only meaningful without a running
+    /// agent).
     pub fn refresh_git_status(&mut self) {
-        if self.owned && self.agent_info.is_none() {
-            self.git_branch_status = check_git_branch_status(&self.name, &self.dir);
+        if self.agent_info.is_none() {
+            self.git_branch_status = check_git_branch_status(&self.info.branch, &self.info.dir);
         }
     }
 
-    /// Compute the current status from daemon state + git branch state + activity.
-    pub fn status(&self) -> TaskStatus {
+    /// The member's status: its agent's state, else whether its worktree and
+    /// branch still exist.
+    fn status(&self, stale: bool) -> TaskStatus {
         if let Some(ref info) = self.agent_info {
             return match info.state {
                 AgentState::Working => TaskStatus::Run,
@@ -151,23 +133,121 @@ impl Task {
                 AgentState::Error => TaskStatus::Error,
             };
         }
-
-        // No agent running — check filesystem and git state for owned tasks
-        if self.owned {
-            if !self.dir.exists() {
-                return TaskStatus::Gone;
-            }
-            if self.git_branch_status == GitBranchStatus::Gone {
-                return TaskStatus::Gone;
-            }
+        if !self.info.dir.exists() || self.git_branch_status == GitBranchStatus::Gone {
+            return TaskStatus::Gone;
         }
-
-        // Check staleness based on last activity
-        if self.is_stale() {
+        if stale {
             return TaskStatus::Stale;
         }
-
         TaskStatus::Idle
+    }
+}
+
+/// A task with its members, their running agents and computed status.
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub name: String,
+    /// Members in join order (a task has at least one).
+    pub members: Vec<Member>,
+    pub run_count: usize,
+    pub last_activity: Option<u64>,
+}
+
+impl Task {
+    /// Build a Task from the daemon's task info and the running agents
+    /// (matched to members by id).
+    pub fn from_info(info: TaskInfo, agents: &[AgentInfo]) -> Self {
+        Self {
+            name: info.name,
+            members: info
+                .members
+                .into_iter()
+                .map(|m| Member::new(m, agents))
+                .collect(),
+            run_count: info.run_count,
+            last_activity: info.last_activity,
+        }
+    }
+
+    /// Take the daemon's latest view of the task, keeping the derived state
+    /// (agents, git status) of the members it still has.
+    pub fn update_info(&mut self, info: TaskInfo) {
+        let mut old = std::mem::take(&mut self.members);
+        self.members = info
+            .members
+            .into_iter()
+            .map(|m| match old.iter().position(|o| o.info.id == m.id) {
+                Some(pos) => {
+                    let mut member = old.swap_remove(pos);
+                    member.info = m;
+                    member
+                }
+                None => Member::new(m, &[]),
+            })
+            .collect();
+        self.run_count = info.run_count;
+        self.last_activity = info.last_activity;
+    }
+
+    /// The member actions apply to while a task has a single member.
+    pub fn primary(&self) -> Option<&Member> {
+        self.members.first()
+    }
+
+    /// The primary member's running agent.
+    pub fn agent_info(&self) -> Option<&AgentInfo> {
+        self.primary().and_then(|m| m.agent_info.as_ref())
+    }
+
+    /// The primary member's worktree.
+    pub fn dir(&self) -> Option<&Path> {
+        self.primary().map(|m| m.info.dir.as_path())
+    }
+
+    /// Repository names of the members.
+    pub fn repo_name(&self) -> String {
+        let repos: Vec<&str> = self.members.iter().map(|m| m.info.repo.as_str()).collect();
+        repos.join(",")
+    }
+
+    pub fn member(&self, id: &str) -> Option<&Member> {
+        self.members.iter().find(|m| m.id() == id)
+    }
+
+    pub fn member_mut(&mut self, id: &str) -> Option<&mut Member> {
+        self.members.iter_mut().find(|m| m.id() == id)
+    }
+
+    /// How to name a member to the user: the task name while it has a single
+    /// member, `<task>/<member>` otherwise.
+    pub fn member_label(&self, member: &Member) -> String {
+        if self.members.len() == 1 {
+            self.name.clone()
+        } else {
+            format!("{}/{}", self.name, member.info.name)
+        }
+    }
+
+    /// Refresh the git branch status of the members without a running agent.
+    pub fn refresh_git_status(&mut self) {
+        for m in &mut self.members {
+            m.refresh_git_status();
+        }
+    }
+
+    /// A member's status.
+    pub fn member_status(&self, member: &Member) -> TaskStatus {
+        member.status(self.is_stale())
+    }
+
+    /// The most urgent of the members' statuses.
+    pub fn status(&self) -> TaskStatus {
+        let stale = self.is_stale();
+        self.members
+            .iter()
+            .map(|m| m.status(stale))
+            .min_by_key(|s| s.sort_priority())
+            .unwrap_or(TaskStatus::Gone)
     }
 
     /// Whether the task has had no activity for longer than the stale threshold.
@@ -187,30 +267,33 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-/// Derive the repository name from a task directory.
-///
-/// For worktrees, returns the main repo name (parsed from `.git` file).
-/// Otherwise, returns the directory basename.
-fn compute_repo_name(dir: &Path) -> String {
-    if tam_worktree::pretty::is_worktree(dir) {
-        if let Ok(name) = tam_worktree::pretty::worktree_main_repo_name(dir) {
-            return name;
-        }
-    }
-    dir.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default()
+/// Create the worktree of a new task member: branch `name` (checked out if
+/// it exists, else created from `source` or the default branch) of the
+/// repository containing `cwd`.
+pub fn create_worktree(
+    name: &str,
+    source: Option<&str>,
+    config: &tam_worktree::config::Config,
+    cwd: &Path,
+) -> anyhow::Result<NewMember> {
+    let dir = tam_worktree::worktree::create(name, source, config, cwd)?;
+    let repo_root = tam_worktree::git::repo_root(&dir)?;
+    Ok(NewMember {
+        repo_root,
+        branch: name.into(),
+        dir,
+    })
 }
 
-/// Query git to determine branch status for an owned task.
+/// Query git to determine whether a member's branch still exists.
 /// Returns Unknown if git operations fail (graceful degradation).
-pub fn check_git_branch_status(task_name: &str, task_dir: &Path) -> GitBranchStatus {
-    let root = match tam_worktree::git::repo_root(task_dir) {
+pub fn check_git_branch_status(branch: &str, dir: &Path) -> GitBranchStatus {
+    let root = match tam_worktree::git::repo_root(dir) {
         Ok(r) => r,
         Err(_) => return GitBranchStatus::Unknown,
     };
 
-    match tam_worktree::git::local_branch_exists(&root, task_name) {
+    match tam_worktree::git::local_branch_exists(&root, branch) {
         Ok(true) => GitBranchStatus::Active,
         Ok(false) => GitBranchStatus::Gone,
         Err(_) => GitBranchStatus::Unknown,
@@ -220,6 +303,7 @@ pub fn check_git_branch_status(task_name: &str, task_dir: &Path) -> GitBranchSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn now_secs() -> u64 {
         SystemTime::now()
@@ -228,20 +312,46 @@ mod tests {
             .as_secs()
     }
 
+    fn member_info(id: &str, repo: &str, dir: &str) -> MemberInfo {
+        MemberInfo {
+            id: id.into(),
+            name: repo.into(),
+            repo: repo.into(),
+            repo_root: None,
+            branch: "feat".into(),
+            dir: PathBuf::from(dir),
+        }
+    }
+
     fn test_snapshot() -> TaskInfo {
         TaskInfo {
             name: "feat".into(),
-            dir: PathBuf::from("/tmp"), // use /tmp which always exists
-            owned: true,
+            // use /tmp which always exists
+            members: vec![member_info("m-1", "app", "/tmp")],
             created_at: now_secs(),
             run_count: 3,
             last_activity: Some(now_secs()),
         }
     }
 
+    fn agent(id: &str, state: AgentState) -> AgentInfo {
+        AgentInfo {
+            id: id.into(),
+            provider: "claude".into(),
+            dir: PathBuf::from("/tmp"),
+            state,
+            pid: Some(1234),
+            uptime_secs: 60,
+            viewers: 0,
+            context_percent: None,
+            task: Some("feat".into()),
+            detail: Default::default(),
+        }
+    }
+
     #[test]
     fn idle_when_no_agent() {
-        let task = Task::from_info(test_snapshot(), None);
+        let task = Task::from_info(test_snapshot(), &[]);
         assert_eq!(task.status(), TaskStatus::Idle);
     }
 
@@ -249,115 +359,99 @@ mod tests {
     fn stale_when_no_recent_activity() {
         let mut snapshot = test_snapshot();
         snapshot.last_activity = Some(1000); // epoch 1970 — very old
-        let task = Task::from_info(snapshot, None);
+        let task = Task::from_info(snapshot, &[]);
         assert_eq!(task.status(), TaskStatus::Stale);
     }
 
     #[test]
-    fn run_when_agent_working() {
-        let info = AgentInfo {
-            id: "feat".into(),
-            provider: "claude".into(),
-            dir: PathBuf::from("/tmp/feat"),
-            state: AgentState::Working,
-            pid: Some(1234),
-            uptime_secs: 60,
-            viewers: 0,
-            context_percent: None,
-            task: Some("feat".into()),
-            detail: Default::default(),
-        };
-        let task = Task::from_info(test_snapshot(), Some(info));
-        assert_eq!(task.status(), TaskStatus::Run);
+    fn agents_are_matched_by_member_id() {
+        let task = Task::from_info(test_snapshot(), &[agent("feat", AgentState::Working)]);
+        // An agent named after the task is not the member's.
+        assert!(task.agent_info().is_none());
+        let task = Task::from_info(test_snapshot(), &[agent("m-1", AgentState::Working)]);
+        assert_eq!(task.agent_info().unwrap().id, "m-1");
     }
 
     #[test]
-    fn input_when_agent_input() {
-        let info = AgentInfo {
-            id: "feat".into(),
-            provider: "claude".into(),
-            dir: PathBuf::from("/tmp/feat"),
-            state: AgentState::Input,
-            pid: Some(1234),
-            uptime_secs: 60,
-            viewers: 0,
-            context_percent: None,
-            task: Some("feat".into()),
-            detail: Default::default(),
-        };
-        let task = Task::from_info(test_snapshot(), Some(info));
-        assert_eq!(task.status(), TaskStatus::Input);
-    }
-
-    #[test]
-    fn block_when_agent_blocked() {
-        let info = AgentInfo {
-            id: "feat".into(),
-            provider: "claude".into(),
-            dir: PathBuf::from("/tmp/feat"),
-            state: AgentState::Blocked,
-            pid: Some(1234),
-            uptime_secs: 60,
-            viewers: 0,
-            context_percent: None,
-            task: Some("feat".into()),
-            detail: Default::default(),
-        };
-        let task = Task::from_info(test_snapshot(), Some(info));
-        assert_eq!(task.status(), TaskStatus::Block);
+    fn status_follows_agent_state() {
+        for (state, status) in [
+            (AgentState::Working, TaskStatus::Run),
+            (AgentState::Input, TaskStatus::Input),
+            (AgentState::Blocked, TaskStatus::Block),
+            (AgentState::Question, TaskStatus::Question),
+            (AgentState::Error, TaskStatus::Error),
+        ] {
+            let task = Task::from_info(test_snapshot(), &[agent("m-1", state)]);
+            assert_eq!(task.status(), status);
+        }
     }
 
     #[test]
     fn gone_when_dir_missing() {
         let mut snapshot = test_snapshot();
-        snapshot.dir = PathBuf::from("/nonexistent/path/that/doesnt/exist");
-        let task = Task::from_info(snapshot, None);
+        snapshot.members[0].dir = PathBuf::from("/nonexistent/path/that/doesnt/exist");
+        let task = Task::from_info(snapshot, &[]);
         assert_eq!(task.status(), TaskStatus::Gone);
     }
 
     #[test]
     fn gone_when_branch_gone() {
-        let mut task = Task::from_info(test_snapshot(), None);
-        task.git_branch_status = GitBranchStatus::Gone;
+        let mut task = Task::from_info(test_snapshot(), &[]);
+        task.members[0].git_branch_status = GitBranchStatus::Gone;
         assert_eq!(task.status(), TaskStatus::Gone);
     }
 
     #[test]
     fn idle_when_branch_active() {
-        let mut task = Task::from_info(test_snapshot(), None);
-        task.git_branch_status = GitBranchStatus::Active;
-        assert_eq!(task.status(), TaskStatus::Idle);
-    }
-
-    #[test]
-    fn borrowed_task_ignores_git_status() {
-        let mut snapshot = test_snapshot();
-        snapshot.owned = false;
-        let mut task = Task::from_info(snapshot, None);
-        task.git_branch_status = GitBranchStatus::Gone;
-        // Borrowed tasks stay Idle regardless of git state
+        let mut task = Task::from_info(test_snapshot(), &[]);
+        task.members[0].git_branch_status = GitBranchStatus::Active;
         assert_eq!(task.status(), TaskStatus::Idle);
     }
 
     #[test]
     fn agent_state_overrides_staleness() {
-        let info = AgentInfo {
-            id: "feat".into(),
-            provider: "claude".into(),
-            dir: PathBuf::from("/tmp/feat"),
-            state: AgentState::Working,
-            pid: Some(1234),
-            uptime_secs: 60,
-            viewers: 0,
-            context_percent: None,
-            task: Some("feat".into()),
-            detail: Default::default(),
-        };
         let mut snapshot = test_snapshot();
         snapshot.last_activity = Some(1000); // very old
-        let task = Task::from_info(snapshot, Some(info));
+        let task = Task::from_info(snapshot, &[agent("m-1", AgentState::Working)]);
         // Agent running takes priority over staleness
         assert_eq!(task.status(), TaskStatus::Run);
+    }
+
+    #[test]
+    fn task_status_is_the_most_urgent_member_status() {
+        let mut snapshot = test_snapshot();
+        snapshot.members.push(member_info("m-2", "web", "/tmp"));
+        let task = Task::from_info(
+            snapshot.clone(),
+            &[
+                agent("m-1", AgentState::Working),
+                agent("m-2", AgentState::Blocked),
+            ],
+        );
+        assert_eq!(task.status(), TaskStatus::Block);
+        assert_eq!(task.repo_name(), "app,web");
+        assert_eq!(task.member_label(&task.members[1]), "feat/web");
+        let task = Task::from_info(snapshot, &[agent("m-2", AgentState::Input)]);
+        assert_eq!(task.status(), TaskStatus::Input);
+    }
+
+    #[test]
+    fn update_info_keeps_member_state() {
+        let mut task = Task::from_info(test_snapshot(), &[agent("m-1", AgentState::Input)]);
+        task.members[0].git_branch_status = GitBranchStatus::Active;
+        let mut info = test_snapshot();
+        info.run_count = 4;
+        info.members.push(member_info("m-2", "web", "/tmp"));
+        task.update_info(info);
+        assert_eq!(task.run_count, 4);
+        assert_eq!(task.members.len(), 2);
+        assert!(task.member("m-1").unwrap().agent_info.is_some());
+        assert_eq!(
+            task.member("m-1").unwrap().git_branch_status,
+            GitBranchStatus::Active
+        );
+        assert!(task.member("m-2").unwrap().agent_info.is_none());
+        assert_eq!(task.member_label(&task.members[0]), "feat/app");
     }
 
     #[test]

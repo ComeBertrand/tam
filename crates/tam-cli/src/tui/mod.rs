@@ -16,7 +16,7 @@ use tam_proto::ServerMessage;
 use crate::client::{self, Client, DropOutcome};
 use crate::config::{self, Config};
 use crate::sessions;
-use crate::task::Task;
+use crate::task::{self, Member, Task};
 
 use self::app::{App, Mode, PickerItem, PickerState};
 
@@ -26,11 +26,14 @@ enum Action {
     Quit,
     SelectNext,
     SelectPrev,
+    /// Attach to a member's agent (`id` is the member id).
     Attach {
-        name: String,
+        id: String,
+        label: String,
     },
     StopAgent {
-        name: String,
+        id: String,
+        label: String,
     },
     DropTask {
         name: String,
@@ -39,16 +42,14 @@ enum Action {
     },
     NewTask,
     RunAgent {
-        name: String,
+        member: String,
     },
     DoNewTask {
         name: String,
         dir: PathBuf,
-        worktree: bool,
     },
     DoRun {
-        name: String,
-        dir: PathBuf,
+        member: String,
         resume_session: Option<String>,
     },
     CustomCommand {
@@ -219,22 +220,20 @@ async fn run_loop(
                 app.select_prev();
                 refresh_peek(client, app).await;
             }
-            Action::Attach { name } => {
+            Action::Attach { id, label } => {
                 input.pause().await;
                 let provider = app
-                    .tasks
-                    .iter()
-                    .find(|t| t.name == name)
-                    .and_then(|t| t.agent_info.as_ref())
+                    .find_member(&id)
+                    .and_then(|(_, m)| m.agent_info.as_ref())
                     .map(|a| a.provider.clone())
                     .unwrap_or_default();
-                let attached = attach_agent(terminal, app, &name, &provider).await;
+                let attached = attach_agent(terminal, app, &id, &label, &provider).await;
                 input.resume();
                 attached?;
                 refresh_peek(client, app).await;
             }
-            Action::StopAgent { name } => {
-                stop_agent(client, app, &name).await?;
+            Action::StopAgent { id, label } => {
+                stop_agent(client, app, &id, &label).await?;
                 refresh_peek(client, app).await;
             }
             Action::DropTask {
@@ -248,29 +247,23 @@ async fn run_loop(
             Action::NewTask => {
                 start_new_task_flow(app, config);
             }
-            Action::RunAgent { name } => {
+            Action::RunAgent { member } => {
                 if let Some(Action::DoRun {
-                    name,
-                    dir,
+                    member,
                     resume_session,
-                }) = start_run_flow(client, app, config, &name).await
+                }) = start_run_flow(client, app, config, &member).await
                 {
-                    do_run(client, app, config, &name, &dir, resume_session).await?;
+                    do_run(client, app, config, &member, resume_session).await?;
                 }
             }
-            Action::DoNewTask {
-                name,
-                dir,
-                worktree,
-            } => {
-                do_new_task(client, app, &name, &dir, worktree, config).await?;
+            Action::DoNewTask { name, dir } => {
+                do_new_task(client, app, &name, &dir, config).await?;
             }
             Action::DoRun {
-                name,
-                dir,
+                member,
                 resume_session,
             } => {
-                do_run(client, app, config, &name, &dir, resume_session).await?;
+                do_run(client, app, config, &member, resume_session).await?;
             }
             Action::CustomCommand {
                 name,
@@ -325,50 +318,31 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::Quit,
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
-        (KeyCode::Enter, _) => {
-            if let Some(task) = app.selected_task() {
-                if task.agent_info.is_some() {
-                    Action::Attach {
-                        name: task.name.clone(),
-                    }
-                } else {
-                    Action::None
-                }
-            } else {
-                Action::None
-            }
-        }
+        (KeyCode::Enter, _) => match selected_member(app) {
+            Some((task, member)) if member.agent_info.is_some() => Action::Attach {
+                id: member.id().to_string(),
+                label: task.member_label(member),
+            },
+            _ => Action::None,
+        },
         (KeyCode::Char('/'), _) => {
             app.filter_active = true;
             Action::None
         }
         (KeyCode::Char('n'), _) => Action::NewTask,
-        (KeyCode::Char('r'), _) => {
-            if let Some(task) = app.selected_task() {
-                if task.agent_info.is_none() {
-                    Action::RunAgent {
-                        name: task.name.clone(),
-                    }
-                } else {
-                    Action::None
-                }
-            } else {
-                Action::None
-            }
-        }
-        (KeyCode::Char('s'), _) => {
-            if let Some(task) = app.selected_task() {
-                if task.agent_info.is_some() {
-                    Action::StopAgent {
-                        name: task.name.clone(),
-                    }
-                } else {
-                    Action::None
-                }
-            } else {
-                Action::None
-            }
-        }
+        (KeyCode::Char('r'), _) => match selected_member(app) {
+            Some((_, member)) if member.agent_info.is_none() => Action::RunAgent {
+                member: member.id().to_string(),
+            },
+            _ => Action::None,
+        },
+        (KeyCode::Char('s'), _) => match selected_member(app) {
+            Some((task, member)) if member.agent_info.is_some() => Action::StopAgent {
+                id: member.id().to_string(),
+                label: task.member_label(member),
+            },
+            _ => Action::None,
+        },
         (KeyCode::Char('p'), _) => Action::TogglePeek,
         (KeyCode::Char('d'), _) => {
             if let Some(task) = app.selected_task() {
@@ -382,15 +356,14 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             if let Some(cmd) = config.commands.iter().find(|cmd| cmd.key_char() == c) {
                 if let Some(task) = app.selected_task() {
                     let provider = task
-                        .agent_info
-                        .as_ref()
+                        .agent_info()
                         .map(|a| a.provider.clone())
                         .unwrap_or_default();
                     Action::CustomCommand {
                         name: cmd.name.clone(),
                         command: cmd.command.clone(),
                         task: task.name.clone(),
-                        dir: task.dir.clone(),
+                        dir: task.dir().map(Path::to_path_buf).unwrap_or_default(),
                         provider,
                     }
                 } else {
@@ -468,35 +441,16 @@ fn handle_new_task_name_key(key: KeyEvent, app: &mut App) -> Action {
             app.mode = Mode::Normal;
             Action::None
         }
-        (KeyCode::Tab, _) => {
-            if let Mode::NewTaskEnterName {
-                ref mut create_worktree,
-                ..
-            } = app.mode
-            {
-                *create_worktree = !*create_worktree;
-            }
-            Action::None
-        }
         (KeyCode::Enter, _) => {
-            let (name, dir, worktree) = match &app.mode {
-                Mode::NewTaskEnterName {
-                    name,
-                    project_dir,
-                    create_worktree,
-                    ..
-                } => (name.clone(), project_dir.clone(), *create_worktree),
+            let (name, dir) = match &app.mode {
+                Mode::NewTaskEnterName { name, project_dir } => (name.clone(), project_dir.clone()),
                 _ => return Action::None,
             };
             if name.is_empty() {
                 return Action::None;
             }
             app.mode = Mode::Normal;
-            Action::DoNewTask {
-                name,
-                dir,
-                worktree,
-            }
+            Action::DoNewTask { name, dir }
         }
         (KeyCode::Backspace, _) => {
             if let Mode::NewTaskEnterName { ref mut name, .. } = app.mode {
@@ -535,7 +489,6 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
             app.mode = Mode::NewTaskEnterName {
                 project_dir: dir,
                 name: String::new(),
-                create_worktree: true,
             };
             Action::None
         }
@@ -594,6 +547,12 @@ fn handle_confirm_force_drop_key(key: KeyEvent, app: &mut App) -> Action {
     }
 }
 
+/// The selected task and the member actions apply to.
+fn selected_member(app: &App) -> Option<(&Task, &Member)> {
+    let task = app.selected_task()?;
+    Some((task, task.primary()?))
+}
+
 fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
     match &mut app.mode {
         Mode::NewTaskPickProject(p) | Mode::RunPickSession { picker: p, .. } => f(p),
@@ -647,20 +606,24 @@ async fn start_run_flow(
     client: &mut Client,
     app: &mut App,
     config: &Config,
-    task_name: &str,
+    member: &str,
 ) -> Option<Action> {
-    let runs = client
-        .get_task(task_name)
+    let (task_name, dir) = app
+        .find_member(member)
+        .map(|(t, m)| (t.name.clone(), m.info.dir.clone()))?;
+    let runs: Vec<_> = client
+        .get_task(&task_name)
         .await
         .map(|(_, runs)| runs)
-        .unwrap_or_default();
-    let task = app.tasks.iter().find(|t| t.name == task_name)?;
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.member == member)
+        .collect();
 
-    let found = sessions::list_sessions_for_task(&config.default_agent, &task.dir, &runs);
+    let found = sessions::list_sessions_for_task(&config.default_agent, &dir, &runs);
     if found.is_empty() {
         return Some(Action::DoRun {
-            name: task_name.to_string(),
-            dir: task.dir.clone(),
+            member: member.to_string(),
             resume_session: None,
         });
     }
@@ -677,7 +640,7 @@ async fn start_run_flow(
     }
 
     app.mode = Mode::RunPickSession {
-        task_name: task_name.to_string(),
+        member: member.to_string(),
         picker: PickerState::new("Pick session", items),
     };
     None
@@ -715,7 +678,6 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
                     app.mode = Mode::NewTaskEnterName {
                         project_dir: dir,
                         name: String::new(),
-                        create_worktree: true,
                     };
                     Action::None
                 }
@@ -728,17 +690,14 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
                 }
             }
         }
-        Mode::RunPickSession { task_name, .. } => {
-            let task = app.tasks.iter().find(|t| t.name == task_name);
-            let dir = task.map(|t| t.dir.clone()).unwrap_or_default();
+        Mode::RunPickSession { member, .. } => {
             let resume_session = if selected_id == "__new__" {
                 None
             } else {
                 Some(selected_id)
             };
             Action::DoRun {
-                name: task_name,
-                dir,
+                member,
                 resume_session,
             }
         }
@@ -755,9 +714,9 @@ async fn refresh_peek(client: &mut Client, app: &mut App) {
         return;
     }
     if let Some(task) = app.selected_task() {
-        if task.agent_info.is_some() {
-            let name = task.name.clone();
-            match fetch_scrollback(client, &name).await {
+        if let Some(agent) = task.agent_info() {
+            let id = agent.id.clone();
+            match fetch_scrollback(client, &id).await {
                 Ok(data) => app.peek = Some(data),
                 Err(e) => app.peek = Some(format!("(error: {e})")),
             }
@@ -787,7 +746,6 @@ async fn do_new_task(
     app: &mut App,
     name: &str,
     dir: &Path,
-    worktree: bool,
     config: &Config,
 ) -> Result<()> {
     if app.tasks.iter().any(|t| t.name == name) {
@@ -798,44 +756,44 @@ async fn do_new_task(
         return Ok(());
     }
 
-    let task_dir = if worktree {
-        let wt_config = tam_worktree::config::load_config()?;
-        match tam_worktree::worktree::create(name, None, &wt_config, dir) {
-            Ok(path) => {
-                if wt_config.auto_init {
-                    let _ = tam_worktree::init::run(&path);
-                }
-                path
+    // A task owns its worktree: branch NAME of the picked repository.
+    let wt_config = tam_worktree::config::load_config()?;
+    let member = match task::create_worktree(name, None, &wt_config, dir) {
+        Ok(member) => {
+            if wt_config.auto_init {
+                let _ = tam_worktree::init::run(&member.dir);
             }
-            Err(e) => {
-                app.set_status(format!("Worktree failed: {e}"), Duration::from_secs(5));
-                return Ok(());
-            }
+            member
         }
-    } else {
-        dir.to_path_buf()
+        Err(e) => {
+            app.set_status(format!("Worktree failed: {e}"), Duration::from_secs(5));
+            return Ok(());
+        }
     };
 
     // The task shows up through the daemon's TaskCreated event.
-    if let Err(e) = client.create_task(name, &task_dir, worktree).await {
-        app.set_status(format!("Create failed: {e}"), Duration::from_secs(5));
-        return Ok(());
-    }
+    let member = match client.create_task(name, vec![member]).await {
+        Ok(task) => task.members[0].id.clone(),
+        Err(e) => {
+            app.set_status(format!("Create failed: {e}"), Duration::from_secs(5));
+            return Ok(());
+        }
+    };
 
     let resp = client
         .send(tam_proto::Request::Spawn {
             provider: config.default_agent.clone(),
-            dir: task_dir,
-            id: Some(name.into()),
+            dir: PathBuf::new(),
+            id: None,
             args: vec![],
             resume_session: None,
             prompt: None,
-            task: Some(name.into()),
+            member: Some(member),
         })
         .await?;
     match resp {
-        tam_proto::Response::Spawned { id } => {
-            app.set_status(format!("Created+started '{id}'"), Duration::from_secs(3));
+        tam_proto::Response::Spawned { .. } => {
+            app.set_status(format!("Created+started '{name}'"), Duration::from_secs(3));
         }
         tam_proto::Response::Error { message } => {
             app.set_status(format!("Spawn error: {message}"), Duration::from_secs(5));
@@ -850,25 +808,31 @@ async fn do_run(
     client: &mut Client,
     app: &mut App,
     config: &Config,
-    name: &str,
-    dir: &Path,
+    member: &str,
     resume_session: Option<String>,
 ) -> Result<()> {
+    let label = app
+        .find_member(member)
+        .map(|(t, m)| t.member_label(m))
+        .unwrap_or_else(|| member.to_string());
     let resp = client
         .send(tam_proto::Request::Spawn {
             provider: config.default_agent.clone(),
-            dir: dir.to_path_buf(),
-            id: Some(name.into()),
+            dir: PathBuf::new(),
+            id: None,
             args: vec![],
             resume_session,
             prompt: None,
-            task: Some(name.into()),
+            member: Some(member.into()),
         })
         .await?;
 
     match resp {
-        tam_proto::Response::Spawned { id } => {
-            app.set_status(format!("Started agent in '{id}'"), Duration::from_secs(3));
+        tam_proto::Response::Spawned { .. } => {
+            app.set_status(
+                format!("Started agent in '{label}'"),
+                Duration::from_secs(3),
+            );
         }
         tam_proto::Response::Error { message } => {
             app.set_status(format!("Error: {message}"), Duration::from_secs(5));
@@ -878,9 +842,11 @@ async fn do_run(
     Ok(())
 }
 
+/// Attach to the agent `id`, named `name` in the status bar.
 async fn attach_agent(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
+    id: &str,
     name: &str,
     provider: &str,
 ) -> Result<()> {
@@ -910,7 +876,7 @@ async fn attach_agent(
 
     let attach_client = Client::connect().await?;
     let result = attach_client
-        .attach_relay(name, cols, agent_rows, on_resize)
+        .attach_relay(id, cols, agent_rows, on_resize)
         .await;
 
     client::reset_terminal_state();
@@ -982,14 +948,14 @@ fn status_bar_seq(name: &str, provider: &str, cols: u16, rows: u16) -> String {
     )
 }
 
-async fn stop_agent(client: &mut Client, app: &mut App, name: &str) -> Result<()> {
+async fn stop_agent(client: &mut Client, app: &mut App, id: &str, label: &str) -> Result<()> {
     // The daemon records the end of the run.
     let resp = client
-        .send(tam_proto::Request::Kill { id: name.into() })
+        .send(tam_proto::Request::Kill { id: id.into() })
         .await?;
     match resp {
         tam_proto::Response::Ok => {
-            app.set_status(format!("Stopped '{name}'"), Duration::from_secs(3));
+            app.set_status(format!("Stopped '{label}'"), Duration::from_secs(3));
         }
         tam_proto::Response::Error { message } => {
             app.set_status(format!("Error: {message}"), Duration::from_secs(5));
@@ -1056,7 +1022,7 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
             app.update_context(&id, context_percent);
         }
         tam_proto::Event::TaskCreated { task } => {
-            let mut task = Task::from_info(task, None);
+            let mut task = Task::from_info(task, &[]);
             task.refresh_git_status();
             app.upsert_task(task);
         }
@@ -1075,10 +1041,7 @@ async fn build_task_list(client: &mut Client) -> Result<Vec<Task>> {
 
     let mut tasks: Vec<Task> = infos
         .into_iter()
-        .map(|info| {
-            let agent_info = agents.iter().find(|a| a.id == info.name).cloned();
-            Task::from_info(info, agent_info)
-        })
+        .map(|info| Task::from_info(info, &agents))
         .collect();
 
     for t in &mut tasks {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tam_proto::{AgentState, Event, Request, Response};
+use tam_proto::{AgentInfo, AgentState, Event, NewMember, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
@@ -67,6 +67,19 @@ impl Daemon {
                 line = m.line,
                 error = %m.error,
                 "malformed ledger line set aside in .rejected"
+            );
+        }
+        if report.migrated > 0 {
+            info!(
+                lines = report.migrated,
+                backup = ?report.backup,
+                "migrated ledger to task members"
+            );
+        }
+        for task in &report.dropped_borrowed {
+            warn!(
+                task = %task,
+                "dropped borrowed task: tasks own their worktrees now (its directory is untouched)"
             );
         }
         if report.compacted > 0 {
@@ -184,8 +197,7 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             .collect();
         for (id, old, new) in changes {
             info!(id = %id, old = %old, new = %new, "state changed");
-            if let (Some(cfg), Some(agent)) = (&notify_config, state.agents.get(&id)) {
-                let info = agent.info(&id);
+            if let (Some(cfg), Some(info)) = (&notify_config, state.agent_info(&id)) {
                 notify::fire_if_matching(
                     cfg,
                     &Notification {
@@ -282,7 +294,7 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
 
 /// An agent whose run has no session id recorded yet.
 struct SessionJob {
-    task: String,
+    member: String,
     pid: u32,
     provider: String,
 }
@@ -290,6 +302,17 @@ struct SessionJob {
 impl DaemonState {
     fn broadcast(&self, event: Event) {
         let _ = self.event_tx.send(event);
+    }
+
+    /// An agent's info, with the task of its member.
+    fn agent_info(&self, id: &str) -> Option<AgentInfo> {
+        let agent = self.agents.get(id)?;
+        let mut info = agent.info(id);
+        info.task = agent
+            .member()
+            .and_then(|m| self.ledger.member_task(m))
+            .map(str::to_string);
+        Some(info)
     }
 
     /// Remove agents whose process exited, telling clients and recording the
@@ -309,29 +332,30 @@ impl DaemonState {
     }
 
     /// An agent was removed from the table: emit `AgentExited` and record the
-    /// end of its task's run.
+    /// end of its member's run.
     fn agent_gone(&mut self, id: &str, agent: &Agent, exit_code: i32) {
         self.broadcast(Event::AgentExited {
             id: id.to_string(),
             exit_code,
         });
-        let Some(task) = agent.task() else {
+        let Some(member) = agent.member() else {
             return;
         };
-        match self.ledger.run_ended(task, exit_code) {
+        match self.ledger.run_ended(member, exit_code) {
             Ok(Some(info)) => self.broadcast(Event::TaskUpdated { task: info }),
             Ok(None) => {}
-            Err(e) => error!(task = %task, "failed to record run end: {e:#}"),
+            Err(e) => error!(member = %member, "failed to record run end: {e:#}"),
         }
     }
 
-    /// Take the task's agents out of the table, telling clients and recording
-    /// the end of the run. The caller kills them.
+    /// Take the agents of the task's members out of the table, telling
+    /// clients and recording the end of their runs. The caller kills them.
     fn take_task_agents(&mut self, task: &str) -> Vec<Agent> {
+        let members = self.ledger.member_ids(task);
         let ids: Vec<String> = self
             .agents
             .iter()
-            .filter(|(_, a)| a.task() == Some(task))
+            .filter(|(_, a)| a.member().is_some_and(|m| members.iter().any(|id| id == m)))
             .map(|(id, _)| id.clone())
             .collect();
         ids.into_iter()
@@ -343,15 +367,15 @@ impl DaemonState {
             .collect()
     }
 
-    /// Agents bound to a task whose current run has no session id yet.
+    /// Agents bound to a member whose current run has no session id yet.
     fn session_jobs(&self) -> Vec<SessionJob> {
         self.agents
             .values()
             .filter_map(|agent| {
-                let task = agent.task()?;
-                let run = self.ledger.runs(task).pop()?;
+                let member = agent.member()?;
+                let run = self.ledger.member_runs(member).pop()?;
                 (run.ended_at.is_none() && run.session_id.is_none()).then(|| SessionJob {
-                    task: task.to_string(),
+                    member: member.to_string(),
                     pid: agent.pid(),
                     provider: agent.provider_name().to_string(),
                 })
@@ -359,30 +383,32 @@ impl DaemonState {
             .collect()
     }
 
-    /// Record the session id reported by an agent's hooks for its task's
+    /// Record the session id reported by an agent's hooks for its member's
     /// current run (first one only; later ones are e.g. `/clear`).
-    fn record_hook_session(&mut self, task: &str, session_id: &str) {
-        match self.ledger.session_identified(task, session_id) {
-            Ok(true) => info!(task = %task, session = %session_id, "session identified by hook"),
+    fn record_hook_session(&mut self, member: &str, session_id: &str) {
+        match self.ledger.session_identified(member, session_id) {
+            Ok(true) => {
+                info!(member = %member, session = %session_id, "session identified by hook")
+            }
             Ok(false) => {}
-            Err(e) => error!(task = %task, "failed to record session: {e:#}"),
+            Err(e) => error!(member = %member, "failed to record session: {e:#}"),
         }
     }
 
     /// Record a discovered session id, if the agent is still the one running
-    /// for the task.
+    /// for the member.
     fn record_session(&mut self, job: &SessionJob, session_id: &str) {
         let still_running = self
             .agents
             .values()
-            .any(|a| a.task() == Some(job.task.as_str()) && a.pid() == job.pid);
+            .any(|a| a.member() == Some(job.member.as_str()) && a.pid() == job.pid);
         if !still_running {
             return;
         }
-        match self.ledger.session_identified(&job.task, session_id) {
-            Ok(true) => info!(task = %job.task, session = %session_id, "session identified"),
+        match self.ledger.session_identified(&job.member, session_id) {
+            Ok(true) => info!(member = %job.member, session = %session_id, "session identified"),
             Ok(false) => {}
-            Err(e) => error!(task = %job.task, "failed to record session: {e:#}"),
+            Err(e) => error!(member = %job.member, "failed to record session: {e:#}"),
         }
     }
 }
@@ -600,7 +626,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             args,
             resume_session,
             prompt,
-            task,
+            member,
         } => {
             handle_spawn(
                 state,
@@ -611,7 +637,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                     args,
                     resume_session,
                     prompt,
-                    task,
+                    member,
                 },
             )
             .await
@@ -632,9 +658,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             payload,
         } => handle_hook_event(state, &agent_id, &event, payload.as_ref()).await,
         Request::Shutdown => handle_shutdown(state).await,
-        Request::CreateTask { name, dir, owned } => {
-            handle_create_task(state, &name, &dir, owned).await
-        }
+        Request::CreateTask { name, members } => handle_create_task(state, &name, &members).await,
         Request::ListTasks => Response::Tasks {
             tasks: state.lock().await.ledger.tasks(),
         },
@@ -642,11 +666,35 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             let state = state.lock().await;
             match state.ledger.task(&name) {
                 Some(task) => Response::Task {
-                    task: task.clone(),
+                    task,
                     runs: state.ledger.runs(&name),
                 },
                 None => Response::Error {
                     message: format!("task '{}' not found", name),
+                },
+            }
+        }
+        Request::ResolveMember { target, dir } => {
+            let state = state.lock().await;
+            let found = match (target, dir) {
+                (Some(target), _) => state.ledger.resolve(&target),
+                (None, Some(dir)) => state
+                    .ledger
+                    .member_at(&dir)
+                    .ok_or_else(|| anyhow::anyhow!("no task member in {}", dir.display())),
+                (None, None) => Err(anyhow::anyhow!("resolve_member needs a target or a dir")),
+            };
+            match found {
+                Ok((task, member)) => {
+                    let runs = state.ledger.member_runs(&member.id);
+                    Response::Member {
+                        task,
+                        member: Box::new(member),
+                        runs,
+                    }
+                }
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
                 },
             }
         }
@@ -683,7 +731,7 @@ struct SpawnSpec {
     args: Vec<String>,
     resume_session: Option<String>,
     prompt: Option<String>,
-    task: Option<String>,
+    member: Option<String>,
 }
 
 async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Response {
@@ -695,30 +743,46 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         args,
         resume_session,
         prompt,
-        task,
+        member,
     } = spec;
 
-    if let Some(task) = &task {
-        if state.ledger.task(task).is_none() {
-            return Response::Error {
-                message: format!("task '{}' not found", task),
+    // A member's agent runs in its worktree, under the member id.
+    let (id, dir) = match &member {
+        Some(member) => {
+            let Some((task, info)) = state.ledger.member(member) else {
+                return Response::Error {
+                    message: format!("member '{}' not found", member),
+                };
             };
+            if id.as_ref().is_some_and(|id| id != member) {
+                return Response::Error {
+                    message: format!("the agent of member '{}' runs under its id", member),
+                };
+            }
+            if !dir.as_os_str().is_empty() && dir != info.dir {
+                return Response::Error {
+                    message: format!(
+                        "member '{}' runs in {}, not {}",
+                        member,
+                        info.dir.display(),
+                        dir.display()
+                    ),
+                };
+            }
+            if state.dropping.contains(&task.name) {
+                return Response::Error {
+                    message: format!("task '{}' is being dropped", task.name),
+                };
+            }
+            if state.agents.contains_key(member) {
+                return Response::Error {
+                    message: format!("'{}' already has a running agent", task.member_label(&info)),
+                };
+            }
+            (Some(member.clone()), info.dir)
         }
-        if state.dropping.contains(task) {
-            return Response::Error {
-                message: format!("task '{}' is being dropped", task),
-            };
-        }
-        if let Some((other, _)) = state
-            .agents
-            .iter()
-            .find(|(_, a)| a.task() == Some(task.as_str()))
-        {
-            return Response::Error {
-                message: format!("task '{}' already has a running agent ('{}')", task, other),
-            };
-        }
-    }
+        None => (id, dir),
+    };
 
     let id = id.unwrap_or_else(|| {
         let id = format!("agent-{}", state.next_id);
@@ -749,17 +813,17 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
     ) {
         Ok(mut agent) => {
             info!(id = %id, provider = %provider, dir = %dir.display(), "spawned agent");
-            agent.set_task(task.clone());
-            let info = agent.info(&id);
+            agent.set_member(member.clone());
             state.agents.insert(id.clone(), agent);
+            let info = state.agent_info(&id).expect("agent just inserted");
             state.broadcast(Event::AgentSpawned {
                 id: id.clone(),
                 info,
             });
-            if let Some(task) = task {
-                match state.ledger.run_started(&task, &provider, resume_session) {
+            if let Some(member) = member {
+                match state.ledger.run_started(&member, &provider, resume_session) {
                     Ok(info) => state.broadcast(Event::TaskUpdated { task: info }),
-                    Err(e) => error!(task = %task, "failed to record run start: {e:#}"),
+                    Err(e) => error!(member = %member, "failed to record run start: {e:#}"),
                 }
             }
             Response::Spawned { id }
@@ -779,8 +843,8 @@ async fn handle_list(state: &Arc<Mutex<DaemonState>>) -> Response {
     // Use cached context values — background monitor refreshes every 10s
     let agents = state
         .agents
-        .iter()
-        .map(|(id, agent)| agent.info(id))
+        .keys()
+        .filter_map(|id| state.agent_info(id))
         .collect();
 
     Response::Agents { agents }
@@ -865,19 +929,21 @@ async fn handle_hook_event(
     };
     info!(id = %agent_id, event = %event, result = ?result, "hook event");
 
-    let info = agent.info(agent_id);
+    let changed = agent.info(agent_id).detail != before;
     let session = agent
-        .task()
+        .member()
         .zip(agent.session_id())
-        .map(|(task, session)| (task.to_string(), session.to_string()));
-    if info.detail != before {
-        state.broadcast(Event::AgentUpdated {
-            id: agent_id.to_string(),
-            info,
-        });
+        .map(|(member, session)| (member.to_string(), session.to_string()));
+    if changed {
+        if let Some(info) = state.agent_info(agent_id) {
+            state.broadcast(Event::AgentUpdated {
+                id: agent_id.to_string(),
+                info,
+            });
+        }
     }
-    if let Some((task, session_id)) = session {
-        state.record_hook_session(&task, &session_id);
+    if let Some((member, session_id)) = session {
+        state.record_hook_session(&member, &session_id);
     }
     Response::Ok
 }
@@ -908,13 +974,15 @@ async fn handle_shutdown(state: &Arc<Mutex<DaemonState>>) -> Response {
 async fn handle_create_task(
     state: &Arc<Mutex<DaemonState>>,
     name: &str,
-    dir: &std::path::Path,
-    owned: bool,
+    members: &[NewMember],
 ) -> Response {
     let mut state = state.lock().await;
-    match state.ledger.create_task(name, dir, owned) {
+    match state.ledger.create_task(name, members) {
         Ok(task) => {
-            info!(task = %name, dir = %dir.display(), "task created");
+            for m in &task.members {
+                info!(task = %name, member = %m.id, dir = %m.dir.display(), "task member added");
+            }
+            info!(task = %name, "task created");
             state.broadcast(Event::TaskCreated { task: task.clone() });
             Response::Task {
                 task,
@@ -927,14 +995,14 @@ async fn handle_create_task(
     }
 }
 
-/// Drop a task: check its worktree, stop its agent, remove the worktree (and
-/// branch), then forget the task. Git runs and the agent is waited for
-/// without holding the state lock; the task is claimed meanwhile so no agent
-/// starts in it.
+/// Drop a task: check its members' worktrees, stop their agents, remove the
+/// worktrees (and branches), then forget the task. Git runs and the agents
+/// are waited for without holding the state lock; the task is claimed
+/// meanwhile so no agent starts in it.
 ///
 /// Refuses (changing nothing) when the drop would lose work and `force` is
-/// unset. The task leaves the ledger only once its worktree is gone: if git
-/// cannot remove it, the agent is stopped but the task kept.
+/// unset. The task leaves the ledger only once its worktrees are gone: if git
+/// cannot remove one, the agents are stopped but the task kept.
 async fn handle_drop_task(
     state: &Arc<Mutex<DaemonState>>,
     name: &str,
@@ -948,11 +1016,7 @@ async fn handle_drop_task(
                 message: format!("task '{}' not found", name),
             };
         };
-        let dirs: Vec<PathBuf> = if task.owned {
-            vec![task.dir.clone()]
-        } else {
-            Vec::new()
-        };
+        let dirs: Vec<PathBuf> = task.members.iter().map(|m| m.dir.clone()).collect();
         if !state.dropping.insert(name.to_string()) {
             return Response::Error {
                 message: format!("task '{}' is already being dropped", name),

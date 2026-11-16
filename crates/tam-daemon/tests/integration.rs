@@ -70,7 +70,7 @@ async fn spawn_and_list() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -103,7 +103,7 @@ async fn spawn_duplicate_id() {
         args: vec!["3600".into()],
         resume_session: None,
         prompt: None,
-        task: None,
+        member: None,
     };
 
     let resp = send(&mut stream, &req).await;
@@ -131,7 +131,7 @@ async fn spawn_invalid_directory() {
             args: vec!["1".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -156,7 +156,7 @@ async fn kill_agent() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -205,7 +205,7 @@ async fn auto_generated_ids() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -223,7 +223,7 @@ async fn auto_generated_ids() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -266,7 +266,7 @@ async fn shutdown_kills_all() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -279,7 +279,7 @@ async fn shutdown_kills_all() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -304,7 +304,7 @@ async fn exited_process_is_cleaned_up() {
             args: vec![],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -336,7 +336,7 @@ async fn failed_process_is_cleaned_up() {
             args: vec![],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -388,7 +388,7 @@ async fn attach_receives_scrollback() {
             args: vec!["-c".into(), "echo hello".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -441,7 +441,7 @@ async fn attach_relays_input_and_output() {
             args: vec![],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -516,7 +516,7 @@ async fn generic_agent_transitions_to_idle() {
             args: vec!["-c".into(), "echo hello; sleep 3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -564,7 +564,7 @@ async fn events_pushed_on_agent_exit() {
             args: vec![],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -618,7 +618,7 @@ async fn hook_event_updates_agent_state() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -677,7 +677,7 @@ async fn spawn_emits_event() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -729,7 +729,7 @@ async fn kill_emits_event() {
             args: vec!["3600".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -814,7 +814,7 @@ async fn resize_updates_pty_and_signals_agent() {
             ],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         },
     )
     .await;
@@ -933,8 +933,7 @@ impl Conn {
         match self
             .request(&Request::CreateTask {
                 name: name.into(),
-                dir: dir.into(),
-                owned: true,
+                members: vec![new_member(name, dir)],
             })
             .await
         {
@@ -946,6 +945,11 @@ impl Conn {
         }
     }
 
+    /// Create a single-member task; returns its member id.
+    async fn create_member(&mut self, name: &str, dir: &std::path::Path) -> String {
+        self.create_task(name, dir).await.members[0].id.clone()
+    }
+
     async fn runs(&mut self, name: &str) -> Vec<tam_proto::RunInfo> {
         match self.request(&Request::GetTask { name: name.into() }).await {
             Response::Task { runs, .. } => runs,
@@ -953,17 +957,33 @@ impl Conn {
         }
     }
 
-    async fn spawn_for_task(&mut self, task: &str, provider: &str, args: &[&str]) -> Response {
+    async fn spawn_for_member(&mut self, member: &str, provider: &str, args: &[&str]) -> Response {
         self.request(&Request::Spawn {
             provider: provider.into(),
-            dir: PathBuf::from("/tmp"),
-            id: Some(task.into()),
+            dir: PathBuf::new(),
+            id: None,
             args: args.iter().map(|a| a.to_string()).collect(),
             resume_session: Some("sess-1".into()),
             prompt: None,
-            task: Some(task.into()),
+            member: Some(member.into()),
         })
         .await
+    }
+
+    async fn resolve(&mut self, target: Option<&str>, dir: Option<&std::path::Path>) -> Response {
+        self.request(&Request::ResolveMember {
+            target: target.map(str::to_string),
+            dir: dir.map(PathBuf::from),
+        })
+        .await
+    }
+}
+
+fn new_member(branch: &str, dir: &std::path::Path) -> tam_proto::NewMember {
+    tam_proto::NewMember {
+        repo_root: PathBuf::from("/src/app"),
+        branch: branch.into(),
+        dir: dir.into(),
     }
 }
 
@@ -976,18 +996,27 @@ async fn task_create_list_get_drop() {
     // A worktree already gone: dropping just forgets the task.
     let task = conn.create_task("feat", &dir.path().join("gone")).await;
     assert_eq!(task.name, "feat");
-    assert!(task.owned);
     assert_eq!(task.run_count, 0);
+    assert_eq!(task.members.len(), 1);
+    assert_eq!(task.members[0].name, "app");
+    assert_eq!(task.members[0].branch, "feat");
+    assert_eq!(task.members[0].dir, dir.path().join("gone"));
 
     // Same name, or same directory: refused.
     let resp = conn
         .request(&Request::CreateTask {
             name: "feat".into(),
-            dir: PathBuf::from("/elsewhere"),
-            owned: false,
+            members: vec![new_member("feat", std::path::Path::new("/elsewhere"))],
         })
         .await;
     assert!(matches!(resp, Response::Error { message } if message.contains("already exists")));
+    let resp = conn
+        .request(&Request::CreateTask {
+            name: "other".into(),
+            members: vec![new_member("other", &dir.path().join("gone"))],
+        })
+        .await;
+    assert!(matches!(resp, Response::Error { message } if message.contains("already has")));
 
     match conn.request(&Request::ListTasks).await {
         Response::Tasks { tasks } => assert_eq!(tasks, vec![task.clone()]),
@@ -1013,6 +1042,41 @@ async fn task_create_list_get_drop() {
 
     // Unsubscribed connections get no pushed events.
     assert!(conn.events.is_empty(), "{:?}", conn.events);
+}
+
+#[tokio::test]
+async fn resolve_member_by_name_id_and_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut conn = Conn::connect(&sock).await;
+    let work = dir.path().join("app--feat");
+    std::fs::create_dir_all(work.join("src")).unwrap();
+    let id = conn.create_member("feat", &work).await;
+
+    for target in ["feat", "feat/app", id.as_str()] {
+        match conn.resolve(Some(target), None).await {
+            Response::Member { task, member, runs } => {
+                assert_eq!(task.name, "feat");
+                assert_eq!(member.id, id);
+                assert!(runs.is_empty());
+            }
+            other => panic!("{target}: expected Member, got {other:?}"),
+        }
+    }
+    match conn.resolve(None, Some(&work.join("src"))).await {
+        Response::Member { member, .. } => assert_eq!(member.id, id),
+        other => panic!("expected Member, got {other:?}"),
+    }
+    let resp = conn.resolve(None, Some(dir.path())).await;
+    assert!(
+        matches!(&resp, Response::Error { message } if message.contains("no task member")),
+        "{resp:?}"
+    );
+    let resp = conn.resolve(Some("feat/web"), None).await;
+    assert!(
+        matches!(&resp, Response::Error { message } if message.contains("no member 'web'")),
+        "{resp:?}"
+    );
 }
 
 #[tokio::test]
@@ -1047,9 +1111,11 @@ async fn agent_exiting_on_its_own_records_run_end() {
     let sock = start_daemon(dir.path()).await;
     let mut watcher = Conn::subscribed(&sock).await;
     let mut cmd = Conn::connect(&sock).await;
-    cmd.create_task("feat", dir.path()).await;
+    let member = cmd.create_member("feat", dir.path()).await;
 
-    let resp = cmd.spawn_for_task("feat", "bash", &["-c", "exit 3"]).await;
+    let resp = cmd
+        .spawn_for_member(&member, "bash", &["-c", "exit 3"])
+        .await;
     assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
 
     // Run started: count goes up, the spawned agent carries its task.
@@ -1067,8 +1133,8 @@ async fn agent_exiting_on_its_own_records_run_end() {
         .await;
     assert!(
         matches!(
-            exited,
-            Some(tam_proto::Event::AgentExited { exit_code: 3, .. })
+            &exited,
+            Some(tam_proto::Event::AgentExited { id, exit_code: 3 }) if *id == member
         ),
         "{exited:?}"
     );
@@ -1079,6 +1145,7 @@ async fn agent_exiting_on_its_own_records_run_end() {
 
     let runs = cmd.runs("feat").await;
     assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].member, member);
     assert_eq!(runs[0].provider, "bash");
     assert_eq!(runs[0].session_id.as_deref(), Some("sess-1"));
     assert_eq!(runs[0].exit_code, Some(3));
@@ -1086,46 +1153,109 @@ async fn agent_exiting_on_its_own_records_run_end() {
 }
 
 #[tokio::test]
+async fn member_agent_runs_in_its_worktree_under_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut watcher = Conn::subscribed(&sock).await;
+    let mut cmd = Conn::connect(&sock).await;
+    let work = dir.path().join("app--feat");
+    std::fs::create_dir_all(&work).unwrap();
+    let member = cmd.create_member("feat", &work).await;
+
+    // The agent sees its member id, in the member's worktree.
+    let resp = cmd
+        .spawn_for_member(
+            &member,
+            "sh",
+            &["-c", "echo \"id=$TAM_AGENT_ID dir=$(pwd)\"; sleep 3600"],
+        )
+        .await;
+    assert!(
+        matches!(&resp, Response::Spawned { id } if *id == member),
+        "{resp:?}"
+    );
+    let spawned = watcher
+        .wait_event(3, |e| matches!(e, tam_proto::Event::AgentSpawned { .. }))
+        .await;
+    match spawned {
+        Some(tam_proto::Event::AgentSpawned { id, info }) => {
+            assert_eq!(id, member);
+            assert_eq!(info.dir, work);
+            assert_eq!(info.task.as_deref(), Some("feat"));
+        }
+        other => panic!("expected AgentSpawned, got {other:?}"),
+    }
+    let expected = format!("id={member} dir={}", work.display());
+    let mut scrollback = String::new();
+    for _ in 0..50 {
+        if let Response::Scrollback { data } = cmd
+            .request(&Request::Scrollback { id: member.clone() })
+            .await
+        {
+            scrollback = data;
+        }
+        if scrollback.contains(&expected) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(scrollback.contains(&expected), "{scrollback:?}");
+
+    // Another id or directory for a member's agent is refused.
+    for (id, dir) in [
+        (Some("other".to_string()), PathBuf::new()),
+        (None, PathBuf::from("/tmp")),
+    ] {
+        let resp = cmd
+            .request(&Request::Spawn {
+                provider: "sleep".into(),
+                dir,
+                id,
+                args: vec!["3600".into()],
+                resume_session: None,
+                prompt: None,
+                member: Some(member.clone()),
+            })
+            .await;
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+    }
+    cmd.request(&Request::Kill { id: member }).await;
+}
+
+#[tokio::test]
 async fn kill_and_drop_record_run_end() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
     let mut cmd = Conn::connect(&sock).await;
-    cmd.create_task("feat", &dir.path().join("gone")).await;
+    // The agent runs in the member's worktree: a real one, dropped clean.
+    let (_repo, wt) = git_worktree(dir.path(), "feat");
+    let member = cmd.create_member("feat", &wt).await;
 
-    let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
+    let resp = cmd.spawn_for_member(&member, "sleep", &["3600"]).await;
     assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
 
-    // One agent per task.
-    let resp = cmd
-        .request(&Request::Spawn {
-            provider: "sleep".into(),
-            dir: PathBuf::from("/tmp"),
-            id: Some("other-id".into()),
-            args: vec!["3600".into()],
-            resume_session: None,
-            prompt: None,
-            task: Some("feat".into()),
-        })
-        .await;
+    // One agent per member.
+    let resp = cmd.spawn_for_member(&member, "sleep", &["3600"]).await;
     assert!(
-        matches!(&resp, Response::Error { message } if message.contains("already has a running agent")),
+        matches!(&resp, Response::Error { message } if message.contains("'feat' already has a running agent")),
         "{resp:?}"
     );
 
     match cmd.request(&Request::List).await {
         Response::Agents { agents } => {
             assert_eq!(agents.len(), 1);
+            assert_eq!(agents[0].id, member);
             assert_eq!(agents[0].task.as_deref(), Some("feat"));
         }
         other => panic!("expected Agents, got {other:?}"),
     }
 
-    cmd.request(&Request::Kill { id: "feat".into() }).await;
+    cmd.request(&Request::Kill { id: member.clone() }).await;
     let runs = cmd.runs("feat").await;
     assert_eq!(runs[0].exit_code, Some(-1));
 
     // A second run, ended by dropping the task.
-    let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
+    let resp = cmd.spawn_for_member(&member, "sleep", &["3600"]).await;
     assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
     let resp = cmd.request(&drop_request("feat", false, false)).await;
     assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
@@ -1206,8 +1336,8 @@ async fn drop_refuses_to_lose_uncommitted_work() {
     let sock = start_daemon(dir.path()).await;
     let (repo, wt) = git_worktree(dir.path(), "feat");
     let mut cmd = Conn::connect(&sock).await;
-    cmd.create_task("feat", &wt).await;
-    let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
+    let member = cmd.create_member("feat", &wt).await;
+    let resp = cmd.spawn_for_member(&member, "sleep", &["3600"]).await;
     assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
     std::fs::write(wt.join("notes.txt"), "wip").unwrap();
 
@@ -1278,8 +1408,8 @@ async fn drop_keeps_task_when_worktree_cannot_be_removed() {
     let sock = start_daemon(dir.path()).await;
     let (repo, wt) = git_worktree(dir.path(), "feat");
     let mut cmd = Conn::connect(&sock).await;
-    cmd.create_task("feat", &wt).await;
-    let resp = cmd.spawn_for_task("feat", "sleep", &["3600"]).await;
+    let member = cmd.create_member("feat", &wt).await;
+    let resp = cmd.spawn_for_member(&member, "sleep", &["3600"]).await;
     assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
     // Clean, but git refuses to remove a locked worktree.
     git(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
@@ -1329,6 +1459,53 @@ async fn drop_removes_clean_worktree_with_submodule() {
 }
 
 #[tokio::test]
+async fn drop_covers_every_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (_, api) = git_worktree(&dir.path().join("api"), "feat");
+    let (_, web) = git_worktree(&dir.path().join("web"), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+    let task = match cmd
+        .request(&Request::CreateTask {
+            name: "feat".into(),
+            members: vec![new_member("feat", &api), new_member("feat", &web)],
+        })
+        .await
+    {
+        Response::Task { task, .. } => task,
+        other => panic!("expected Task, got {other:?}"),
+    };
+    for member in &task.members {
+        let resp = cmd.spawn_for_member(&member.id, "sleep", &["3600"]).await;
+        assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+    }
+    std::fs::write(web.join("wip.txt"), "wip").unwrap();
+
+    // Refused for the member that would lose work; nothing changed.
+    match cmd.request(&drop_request("feat", false, false)).await {
+        Response::DropRefused { worktrees } => {
+            assert_eq!(worktrees.len(), 1, "{worktrees:?}");
+            assert_eq!(worktrees[0].path, web);
+        }
+        other => panic!("expected DropRefused, got {other:?}"),
+    }
+    assert_eq!(agent_count(&mut cmd).await, 2);
+    assert!(api.exists() && web.exists());
+
+    // Forced: every member's agent stopped and worktree removed.
+    let resp = cmd.request(&drop_request("feat", true, false)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
+    assert_eq!(agent_count(&mut cmd).await, 0);
+    assert!(!api.exists() && !web.exists());
+    let resp = cmd
+        .request(&Request::GetTask {
+            name: "feat".into(),
+        })
+        .await;
+    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+}
+
+#[tokio::test]
 async fn drop_of_missing_or_foreign_directory() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
@@ -1366,19 +1543,34 @@ async fn drop_of_missing_or_foreign_directory() {
 }
 
 #[tokio::test]
-async fn spawn_for_unknown_task_fails() {
+async fn spawn_for_unknown_member_fails() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
     let mut cmd = Conn::connect(&sock).await;
-    let resp = cmd.spawn_for_task("nope", "sleep", &["3600"]).await;
-    assert!(
-        matches!(&resp, Response::Error { message } if message.contains("not found")),
-        "{resp:?}"
-    );
+    cmd.create_task("feat", dir.path()).await;
+    // A task name is not a member id.
+    for member in ["nope", "feat"] {
+        let resp = cmd.spawn_for_member(member, "sleep", &["3600"]).await;
+        assert!(
+            matches!(&resp, Response::Error { message } if message.contains("not found")),
+            "{resp:?}"
+        );
+    }
     match cmd.request(&Request::List).await {
         Response::Agents { agents } => assert!(agents.is_empty()),
         other => panic!("expected Agents, got {other:?}"),
     }
+}
+
+/// Wait for a daemon that was asked to shut down to release its ledger.
+async fn wait_ledger_released(ledger_path: &std::path::Path) {
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if tam_daemon::ledger::Ledger::open(ledger_path).is_ok() {
+            return;
+        }
+    }
+    panic!("old daemon kept the ledger locked");
 }
 
 #[tokio::test]
@@ -1386,21 +1578,10 @@ async fn tasks_survive_daemon_restart() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
     let mut cmd = Conn::connect(&sock).await;
-    cmd.create_task("feat", dir.path()).await;
+    let member = cmd.create_member("feat", dir.path()).await;
     cmd.request(&Request::Shutdown).await;
     drop(cmd);
-
-    // Wait for the old daemon to release the ledger.
-    let ledger_path = dir.path().join("ledger.jsonl");
-    let mut released = false;
-    for _ in 0..60 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if tam_daemon::ledger::Ledger::open(&ledger_path).is_ok() {
-            released = true;
-            break;
-        }
-    }
-    assert!(released, "old daemon kept the ledger locked");
+    wait_ledger_released(&dir.path().join("ledger.jsonl")).await;
 
     let sock = start_daemon(dir.path()).await;
     let mut cmd = Conn::connect(&sock).await;
@@ -1408,9 +1589,42 @@ async fn tasks_survive_daemon_restart() {
         Response::Tasks { tasks } => {
             assert_eq!(tasks.len(), 1);
             assert_eq!(tasks[0].name, "feat");
+            assert_eq!(tasks[0].members[0].id, member);
         }
         other => panic!("expected Tasks, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn daemon_migrates_a_legacy_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("ledger.jsonl"),
+        concat!(
+            r#"{"type":"task_created","name":"feat","dir":"/w/app--feat","owned":true,"timestamp":100}"#,
+            "\n",
+            r#"{"type":"agent_run_started","task":"feat","provider":"claude","session_id":"s1","timestamp":200}"#,
+            "\n",
+            r#"{"type":"task_created","name":"here","dir":"/src/app","owned":false,"timestamp":300}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut cmd = Conn::connect(&sock).await;
+    let task = match cmd.request(&Request::ListTasks).await {
+        Response::Tasks { tasks } => {
+            assert_eq!(tasks.len(), 1, "{tasks:?}");
+            tasks.into_iter().next().unwrap()
+        }
+        other => panic!("expected Tasks, got {other:?}"),
+    };
+    assert_eq!(task.name, "feat");
+    assert_eq!(task.members[0].repo, "app");
+    let runs = cmd.runs("feat").await;
+    assert_eq!(runs[0].member, task.members[0].id);
+    assert_eq!(runs[0].session_id.as_deref(), Some("s1"));
+    assert!(dir.path().join("ledger.jsonl.pre-members").exists());
 }
 
 #[tokio::test]
@@ -1446,7 +1660,7 @@ fn dropped_daemon_leaves_no_agent_behind() {
                 args: vec!["-c".into(), "sleep 3600 & wait".into()],
                 resume_session: None,
                 prompt: None,
-                task: None,
+                member: None,
             },
         )
         .await;

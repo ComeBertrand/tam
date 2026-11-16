@@ -17,28 +17,47 @@ and `tam-worktree` (dropping a task removes its worktree). `tam-cli` depends on 
 
 ## Key architecture patterns
 
+- **Task model** — a task is a name plus 1..N members; a member is one
+  worktree in one repo (repo, branch, dir) with at most one agent session.
+  Every task owns its worktrees (no borrowed tasks). Members have a stable id
+  (`m-xxxxxxxx`) independent of task and branch names: it is the member's
+  agent id in the daemon and `$TAM_AGENT_ID`. Short names (repo name, else
+  `<repo>-<branch>`, assigned in join order, never containing `/`) are derived
+  when the ledger is folded, not stored. Agents store only their member id;
+  `AgentInfo.task` is looked up when asked, so moving a member to another task
+  (a future merge) is one ledger event. Names typed by users (task, `task/member`,
+  member id, or the cwd) are resolved by the daemon: `Ledger::resolve` /
+  `member_at`, request `ResolveMember`.
 - **Task status is always derived** — computed from daemon state + git state +
   filesystem + activity timestamps, never stored. See `task.rs`
-  `GitBranchStatus` + `Task::status()`. Staleness is time-based (30 days
-  without activity), not git-merge-based.
+  `GitBranchStatus` + `Task::status()`: each member has its own status, the
+  task shows the most urgent. Staleness is time-based (30 days without
+  activity), not git-merge-based.
 - **Daemon owns the ledger** — append-only JSONL at
   `$XDG_DATA_HOME/tam/ledger.jsonl` (`tam-daemon/src/ledger.rs`). Records events
-  (TaskCreated, AgentRunStarted, etc.), never states. The daemon is the only
-  writer (flock on `ledger.jsonl.lock`), records agent runs itself (Spawn with
-  `task`), compacts on start and sets malformed lines aside in
-  `ledger.jsonl.rejected`. Clients use task requests (CreateTask, ListTasks,
-  GetTask, DropTask) and get TaskCreated/TaskUpdated/TaskDropped events after
+  (TaskCreated, MemberAdded, AgentRunStarted keyed by member id, etc.), never
+  states. The daemon is the only writer (flock on `ledger.jsonl.lock`), records
+  agent runs itself (Spawn with `member`: the daemon supplies the agent id and
+  dir), compacts on start and sets malformed lines aside in
+  `ledger.jsonl.rejected`. Ledgers from before members (tam <= 0.3.6:
+  `task_created` with `dir`/`owned`, runs keyed by task name) are migrated on
+  open, line by line (tried as `LegacyEvent` first: serde would otherwise
+  accept them as current events): owned tasks become single-member tasks,
+  borrowed ones are dropped, the old file is kept as `ledger.jsonl.pre-members`
+  (never overwritten: `.pre-members.1`, …).
+  Clients use task requests (CreateTask, ListTasks, GetTask, ResolveMember,
+  DropTask) and get TaskCreated/TaskUpdated/TaskDropped events after
   `Subscribe`; `tam-cli` never touches the ledger file.
 - **Drop is the daemon's** — `DropTask { force, delete_branch }` (`handle_drop_task`;
   git side in `tam-daemon/src/worktrees.rs`, per worktree, over
   `tam_worktree::worktree::{check, remove, delete_branch}`). Without `force` it
   replies `DropRefused` with what would be lost — uncommitted changes, and with
   `delete_branch` commits no other branch/tag/remote holds — or why a directory
-  can't be checked, and changes nothing. Otherwise: stop the agent and wait for
-  it, check again, remove the worktree (`--force`: checked already, and git
-  refuses clean worktrees with submodules otherwise), `git branch -D`, then the
-  ledger. The task leaves the ledger only once its worktree is gone; a
-  kept branch is a warning in `Dropped`. Git runs outside the state lock; the task
+  can't be checked, and changes nothing. Otherwise: stop the members' agents
+  and wait for them, check again, remove each member's worktree (`--force`:
+  checked already, and git refuses clean worktrees with submodules otherwise),
+  `git branch -D`, then the ledger. The task leaves the ledger only once its
+  worktrees are gone; a kept branch is a warning in `Dropped`. Git runs outside the state lock; the task
   sits in `dropping` meanwhile, so Spawn into it is refused.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
   daemon exits after 30s with no agents and no clients.
@@ -65,8 +84,10 @@ cargo test
 
 ## Testing
 
-- Unit tests are inline in each module (~230 across all crates)
-- Integration tests in `crates/tam-daemon/tests/` (~33 async tests, real sockets/PTYs/git repos)
+- Unit tests are inline in each module (~270 across all crates)
+- Integration tests in `crates/tam-daemon/tests/` (~38 async tests, real
+  sockets/PTYs/git repos) and `crates/tam-cli/tests/` (`tam hook-notify`
+  against a daemon)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

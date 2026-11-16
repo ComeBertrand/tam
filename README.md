@@ -32,9 +32,6 @@ Running multiple AI coding agents means juggling tmux panes, manual worktree cre
 ## Quick start
 
 ```bash
-# One-time: configure Claude Code hooks for state detection
-tam init --agent claude
-
 # Create a task — this creates branch "fix-auth" and worktree "myapp--fix-auth"
 tam new fix-auth -w
 
@@ -62,7 +59,9 @@ tam
 |---|---|
 | `● run` | Agent producing output |
 | `▲ input` | Agent waiting for user prompt |
-| `▲ block` | Agent waiting for permission |
+| `▲ block` | Agent waiting for permission (or plan approval) |
+| `? question` | Agent asked the user a question |
+| `✗ error` | Agent's last turn failed (API error, rate limit…) |
 | `○ idle` | No agent running, task exists |
 | `◌ stale` | No activity for 30 days |
 | `✗ gone` | Worktree or branch deleted externally |
@@ -133,12 +132,12 @@ Running `tam` with no arguments opens the dashboard:
 
 Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs an agent, `s` stops, `d` drops, `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
 
-Tasks are sorted by repository name, then by status priority (blocked → input → running → idle → stale → gone), then by task name.
+Tasks are sorted by repository name, then by status priority (blocked/question → error → input → running → idle → stale → gone), then by task name.
 
 ### Setup
 
 ```
-tam init --agent claude        Configure Claude Code hooks
+tam init --agent claude        Remove the Claude hooks older versions installed globally
 tam shutdown                   Stop all agents and kill the daemon
 tam status                     Check if the daemon is running
 ```
@@ -163,8 +162,8 @@ ignore = [".*", "node_modules", "target"]
 scrollback = 1048576
 
 [notify]
-command = "notify-send 'tam: {task}' '{status}'"
-on_states = ["input", "blocked"]
+command = "notify-send 'tam: {task}' '{kind}: {message}'"
+on_states = ["input", "blocked", "question", "error"]   # default
 
 [session]
 finder = "fzf"
@@ -174,6 +173,17 @@ name = "open in editor"
 key = "o"
 command = "code {dir}"
 ```
+
+The notify command runs with `sh -c` on state changes, except while you are attached to the agent. Placeholders are escaped for the quoting they sit in:
+
+| Placeholder | Value |
+|---|---|
+| `{task}`, `{id}` | Task name, agent id |
+| `{state}` (alias `{status}`), `{old_state}` | New and previous agent state |
+| `{kind}` | `question`, `permission`, `done` or `error` |
+| `{message}` | The question or permission asked, the agent's last response, or the error |
+| `{tool}` | Tool waiting for permission (e.g. `Bash`) |
+| `{error}` | Error kind (e.g. `rate_limit`) |
 
 Per-repo worktree initialization is configured via `.tam.toml` at the project root. When `tam new NAME -w` creates a worktree, it copies files matching `include` globs from the main checkout (useful for untracked secrets or editor config) and runs `commands` inside the new worktree:
 
@@ -187,11 +197,11 @@ commands = ["npm install"]
 
 | Provider | State detection | Context tracking | Setup |
 |---|---|---|---|
-| **Claude Code** | Hook-based (immediate) | Reads session JSONL for token usage | `tam init --agent claude` |
+| **Claude Code** | Hook-based (immediate) | Reads the session transcript for token usage | None |
 | **Codex** | PTY heuristic (5s idle) | Reads session JSONL | None |
 | **Any CLI** | PTY heuristic (5s idle) | None | None |
 
-Claude Code uses hooks (`~/.claude/settings.json`) to report state changes instantly — TAM knows the moment an agent needs input or hits a permission prompt. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
+Claude Code reports state changes through hooks that TAM injects into each agent it spawns (`claude --settings`, nothing is written to your Claude settings): TAM knows the moment an agent finishes, asks a question, needs a permission or fails on an API error. Claude runs no hooks until a folder is trusted, so a new worktree shows `input` while Claude's trust prompt waits. An interrupted turn fires no hook; TAM takes a working agent silent for 10s as back at the prompt. If you ran `tam init --agent claude` with an older version, run it again to remove the global hooks it installed. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
 
 ## Install
 

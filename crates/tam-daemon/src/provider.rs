@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use tam_proto::AgentState;
+use serde_json::Value;
+use tam_proto::{AgentDetail, AgentError, AgentState, DeniedTool, Pending};
 
 /// Context window usage for an agent.
 pub struct ContextUsage {
@@ -18,6 +19,24 @@ impl ContextUsage {
         let pct = (self.used_tokens as f64 / self.limit_tokens as f64 * 100.0).round() as u64;
         pct.min(100) as u8
     }
+}
+
+/// What the daemon keeps per agent from its hook events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookData {
+    /// Reported to clients as `AgentInfo::detail`.
+    pub detail: AgentDetail,
+    /// The agent's session transcript (used for context usage).
+    pub transcript_path: Option<PathBuf>,
+}
+
+/// Outcome of a hook event for a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookResult {
+    /// The provider doesn't know this event.
+    Unknown,
+    /// The event was handled; `state` is the new agent state, if it changes.
+    Handled { state: Option<AgentState> },
 }
 
 /// Adapter for a specific agent tool (claude, codex, etc.).
@@ -46,13 +65,35 @@ pub trait Provider: Send + Sync {
         idle_duration: Duration,
     ) -> Option<AgentState>;
 
-    /// Map a hook event name to an agent state.
-    /// Returns `None` if this provider doesn't handle hooks or doesn't recognize the event.
-    fn map_hook_event(&self, event: &str) -> Option<AgentState>;
+    /// Apply a hook event (name + JSON input) to the agent's hook data and
+    /// say which state it leads to. `current` is the agent's state before
+    /// the event. Providers without hooks return `HookResult::Unknown`.
+    fn handle_hook(
+        &self,
+        _event: &str,
+        _payload: Option<&Value>,
+        _current: AgentState,
+        _data: &mut HookData,
+    ) -> HookResult {
+        HookResult::Unknown
+    }
 
-    /// Read context window usage for an agent. Returns `None` if not supported
-    /// or if the data isn't available.
-    fn context_usage(&self, _pid: u32, _dir: &Path) -> Option<ContextUsage> {
+    /// For hook-based providers: how long a `working` agent's PTY may stay
+    /// silent before it is taken as back at the prompt. Covers turns that
+    /// end without a hook (user interrupt).
+    fn silent_working_timeout(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Read context window usage for an agent. `transcript` is the session
+    /// transcript reported by the agent's hooks, when known. Returns `None`
+    /// if not supported or if the data isn't available.
+    fn context_usage(
+        &self,
+        _pid: u32,
+        _dir: &Path,
+        _transcript: Option<&Path>,
+    ) -> Option<ContextUsage> {
         None
     }
 
@@ -65,9 +106,77 @@ pub trait Provider: Send + Sync {
 
 /// Claude Code provider.
 ///
-/// State detection will use hooks (configured at spawn time). Output-based
-/// detection returns None — state is pushed via hook callbacks.
-pub struct ClaudeProvider;
+/// State detection uses hooks, injected at spawn time with `--settings`.
+/// Each hook runs `hook_command` (`tam hook-notify`), which forwards the
+/// hook's JSON input to the daemon. Output-based detection returns None.
+pub struct ClaudeProvider {
+    /// Shell command the injected hooks run. `None` disables injection.
+    hook_command: Option<String>,
+}
+
+/// How long a working Claude agent's PTY may stay silent before the turn is
+/// taken as over. While a turn runs, Claude redraws its spinner continuously,
+/// even during long silent tools; at the prompt it draws nothing.
+const CLAUDE_SILENT_WORKING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest text kept from a hook payload (last message, error message).
+const MAX_MESSAGE_LEN: usize = 2000;
+/// Longest one-line summary of a tool call or question.
+const MAX_SUMMARY_LEN: usize = 200;
+
+impl ClaudeProvider {
+    /// A provider whose hooks run `hook_command`.
+    pub fn new(hook_command: Option<String>) -> Self {
+        Self { hook_command }
+    }
+
+    /// A provider whose hooks call back into this executable
+    /// (`<current exe> hook-notify`), so they reach the daemon that spawned
+    /// the agent whatever `tam` is on the PATH.
+    pub fn with_current_exe() -> Self {
+        let command = std::env::current_exe()
+            .ok()
+            .map(|exe| format!("{} hook-notify", shell_quote(&exe.to_string_lossy())));
+        Self::new(command)
+    }
+}
+
+/// Hook events tam registers for Claude, with their matcher.
+const CLAUDE_HOOKS: &[(&str, Option<&str>)] = &[
+    ("SessionStart", None),
+    ("SessionEnd", None),
+    ("UserPromptSubmit", None),
+    ("PreToolUse", Some("AskUserQuestion")),
+    ("PostToolUse", None),
+    ("PostToolUseFailure", None),
+    ("PermissionRequest", None),
+    ("PermissionDenied", None),
+    ("Notification", Some("idle_prompt|elicitation_dialog")),
+    ("Stop", None),
+    ("StopFailure", None),
+];
+
+/// The `--settings` JSON that registers tam's hooks, all running `command`.
+pub fn claude_hook_settings(command: &str) -> String {
+    let mut hooks = serde_json::Map::new();
+    for &(event, matcher) in CLAUDE_HOOKS {
+        let mut entry = serde_json::Map::new();
+        if let Some(m) = matcher {
+            entry.insert("matcher".into(), m.into());
+        }
+        entry.insert(
+            "hooks".into(),
+            serde_json::json!([{ "type": "command", "command": command, "timeout": 5 }]),
+        );
+        hooks.insert(event.into(), Value::Array(vec![Value::Object(entry)]));
+    }
+    serde_json::json!({ "hooks": hooks }).to_string()
+}
+
+/// Quote a string for `sh -c`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
 impl Provider for ClaudeProvider {
     fn name(&self) -> &str {
@@ -83,6 +192,10 @@ impl Provider for ClaudeProvider {
     ) -> Command {
         let mut cmd = Command::new("claude");
         cmd.current_dir(dir);
+        if let Some(hook_command) = &self.hook_command {
+            cmd.arg("--settings")
+                .arg(claude_hook_settings(hook_command));
+        }
         if let Some(id) = resume_session {
             cmd.arg("--resume").arg(id);
         }
@@ -102,24 +215,208 @@ impl Provider for ClaudeProvider {
         None
     }
 
-    fn map_hook_event(&self, event: &str) -> Option<AgentState> {
-        match event {
-            // User submitted a prompt, Claude is about to work
-            "user_prompt_submit" => Some(AgentState::Working),
-            // Claude finished responding, waiting for new prompt
-            "stop" | "notification:idle_prompt" => Some(AgentState::Input),
-            // Claude needs user action (permission approval)
-            "notification:permission_prompt" => Some(AgentState::Blocked),
-            _ => None,
-        }
+    fn handle_hook(
+        &self,
+        event: &str,
+        payload: Option<&Value>,
+        current: AgentState,
+        data: &mut HookData,
+    ) -> HookResult {
+        claude_handle_hook(event, payload.unwrap_or(&Value::Null), current, data)
     }
 
-    fn context_usage(&self, pid: u32, dir: &Path) -> Option<ContextUsage> {
-        claude_context_usage(pid, dir)
+    fn silent_working_timeout(&self) -> Option<Duration> {
+        Some(CLAUDE_SILENT_WORKING_TIMEOUT)
+    }
+
+    fn context_usage(
+        &self,
+        pid: u32,
+        dir: &Path,
+        transcript: Option<&Path>,
+    ) -> Option<ContextUsage> {
+        claude_context_usage(pid, dir, transcript)
     }
 
     fn session_id(&self, pid: u32) -> Option<String> {
         claude_session_id(pid)
+    }
+}
+
+// --- Claude hook handling ---
+
+const ASK_USER_QUESTION: &str = "AskUserQuestion";
+
+fn claude_handle_hook(
+    event: &str,
+    p: &Value,
+    current: AgentState,
+    data: &mut HookData,
+) -> HookResult {
+    // Every event carries the session; it changes on /clear, /resume…
+    if let Some(id) = str_field(p, "session_id") {
+        data.detail.session_id = Some(id.to_string());
+    }
+    if let Some(path) = str_field(p, "transcript_path") {
+        data.transcript_path = Some(PathBuf::from(path));
+    }
+    let detail = &mut data.detail;
+    let tool = str_field(p, "tool_name");
+
+    let state = match event {
+        "SessionStart" | "SessionEnd" => None,
+        "UserPromptSubmit" => {
+            detail.pending = None;
+            detail.error = None;
+            detail.denied = None;
+            // Belongs to the previous turn (an interrupted turn has none)
+            detail.last_message = None;
+            Some(AgentState::Working)
+        }
+        // Registered for AskUserQuestion only: the question shows before
+        // its PermissionRequest.
+        "PreToolUse" if tool == Some(ASK_USER_QUESTION) => {
+            detail.pending = Some(tool_pending(p));
+            Some(AgentState::Question)
+        }
+        "PreToolUse" => None,
+        // Also the way AskUserQuestion and plan approval (ExitPlanMode) wait.
+        "PermissionRequest" => {
+            detail.pending = Some(tool_pending(p));
+            if tool == Some(ASK_USER_QUESTION) {
+                Some(AgentState::Question)
+            } else {
+                Some(AgentState::Blocked)
+            }
+        }
+        "PostToolUse" | "PostToolUseFailure" => {
+            detail.pending = None;
+            Some(AgentState::Working)
+        }
+        "PermissionDenied" => {
+            detail.denied = Some(DeniedTool {
+                tool: tool.unwrap_or("?").to_string(),
+                summary: p.get("tool_input").map(|i| tool_summary(tool, i)),
+                reason: str_field(p, "reason").map(|r| truncate(r, MAX_SUMMARY_LEN)),
+            });
+            None
+        }
+        "Notification" => match str_field(p, "notification_type") {
+            // Backstop for a turn that ended without Stop; leaves question,
+            // blocked and error alone.
+            Some("idle_prompt") if current == AgentState::Working => {
+                detail.pending = None;
+                Some(AgentState::Input)
+            }
+            Some("elicitation_dialog") => {
+                detail.pending = Some(Pending {
+                    tool: None,
+                    summary: one_line(str_field(p, "message").unwrap_or("input requested")),
+                });
+                Some(AgentState::Question)
+            }
+            _ => None,
+        },
+        "Stop" => {
+            detail.pending = None;
+            detail.error = None;
+            detail.last_message =
+                str_field(p, "last_assistant_message").map(|m| truncate(m, MAX_MESSAGE_LEN));
+            Some(AgentState::Input)
+        }
+        "StopFailure" => {
+            detail.pending = None;
+            detail.error = Some(AgentError {
+                kind: str_field(p, "error").unwrap_or("unknown").to_string(),
+                message: str_field(p, "error_details")
+                    .or_else(|| str_field(p, "last_assistant_message"))
+                    .map(|m| truncate(m, MAX_MESSAGE_LEN)),
+            });
+            Some(AgentState::Error)
+        }
+        _ => return HookResult::Unknown,
+    };
+    HookResult::Handled { state }
+}
+
+fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key)?.as_str().filter(|s| !s.is_empty())
+}
+
+/// The pending action of a tool call waiting on the user.
+fn tool_pending(p: &Value) -> Pending {
+    let tool = str_field(p, "tool_name");
+    Pending {
+        tool: tool.map(str::to_string),
+        summary: p
+            .get("tool_input")
+            .map(|i| tool_summary(tool, i))
+            .unwrap_or_default(),
+    }
+}
+
+/// One-line summary of a tool call: the command, path, question… it is about.
+fn tool_summary(tool: Option<&str>, input: &Value) -> String {
+    let text = match tool {
+        Some(ASK_USER_QUESTION) => {
+            let questions = input.get("questions").and_then(Value::as_array);
+            let first = questions
+                .and_then(|q| q.first())
+                .and_then(|q| str_field(q, "question"));
+            match (first, questions.map(Vec::len).unwrap_or(0)) {
+                (Some(q), n) if n > 1 => format!("{q} (+{} more)", n - 1),
+                (Some(q), _) => q.to_string(),
+                (None, _) => "question".to_string(),
+            }
+        }
+        Some("ExitPlanMode") => {
+            let title = str_field(input, "plan").and_then(|plan| {
+                plan.lines()
+                    .map(|l| l.trim_matches(['#', ' ']))
+                    .find(|l| !l.is_empty())
+            });
+            match title {
+                Some(t) => format!("approve plan: {t}"),
+                None => "approve plan".to_string(),
+            }
+        }
+        _ => [
+            "command",
+            "file_path",
+            "notebook_path",
+            "url",
+            "pattern",
+            "query",
+        ]
+        .iter()
+        .find_map(|k| str_field(input, k))
+        .map(str::to_string)
+        .unwrap_or_else(|| input.to_string()),
+    };
+    one_line(&text)
+}
+
+/// First line of `s`, trimmed and capped to a summary length.
+fn one_line(s: &str) -> String {
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let more = s.trim().lines().nth(1).is_some();
+    let mut out = truncate(line, MAX_SUMMARY_LEN);
+    if more && !out.ends_with('…') {
+        out.push_str(" …");
+    }
+    out
+}
+
+/// Cap `s` to `max` characters, marking the cut with an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.trim();
+    match s.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
     }
 }
 
@@ -168,20 +465,14 @@ fn claude_session_id(pid: u32) -> Option<String> {
     Some(session.session_id)
 }
 
-fn claude_context_usage(pid: u32, dir: &Path) -> Option<ContextUsage> {
-    let home = std::env::var("HOME").ok()?;
-    let claude_dir = PathBuf::from(&home).join(".claude");
-
-    // Encode directory path the way Claude does: /home/user/foo → -home-user-foo
-    let encoded_dir = encode_claude_path(dir);
-    let project_dir = claude_dir.join("projects").join(&encoded_dir);
-
-    // Try to find the JSONL via the PID session file first, then fall back
-    // to the most recently modified JSONL in the project directory.
-    // Claude's sessionId in the PID file doesn't always match the JSONL filename
-    // (e.g. when resuming a session, the JSONL keeps its original name).
-    let jsonl_path = claude_session_jsonl_from_pid(pid, &claude_dir, &project_dir)
-        .or_else(|| claude_most_recent_jsonl(&project_dir))?;
+fn claude_context_usage(pid: u32, dir: &Path, transcript: Option<&Path>) -> Option<ContextUsage> {
+    // The transcript reported by the hooks is authoritative; without it
+    // (no hook seen yet), guess from the PID session file, then from the
+    // most recently modified JSONL in the project directory.
+    let jsonl_path = match transcript {
+        Some(path) => path.to_path_buf(),
+        None => claude_guess_transcript(pid, dir)?,
+    };
 
     // Read JSONL, find last assistant message with usage
     let content = std::fs::read_to_string(&jsonl_path).ok()?;
@@ -201,6 +492,20 @@ fn claude_context_usage(pid: u32, dir: &Path) -> Option<ContextUsage> {
         used_tokens: used,
         limit_tokens: limit,
     })
+}
+
+fn claude_guess_transcript(pid: u32, dir: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let claude_dir = PathBuf::from(&home).join(".claude");
+
+    // Encode directory path the way Claude does: /home/user/foo → -home-user-foo
+    let encoded_dir = encode_claude_path(dir);
+    let project_dir = claude_dir.join("projects").join(&encoded_dir);
+
+    // Claude's sessionId in the PID file doesn't always match the JSONL filename
+    // (e.g. when resuming a session, the JSONL keeps its original name).
+    claude_session_jsonl_from_pid(pid, &claude_dir, &project_dir)
+        .or_else(|| claude_most_recent_jsonl(&project_dir))
 }
 
 /// Try to resolve the JSONL path from the PID session file.
@@ -299,11 +604,12 @@ impl Provider for CodexProvider {
         }
     }
 
-    fn map_hook_event(&self, _event: &str) -> Option<AgentState> {
-        None
-    }
-
-    fn context_usage(&self, _pid: u32, dir: &Path) -> Option<ContextUsage> {
+    fn context_usage(
+        &self,
+        _pid: u32,
+        dir: &Path,
+        _transcript: Option<&Path>,
+    ) -> Option<ContextUsage> {
         codex_context_usage(dir)
     }
 }
@@ -477,17 +783,12 @@ impl Provider for GenericProvider {
             Some(AgentState::Working)
         }
     }
-
-    fn map_hook_event(&self, _event: &str) -> Option<AgentState> {
-        // Generic provider doesn't use hooks
-        None
-    }
 }
 
 /// Resolve a provider name to a concrete provider.
 pub fn resolve(name: &str) -> Box<dyn Provider> {
     match name {
-        "claude" => Box::new(ClaudeProvider),
+        "claude" => Box::new(ClaudeProvider::with_current_exe()),
         "codex" => Box::new(CodexProvider),
         other => Box::new(GenericProvider::new(other)),
     }
@@ -500,7 +801,7 @@ mod tests {
 
     #[test]
     fn claude_provider_basics() {
-        let p = ClaudeProvider;
+        let p = ClaudeProvider::new(None);
         assert_eq!(p.name(), "claude");
 
         let cmd = p.build_command(&PathBuf::from("/tmp"), &["--verbose".into()], None, None);
@@ -512,7 +813,7 @@ mod tests {
 
     #[test]
     fn claude_resume_session() {
-        let p = ClaudeProvider;
+        let p = ClaudeProvider::new(None);
         let cmd = p.build_command(&PathBuf::from("/tmp"), &[], Some("abc-123"), None);
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args, &["--resume", "abc-123"]);
@@ -520,7 +821,7 @@ mod tests {
 
     #[test]
     fn claude_prompt_arg() {
-        let p = ClaudeProvider;
+        let p = ClaudeProvider::new(None);
         let cmd = p.build_command(&PathBuf::from("/tmp"), &[], None, Some("fix the bug"));
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args, &["fix the bug"]);
@@ -528,7 +829,7 @@ mod tests {
 
     #[test]
     fn claude_resume_session_and_prompt() {
-        let p = ClaudeProvider;
+        let p = ClaudeProvider::new(None);
         let cmd = p.build_command(
             &PathBuf::from("/tmp"),
             &[],
@@ -541,7 +842,7 @@ mod tests {
 
     #[test]
     fn claude_returns_none_for_output_detection() {
-        let p = ClaudeProvider;
+        let p = ClaudeProvider::new(None);
         assert_eq!(
             p.detect_state_from_output(b"anything", Duration::from_secs(0)),
             None
@@ -583,50 +884,315 @@ mod tests {
         assert_eq!(p.name(), "my-agent");
     }
 
+    /// Feed a hook event to the Claude provider.
+    fn hook(event: &str, payload: Value, current: AgentState, data: &mut HookData) -> HookResult {
+        ClaudeProvider::new(None).handle_hook(event, Some(&payload), current, data)
+    }
+
+    fn handled(state: AgentState) -> HookResult {
+        HookResult::Handled { state: Some(state) }
+    }
+
+    const NO_CHANGE: HookResult = HookResult::Handled { state: None };
+
     #[test]
-    fn claude_hook_stop_maps_to_input() {
-        let p = ClaudeProvider;
-        assert_eq!(p.map_hook_event("stop"), Some(AgentState::Input));
+    fn claude_session_start_records_session_and_transcript() {
+        let mut d = HookData::default();
+        let r = hook(
+            "SessionStart",
+            serde_json::json!({"session_id": "s1", "transcript_path": "/t/s1.jsonl", "source": "startup"}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(r, NO_CHANGE);
+        assert_eq!(d.detail.session_id.as_deref(), Some("s1"));
+        assert_eq!(d.transcript_path, Some(PathBuf::from("/t/s1.jsonl")));
+
+        // /clear starts a new session
+        hook(
+            "SessionStart",
+            serde_json::json!({"session_id": "s2", "transcript_path": "/t/s2.jsonl"}),
+            AgentState::Input,
+            &mut d,
+        );
+        assert_eq!(d.detail.session_id.as_deref(), Some("s2"));
+        assert_eq!(d.transcript_path, Some(PathBuf::from("/t/s2.jsonl")));
+    }
+
+    #[test]
+    fn claude_permission_request_blocks_with_tool_summary() {
+        let mut d = HookData::default();
+        let r = hook(
+            "PermissionRequest",
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "touch hello.txt", "description": "x"}}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(r, handled(AgentState::Blocked));
+        let pending = d.detail.pending.clone().unwrap();
+        assert_eq!(pending.tool.as_deref(), Some("Bash"));
+        assert_eq!(pending.summary, "touch hello.txt");
+
+        // The tool ran (permission granted): back to working, nothing pending
+        let r = hook(
+            "PostToolUse",
+            serde_json::json!({"tool_name": "Bash"}),
+            AgentState::Blocked,
+            &mut d,
+        );
+        assert_eq!(r, handled(AgentState::Working));
+        assert!(d.detail.pending.is_none());
+    }
+
+    #[test]
+    fn claude_ask_user_question_is_a_question() {
+        let input = serde_json::json!({
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [
+                {"question": "Tea or coffee?", "options": []},
+                {"question": "Sugar?", "options": []}
+            ]}
+        });
+        let mut d = HookData::default();
         assert_eq!(
-            p.map_hook_event("notification:idle_prompt"),
-            Some(AgentState::Input)
+            hook("PreToolUse", input.clone(), AgentState::Working, &mut d),
+            handled(AgentState::Question)
+        );
+        // AskUserQuestion then goes through PermissionRequest: stays a question
+        assert_eq!(
+            hook("PermissionRequest", input, AgentState::Question, &mut d),
+            handled(AgentState::Question)
+        );
+        assert_eq!(
+            d.detail.pending.unwrap().summary,
+            "Tea or coffee? (+1 more)"
         );
     }
 
     #[test]
-    fn claude_hook_permission_maps_to_blocked() {
-        let p = ClaudeProvider;
+    fn claude_pre_tool_use_of_other_tools_changes_nothing() {
+        let mut d = HookData::default();
+        let r = hook(
+            "PreToolUse",
+            serde_json::json!({"tool_name": "Bash", "tool_input": {}}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(r, NO_CHANGE);
+    }
+
+    #[test]
+    fn claude_plan_approval_is_blocked() {
+        let mut d = HookData::default();
+        let r = hook(
+            "PermissionRequest",
+            serde_json::json!({"tool_name": "ExitPlanMode", "tool_input": {"plan": "## Context\nCreate foo.txt"}}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(r, handled(AgentState::Blocked));
+        assert_eq!(d.detail.pending.unwrap().summary, "approve plan: Context");
+    }
+
+    #[test]
+    fn claude_stop_keeps_last_message() {
+        let mut d = HookData::default();
+        d.detail.pending = Some(Pending {
+            tool: None,
+            summary: "x".into(),
+        });
+        let r = hook(
+            "Stop",
+            serde_json::json!({"last_assistant_message": "All done."}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(r, handled(AgentState::Input));
+        assert_eq!(d.detail.last_message.as_deref(), Some("All done."));
+        assert!(d.detail.pending.is_none());
+    }
+
+    #[test]
+    fn claude_stop_failure_is_an_error_with_cause() {
+        let mut d = HookData::default();
+        let r = hook(
+            "StopFailure",
+            serde_json::json!({"error": "model_not_found", "last_assistant_message": "There's an issue with the selected model"}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(r, handled(AgentState::Error));
+        let err = d.detail.error.clone().unwrap();
+        assert_eq!(err.kind, "model_not_found");
         assert_eq!(
-            p.map_hook_event("notification:permission_prompt"),
-            Some(AgentState::Blocked)
+            err.message.as_deref(),
+            Some("There's an issue with the selected model")
+        );
+
+        // A new prompt clears the error and the previous turn's message
+        d.detail.last_message = Some("old".into());
+        let r = hook(
+            "UserPromptSubmit",
+            serde_json::json!({"prompt": "retry"}),
+            AgentState::Error,
+            &mut d,
+        );
+        assert_eq!(r, handled(AgentState::Working));
+        assert!(d.detail.error.is_none());
+        assert!(d.detail.last_message.is_none());
+    }
+
+    #[test]
+    fn claude_permission_denied_is_recorded_without_state_change() {
+        let mut d = HookData::default();
+        let r = hook(
+            "PermissionDenied",
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}, "reason": "destructive"}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(r, NO_CHANGE);
+        let denied = d.detail.denied.unwrap();
+        assert_eq!(denied.tool, "Bash");
+        assert_eq!(denied.summary.as_deref(), Some("rm -rf /"));
+        assert_eq!(denied.reason.as_deref(), Some("destructive"));
+    }
+
+    #[test]
+    fn claude_notifications() {
+        let mut d = HookData::default();
+        let idle = serde_json::json!({"notification_type": "idle_prompt"});
+        assert_eq!(
+            hook("Notification", idle.clone(), AgentState::Working, &mut d),
+            handled(AgentState::Input)
+        );
+        // idle_prompt leaves an error (or a question) alone
+        assert_eq!(
+            hook("Notification", idle, AgentState::Error, &mut d),
+            NO_CHANGE
+        );
+        // permission_prompt duplicates PermissionRequest (and also fires for
+        // questions): no state change
+        let perm = serde_json::json!({"notification_type": "permission_prompt"});
+        assert_eq!(
+            hook("Notification", perm, AgentState::Question, &mut d),
+            NO_CHANGE
+        );
+        let elicit = serde_json::json!({"notification_type": "elicitation_dialog", "message": "Pick a repo"});
+        assert_eq!(
+            hook("Notification", elicit, AgentState::Working, &mut d),
+            handled(AgentState::Question)
+        );
+        assert_eq!(d.detail.pending.unwrap().summary, "Pick a repo");
+    }
+
+    #[test]
+    fn claude_unknown_event() {
+        let mut d = HookData::default();
+        assert_eq!(
+            hook("Bogus", Value::Null, AgentState::Working, &mut d),
+            HookResult::Unknown
+        );
+        // Legacy event names are not hook event names
+        assert_eq!(
+            hook("stop", Value::Null, AgentState::Working, &mut d),
+            HookResult::Unknown
         );
     }
 
     #[test]
-    fn claude_hook_user_prompt_maps_to_working() {
-        let p = ClaudeProvider;
+    fn claude_hook_without_payload() {
+        let p = ClaudeProvider::new(None);
+        let mut d = HookData::default();
         assert_eq!(
-            p.map_hook_event("user_prompt_submit"),
-            Some(AgentState::Working)
+            p.handle_hook("Stop", None, AgentState::Working, &mut d),
+            handled(AgentState::Input)
+        );
+        assert!(d.detail.last_message.is_none());
+    }
+
+    #[test]
+    fn summaries_are_one_line_and_capped() {
+        assert_eq!(one_line("  first\nsecond"), "first …");
+        let long = "x".repeat(500);
+        let s = one_line(&long);
+        assert_eq!(s.chars().count(), MAX_SUMMARY_LEN + 1);
+        assert!(s.ends_with('…'));
+        assert_eq!(
+            tool_summary(
+                Some("Edit"),
+                &serde_json::json!({"file_path": "/a/b.rs", "old_string": "x"})
+            ),
+            "/a/b.rs"
+        );
+        assert_eq!(
+            tool_summary(Some("Mcp"), &serde_json::json!({"a": 1})),
+            r#"{"a":1}"#
         );
     }
 
     #[test]
-    fn claude_hook_unknown_returns_none() {
-        let p = ClaudeProvider;
-        assert_eq!(p.map_hook_event("something_else"), None);
+    fn claude_injects_hook_settings() {
+        let p = ClaudeProvider::new(Some("'/bin/tam' hook-notify".into()));
+        let cmd = p.build_command(&PathBuf::from("/tmp"), &[], Some("abc"), None);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "--settings");
+        assert_eq!(&args[2..], &["--resume", "abc"]);
+        let settings: Value = serde_json::from_str(&args[1]).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        for (event, _) in CLAUDE_HOOKS {
+            let entry = &hooks[*event][0];
+            assert_eq!(
+                entry["hooks"][0]["command"], "'/bin/tam' hook-notify",
+                "{event}"
+            );
+        }
+        assert_eq!(hooks["PreToolUse"][0]["matcher"], "AskUserQuestion");
+        assert!(hooks["Stop"][0].get("matcher").is_none());
     }
 
     #[test]
-    fn generic_hook_always_none() {
+    fn claude_hook_command_quotes_exe() {
+        assert_eq!(shell_quote("/a b/it's"), r#"'/a b/it'\''s'"#);
+        let p = ClaudeProvider::with_current_exe();
+        assert!(p.hook_command.unwrap().ends_with("' hook-notify"));
+    }
+
+    #[test]
+    fn only_claude_has_silent_working_timeout() {
+        assert!(ClaudeProvider::new(None).silent_working_timeout().is_some());
+        assert!(GenericProvider::new("x").silent_working_timeout().is_none());
+        assert!(CodexProvider.silent_working_timeout().is_none());
+    }
+
+    #[test]
+    fn claude_context_from_transcript_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("s.jsonl");
+        std::fs::write(&t, r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":100000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#).unwrap();
+        let u = ClaudeProvider::new(None)
+            .context_usage(0, Path::new("/nonexistent"), Some(&t))
+            .unwrap();
+        assert_eq!(u.percent(), 50);
+    }
+
+    #[test]
+    fn generic_hook_is_unknown() {
         let p = GenericProvider::new("test");
-        assert_eq!(p.map_hook_event("stop"), None);
+        let mut d = HookData::default();
+        assert_eq!(
+            p.handle_hook("Stop", None, AgentState::Working, &mut d),
+            HookResult::Unknown
+        );
     }
 
     #[test]
     fn generic_context_usage_returns_none() {
         let p = GenericProvider::new("test");
-        assert!(p.context_usage(1234, Path::new("/tmp")).is_none());
+        assert!(p.context_usage(1234, Path::new("/tmp"), None).is_none());
     }
 
     #[test]
@@ -760,12 +1326,6 @@ mod tests {
             p.detect_state_from_output(b"", Duration::from_secs(6)),
             Some(AgentState::Idle)
         );
-    }
-
-    #[test]
-    fn codex_hook_always_none() {
-        let p = CodexProvider;
-        assert_eq!(p.map_hook_event("stop"), None);
     }
 
     #[test]

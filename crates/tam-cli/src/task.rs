@@ -26,6 +26,10 @@ pub enum TaskStatus {
     Input,
     /// Agent alive, waiting for permission
     Block,
+    /// Agent alive, asked the user a question
+    Question,
+    /// Agent alive, its last turn failed (e.g. API error)
+    Error,
     /// No agent running, task exists
     Idle,
     /// No agent running, no activity for a long time
@@ -40,6 +44,8 @@ impl std::fmt::Display for TaskStatus {
             Self::Run => write!(f, "run"),
             Self::Input => write!(f, "input"),
             Self::Block => write!(f, "block"),
+            Self::Question => write!(f, "question"),
+            Self::Error => write!(f, "error"),
             Self::Idle => write!(f, "idle"),
             Self::Stale => write!(f, "stale"),
             Self::Gone => write!(f, "gone"),
@@ -51,13 +57,22 @@ impl TaskStatus {
     /// Sort priority: lower = more urgent (shown first in TUI).
     pub fn sort_priority(&self) -> u8 {
         match self {
-            Self::Block => 0,
-            Self::Input => 1,
-            Self::Run => 2,
-            Self::Idle => 3,
-            Self::Stale => 4,
-            Self::Gone => 5,
+            Self::Block | Self::Question => 0,
+            Self::Error => 1,
+            Self::Input => 2,
+            Self::Run => 3,
+            Self::Idle => 4,
+            Self::Stale => 5,
+            Self::Gone => 6,
         }
+    }
+
+    /// Whether the task waits on the user.
+    pub fn needs_attention(&self) -> bool {
+        matches!(
+            self,
+            Self::Input | Self::Block | Self::Question | Self::Error
+        )
     }
 
     /// Status indicator string for display.
@@ -66,6 +81,8 @@ impl TaskStatus {
             Self::Run => "● run",
             Self::Input => "▲ input",
             Self::Block => "▲ block",
+            Self::Question => "? question",
+            Self::Error => "✗ error",
             Self::Idle => "○ idle",
             Self::Stale => "◌ stale",
             Self::Gone => "✗ gone",
@@ -130,6 +147,8 @@ impl Task {
                 AgentState::Input => TaskStatus::Input,
                 AgentState::Blocked => TaskStatus::Block,
                 AgentState::Idle => TaskStatus::Idle,
+                AgentState::Question => TaskStatus::Question,
+                AgentState::Error => TaskStatus::Error,
             };
         }
 
@@ -246,6 +265,7 @@ mod tests {
             viewers: 0,
             context_percent: None,
             task: Some("feat".into()),
+            detail: Default::default(),
         };
         let task = Task::from_info(test_snapshot(), Some(info));
         assert_eq!(task.status(), TaskStatus::Run);
@@ -263,6 +283,7 @@ mod tests {
             viewers: 0,
             context_percent: None,
             task: Some("feat".into()),
+            detail: Default::default(),
         };
         let task = Task::from_info(test_snapshot(), Some(info));
         assert_eq!(task.status(), TaskStatus::Input);
@@ -280,6 +301,7 @@ mod tests {
             viewers: 0,
             context_percent: None,
             task: Some("feat".into()),
+            detail: Default::default(),
         };
         let task = Task::from_info(test_snapshot(), Some(info));
         assert_eq!(task.status(), TaskStatus::Block);
@@ -329,6 +351,7 @@ mod tests {
             viewers: 0,
             context_percent: None,
             task: Some("feat".into()),
+            detail: Default::default(),
         };
         let mut snapshot = test_snapshot();
         snapshot.last_activity = Some(1000); // very old

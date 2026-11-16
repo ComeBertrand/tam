@@ -1,5 +1,5 @@
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -298,124 +298,93 @@ pub fn validate_provider(name: &str) -> anyhow::Result<()> {
     }
 }
 
-pub fn init_agent_hooks(agent: &str) -> Result<()> {
+/// Remove the hooks older versions of `tam init` wrote into the agent's
+/// global settings. tam now injects its hooks into each agent it spawns, so
+/// the global ones only fired for every session outside tam too.
+pub fn remove_legacy_hooks(agent: &str) -> Result<()> {
     match agent {
-        "claude" => init_claude_hooks(),
+        "claude" => {
+            let settings_path = dirs::home_dir()
+                .context("cannot determine home directory")?
+                .join(".claude")
+                .join("settings.json");
+            remove_legacy_claude_hooks(&settings_path)
+        }
         _ => anyhow::bail!("init not supported for agent '{agent}'"),
     }
 }
 
-fn init_claude_hooks() -> Result<()> {
-    let settings_path = dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".claude")
-        .join("settings.json");
-
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)
-            .with_context(|| format!("failed to read {}", settings_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse {}", settings_path.display()))?
-    } else {
-        serde_json::json!({})
-    };
-
-    let hooks = settings
-        .as_object_mut()
-        .context("settings.json is not an object")?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks = hooks.as_object_mut().context("hooks is not an object")?;
-
-    let tam_hooks: &[(&str, Option<&str>, &str)] = &[
-        ("UserPromptSubmit", None, "user_prompt_submit"),
-        ("Stop", None, "stop"),
-        (
-            "Notification",
-            Some("idle_prompt"),
-            "notification:idle_prompt",
-        ),
-        (
-            "Notification",
-            Some("permission_prompt"),
-            "notification:permission_prompt",
-        ),
-    ];
-
-    let mut added = Vec::new();
-    let mut skipped = Vec::new();
-
-    for &(event, matcher, tam_event) in tam_hooks {
-        let hook_entry = make_hook_entry(matcher, tam_event);
-
-        let event_hooks = hooks.entry(event).or_insert_with(|| serde_json::json!([]));
-
-        let arr = event_hooks
-            .as_array_mut()
-            .with_context(|| format!("hooks.{event} is not an array"))?;
-
-        // Check if tam or zinc hook already exists for this event+matcher
-        if arr.iter().any(|entry| entry_matches_hook(entry, tam_event)) {
-            skipped.push(format!(
-                "{event}{}",
-                matcher.map(|m| format!("({m})")).unwrap_or_default()
-            ));
-        } else {
-            arr.push(hook_entry);
-            added.push(format!(
-                "{event}{}",
-                matcher.map(|m| format!("({m})")).unwrap_or_default()
-            ));
-        }
+fn remove_legacy_claude_hooks(settings_path: &Path) -> Result<()> {
+    println!("Claude hooks are now injected into each agent tam spawns; nothing to install.");
+    if !settings_path.exists() {
+        return Ok(());
     }
+    let content = std::fs::read_to_string(settings_path)
+        .with_context(|| format!("failed to read {}", settings_path.display()))?;
+    let mut settings: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", settings_path.display()))?;
 
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let removed = strip_legacy_hooks(&mut settings);
+    if removed.is_empty() {
+        println!("No old tam hooks in {}.", settings_path.display());
+        return Ok(());
     }
     let formatted = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&settings_path, formatted.as_bytes())
+    std::fs::write(settings_path, formatted.as_bytes())
         .with_context(|| format!("failed to write {}", settings_path.display()))?;
-
-    if !added.is_empty() {
-        println!("Added hooks: {}", added.join(", "));
-    }
-    if !skipped.is_empty() {
-        println!("Already configured: {}", skipped.join(", "));
-    }
-    println!("Wrote {}", settings_path.display());
-
+    println!(
+        "Removed old tam hooks from {}: {}",
+        settings_path.display(),
+        removed.join(", ")
+    );
     Ok(())
 }
 
-fn make_hook_entry(matcher: Option<&str>, tam_event: &str) -> serde_json::Value {
-    let hook = serde_json::json!({
-        "type": "command",
-        "command": format!("tam hook-notify --event {tam_event}"),
-        "timeout": 5
-    });
-
-    let mut entry = serde_json::Map::new();
-    if let Some(m) = matcher {
-        entry.insert("matcher".into(), serde_json::Value::String(m.into()));
-    }
-    entry.insert("hooks".into(), serde_json::json!([hook]));
-    serde_json::Value::Object(entry)
+/// Whether a hook command is one written by an older `tam init` (or zinc).
+fn is_legacy_hook_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let program = words.next().unwrap_or("");
+    let program = program.rsplit('/').next().unwrap_or(program);
+    matches!(program, "tam" | "zinc")
+        && words.next() == Some("hook-notify")
+        && words.next() == Some("--event")
 }
 
-/// Check if a hook entry already contains a tam or zinc hook-notify command.
-fn entry_matches_hook(entry: &serde_json::Value, event: &str) -> bool {
-    let tam_cmd = format!("tam hook-notify --event {event}");
-    let zinc_cmd = format!("zinc hook-notify --event {event}");
-    entry["hooks"]
-        .as_array()
-        .map(|hooks| {
-            hooks.iter().any(|h| {
-                let cmd = h["command"].as_str().unwrap_or("");
-                cmd == tam_cmd || cmd == zinc_cmd
-            })
-        })
-        .unwrap_or(false)
+/// Remove legacy tam hook handlers from a Claude settings object, dropping
+/// matcher groups and events left empty. Returns the removed events.
+fn strip_legacy_hooks(settings: &mut serde_json::Value) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return removed;
+    };
+    for (event, groups) in hooks.iter_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            let Some(handlers) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                return true;
+            };
+            let before = handlers.len();
+            handlers.retain(|h| !h["command"].as_str().is_some_and(is_legacy_hook_command));
+            if handlers.len() == before {
+                return true;
+            }
+            let label = match group.get("matcher").and_then(|m| m.as_str()) {
+                Some(m) if !m.is_empty() => format!("{event}({m})"),
+                _ => event.clone(),
+            };
+            removed.push(label);
+            !group["hooks"].as_array().is_some_and(|h| h.is_empty())
+        });
+    }
+    hooks.retain(|_, groups| !groups.as_array().is_some_and(|g| g.is_empty()));
+    if hooks.is_empty() {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("hooks");
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -517,18 +486,82 @@ finder = "fzf"
     }
 
     #[test]
-    fn entry_matches_tam_hook() {
-        let entry = serde_json::json!({
-            "hooks": [{"type": "command", "command": "tam hook-notify --event stop"}]
-        });
-        assert!(entry_matches_hook(&entry, "stop"));
+    fn legacy_hook_commands() {
+        assert!(is_legacy_hook_command("tam hook-notify --event stop"));
+        assert!(is_legacy_hook_command("zinc hook-notify --event stop"));
+        assert!(is_legacy_hook_command(
+            "/usr/bin/tam hook-notify --event notification:idle_prompt"
+        ));
+        assert!(!is_legacy_hook_command(
+            "'/nix/store/x/bin/tam' hook-notify"
+        ));
+        assert!(!is_legacy_hook_command("tam hook-notify"));
+        assert!(!is_legacy_hook_command("notify-send done"));
     }
 
     #[test]
-    fn entry_matches_zinc_hook_migration() {
-        let entry = serde_json::json!({
-            "hooks": [{"type": "command", "command": "zinc hook-notify --event stop"}]
+    fn strips_only_legacy_hooks() {
+        let legacy = |e: &str| serde_json::json!({"type": "command", "command": format!("tam hook-notify --event {e}"), "timeout": 5});
+        let mine = serde_json::json!({"type": "command", "command": "notify-send stop"});
+        let mut settings = serde_json::json!({
+            "model": "opus",
+            "hooks": {
+                "UserPromptSubmit": [{"hooks": [legacy("user_prompt_submit")]}],
+                "Stop": [{"hooks": [legacy("stop"), mine.clone()]}],
+                "Notification": [
+                    {"matcher": "idle_prompt", "hooks": [legacy("notification:idle_prompt")]},
+                    {"matcher": "permission_prompt", "hooks": [legacy("notification:permission_prompt")]}
+                ],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [mine.clone()]}]
+            }
         });
-        assert!(entry_matches_hook(&entry, "stop"));
+        let removed = strip_legacy_hooks(&mut settings);
+        assert_eq!(
+            removed,
+            vec![
+                "Notification(idle_prompt)",
+                "Notification(permission_prompt)",
+                "Stop",
+                "UserPromptSubmit"
+            ]
+        );
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "model": "opus",
+                "hooks": {
+                    "Stop": [{"hooks": [mine.clone()]}],
+                    "PreToolUse": [{"matcher": "Bash", "hooks": [mine]}]
+                }
+            })
+        );
+        // Idempotent
+        assert!(strip_legacy_hooks(&mut settings).is_empty());
+    }
+
+    #[test]
+    fn drops_hooks_key_when_only_legacy_hooks() {
+        let mut settings = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "tam hook-notify --event stop"}]}]}
+        });
+        assert_eq!(strip_legacy_hooks(&mut settings), vec!["Stop"]);
+        assert_eq!(settings, serde_json::json!({}));
+    }
+
+    #[test]
+    fn removes_legacy_hooks_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"tam hook-notify --event stop"}]}]},"theme":"dark"}"#,
+        )
+        .unwrap();
+        remove_legacy_claude_hooks(&path).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after, serde_json::json!({"theme": "dark"}));
+        // Missing file is fine
+        remove_legacy_claude_hooks(&dir.path().join("none.json")).unwrap();
     }
 }

@@ -4,7 +4,7 @@ use std::time::Instant;
 use tam_proto::{AgentInfo, TaskInfo};
 
 use crate::config::CustomCommand;
-use crate::task::{Task, TaskStatus};
+use crate::task::Task;
 
 pub enum Mode {
     Normal,
@@ -274,11 +274,11 @@ impl App {
         self.clamp_selection();
     }
 
-    /// Count tasks needing attention (input or blocked).
+    /// Count tasks needing attention (input, blocked, question or error).
     pub fn needs_attention_count(&self) -> usize {
         self.tasks
             .iter()
-            .filter(|t| matches!(t.status(), TaskStatus::Input | TaskStatus::Block))
+            .filter(|t| t.status().needs_attention())
             .count()
     }
 }

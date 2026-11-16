@@ -5,7 +5,7 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use nix::pty::openpty;
@@ -15,7 +15,7 @@ use tam_proto::{AgentInfo, AgentState};
 use tokio::sync::broadcast;
 use tracing::error;
 
-use crate::provider::Provider;
+use crate::provider::{HookData, HookResult, Provider};
 use crate::scrollback::ScrollbackBuffer;
 
 /// Lightweight metadata for context refresh — collected under lock, IO done outside.
@@ -24,6 +24,8 @@ pub struct ContextRefreshJob {
     pub pid: u32,
     pub dir: PathBuf,
     pub provider: String,
+    /// Session transcript reported by the agent's hooks.
+    pub transcript: Option<PathBuf>,
 }
 
 pub struct Agent {
@@ -45,6 +47,8 @@ pub struct Agent {
     context_percent: Option<u8>,
     /// Task this agent runs for, if any (its runs are recorded in the ledger).
     task: Option<String>,
+    /// What the agent's hooks reported (session, pending action, …).
+    hook_data: HookData,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -133,6 +137,7 @@ impl Agent {
             reported_state: AgentState::Working,
             context_percent: None,
             task: None,
+            hook_data: HookData::default(),
             _reader_handle: reader_handle,
         })
     }
@@ -205,18 +210,41 @@ impl Agent {
         self.state = state;
     }
 
-    /// Map a hook event to a state via the provider, and update stored state.
-    /// Returns the new state if the event was recognized, None otherwise.
-    pub fn handle_hook_event(&mut self, event: &str) -> Option<AgentState> {
-        let new_state = self.provider.map_hook_event(event)?;
-        self.set_state(new_state);
-        Some(new_state)
+    /// Apply a hook event via the provider: update the hook data and the
+    /// stored state. Returns `None` if the provider doesn't know the event.
+    pub fn handle_hook_event(
+        &mut self,
+        event: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Option<HookResult> {
+        let current = self.current_state();
+        let result = self
+            .provider
+            .handle_hook(event, payload, current, &mut self.hook_data);
+        match result {
+            HookResult::Unknown => return None,
+            HookResult::Handled { state: Some(state) } => self.set_state(state),
+            // Pin a silence-derived state, so that a hook that changes no
+            // state can't bring back a stale `working`.
+            HookResult::Handled { state: None } => self.set_state(current),
+        }
+        Some(result)
+    }
+
+    /// Session id reported by the agent's hooks.
+    pub fn session_id(&self) -> Option<&str> {
+        self.hook_data.detail.session_id.as_deref()
     }
 
     /// Check for a state transition. Returns Some((old, new)) if state changed.
     /// Updates reported_state so the same transition isn't reported twice.
     pub fn check_state_change(&mut self) -> Option<(AgentState, AgentState)> {
         let current = self.current_state();
+        // Commit a silence-derived state: output that follows (e.g. the
+        // prompt echoing the user's typing) must not bring back `working`.
+        if self.provider.silent_working_timeout().is_some() {
+            self.state = current;
+        }
         if current != self.reported_state {
             let old = self.reported_state;
             self.reported_state = current;
@@ -230,9 +258,14 @@ impl Agent {
     /// fall back to the stored state (set by hooks or default).
     pub fn current_state(&self) -> AgentState {
         let idle_duration = self.last_output_at.lock().unwrap().elapsed();
-        self.provider
-            .detect_state_from_output(&[], idle_duration)
-            .unwrap_or(self.state)
+        if let Some(state) = self.provider.detect_state_from_output(&[], idle_duration) {
+            return state;
+        }
+        silence_fallback(
+            self.state,
+            idle_duration,
+            self.provider.silent_working_timeout(),
+        )
     }
 
     /// Build an AgentInfo snapshot for reporting to clients.
@@ -247,6 +280,7 @@ impl Agent {
             viewers: self.viewers.load(Ordering::Relaxed),
             context_percent: self.context_percent,
             task: self.task.clone(),
+            detail: Box::new(self.hook_data.detail.clone()),
         }
     }
 
@@ -258,6 +292,7 @@ impl Agent {
             pid: self.child.id(),
             dir: self.dir.clone(),
             provider: self.provider.name().to_string(),
+            transcript: self.hook_data.transcript_path.clone(),
         }
     }
 
@@ -312,6 +347,27 @@ impl Agent {
     }
 }
 
+/// State of a hook-driven agent given how long its PTY has been silent: a
+/// turn interrupted by the user ends without any hook, leaving `working`
+/// stored, so a `working` agent silent for `timeout` is back at the prompt.
+/// (`timeout` is the provider's `silent_working_timeout`; `None` disables
+/// the fallback.)
+///
+/// Only `working` is corrected. Nothing fires either when a permission or
+/// question is answered (the next hook is the tool's `PostToolUse`), but
+/// the output can't tell: Claude's waiting dialogs may redraw as often as
+/// its working spinner.
+fn silence_fallback(
+    stored: AgentState,
+    silent_for: Duration,
+    timeout: Option<Duration>,
+) -> AgentState {
+    match timeout {
+        Some(t) if stored == AgentState::Working && silent_for >= t => AgentState::Input,
+        _ => stored,
+    }
+}
+
 /// Blocking loop that reads PTY master output, stores it in the scrollback buffer,
 /// broadcasts it to any attached clients, and tracks when output last arrived.
 /// Exits when the PTY slave side is closed (agent exits).
@@ -343,5 +399,36 @@ fn pty_reader_loop(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T: Option<Duration> = Some(Duration::from_secs(10));
+
+    #[test]
+    fn silent_working_agent_falls_back_to_input() {
+        let s = |stored, secs| silence_fallback(stored, Duration::from_secs(secs), T);
+        assert_eq!(s(AgentState::Working, 3), AgentState::Working);
+        assert_eq!(s(AgentState::Working, 10), AgentState::Input);
+        // Only `working` is subject to the fallback
+        for state in [
+            AgentState::Blocked,
+            AgentState::Question,
+            AgentState::Error,
+            AgentState::Input,
+        ] {
+            assert_eq!(s(state, 60), state);
+        }
+    }
+
+    #[test]
+    fn no_fallback_without_timeout() {
+        assert_eq!(
+            silence_fallback(AgentState::Working, Duration::from_secs(600), None),
+            AgentState::Working
+        );
     }
 }

@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::agent::Agent;
 use crate::ledger::Ledger;
-use crate::notify::{self, NotifyConfig};
+use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
 
 pub struct Daemon {
@@ -180,8 +180,19 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             .collect();
         for (id, old, new) in changes {
             info!(id = %id, old = %old, new = %new, "state changed");
-            if let Some(ref cfg) = notify_config {
-                notify::fire_if_matching(cfg, &id, old, new);
+            if let (Some(cfg), Some(agent)) = (&notify_config, state.agents.get(&id)) {
+                let info = agent.info(&id);
+                notify::fire_if_matching(
+                    cfg,
+                    &Notification {
+                        id: &id,
+                        task: info.task.as_deref().unwrap_or(&id),
+                        old,
+                        new,
+                        detail: &info.detail,
+                        viewers: info.viewers,
+                    },
+                );
             }
             let _ = state.event_tx.send(Event::StateChange { id, old, new });
         }
@@ -224,7 +235,11 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             let results: Vec<_> = jobs
                 .into_iter()
                 .filter_map(|job| {
-                    let usage = provider::resolve(&job.provider).context_usage(job.pid, &job.dir);
+                    let usage = provider::resolve(&job.provider).context_usage(
+                        job.pid,
+                        &job.dir,
+                        job.transcript.as_deref(),
+                    );
                     usage.map(|u| (job.id, u.percent()))
                 })
                 .collect();
@@ -320,6 +335,16 @@ impl DaemonState {
                 })
             })
             .collect()
+    }
+
+    /// Record the session id reported by an agent's hooks for its task's
+    /// current run (first one only; later ones are e.g. `/clear`).
+    fn record_hook_session(&mut self, task: &str, session_id: &str) {
+        match self.ledger.session_identified(task, session_id) {
+            Ok(true) => info!(task = %task, session = %session_id, "session identified by hook"),
+            Ok(false) => {}
+            Err(e) => error!(task = %task, "failed to record session: {e:#}"),
+        }
     }
 
     /// Record a discovered session id, if the agent is still the one running
@@ -579,7 +604,11 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         },
         Request::Scrollback { id } => handle_scrollback(state, &id).await,
         Request::Resize { id, cols, rows } => handle_resize(state, &id, cols, rows).await,
-        Request::HookEvent { agent_id, event } => handle_hook_event(state, &agent_id, &event).await,
+        Request::HookEvent {
+            agent_id,
+            event,
+            payload,
+        } => handle_hook_event(state, &agent_id, &event, payload.as_ref()).await,
         Request::Shutdown => handle_shutdown(state).await,
         Request::CreateTask { name, dir, owned } => {
             handle_create_task(state, &name, &dir, owned).await
@@ -791,23 +820,38 @@ async fn handle_hook_event(
     state: &Arc<Mutex<DaemonState>>,
     agent_id: &str,
     event: &str,
+    payload: Option<&serde_json::Value>,
 ) -> Response {
     let mut state = state.lock().await;
 
-    match state.agents.get_mut(agent_id) {
-        Some(agent) => match agent.handle_hook_event(event) {
-            Some(new_state) => {
-                info!(id = %agent_id, event = %event, state = %new_state, "hook event");
-                Response::Ok
-            }
-            None => Response::Error {
-                message: format!("unknown hook event '{}' for agent '{}'", event, agent_id),
-            },
-        },
-        None => Response::Error {
+    let Some(agent) = state.agents.get_mut(agent_id) else {
+        return Response::Error {
             message: format!("agent '{}' not found", agent_id),
-        },
+        };
+    };
+    let before = agent.info(agent_id).detail;
+    let Some(result) = agent.handle_hook_event(event, payload) else {
+        return Response::Error {
+            message: format!("unknown hook event '{}' for agent '{}'", event, agent_id),
+        };
+    };
+    info!(id = %agent_id, event = %event, result = ?result, "hook event");
+
+    let info = agent.info(agent_id);
+    let session = agent
+        .task()
+        .zip(agent.session_id())
+        .map(|(task, session)| (task.to_string(), session.to_string()));
+    if info.detail != before {
+        state.broadcast(Event::AgentUpdated {
+            id: agent_id.to_string(),
+            info,
+        });
     }
+    if let Some((task, session_id)) = session {
+        state.record_hook_session(&task, &session_id);
+    }
+    Response::Ok
 }
 
 async fn handle_shutdown(state: &Arc<Mutex<DaemonState>>) -> Response {

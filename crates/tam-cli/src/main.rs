@@ -6,6 +6,7 @@ use clap::Parser;
 mod cli;
 mod client;
 mod config;
+mod hook;
 mod sessions;
 mod task;
 mod tui;
@@ -294,7 +295,7 @@ async fn main() -> Result<()> {
 
         Commands::Init { agent } => {
             config::validate_provider(&agent)?;
-            config::init_agent_hooks(&agent)?;
+            config::remove_legacy_hooks(&agent)?;
         }
 
         Commands::Shutdown => {
@@ -335,28 +336,11 @@ async fn main() -> Result<()> {
             return d.run().await;
         }
 
-        Commands::HookNotify { agent, event } => {
-            // Not running under tam — silently succeed so hooks don't block the agent
-            let agent = match agent {
-                Some(a) => a,
-                None => {
-                    // Also check ZINC_AGENT_ID for migration
-                    match std::env::var("ZINC_AGENT_ID") {
-                        Ok(a) => a,
-                        Err(_) => return Ok(()),
-                    }
-                }
-            };
-            // Best-effort: don't block the agent
-            if let Ok(mut client) = client::Client::connect().await {
-                let _ = client
-                    .send(tam_proto::Request::HookEvent {
-                        agent_id: agent,
-                        event,
-                    })
-                    .await;
-            }
-        }
+        Commands::HookNotify {
+            agent,
+            socket,
+            event,
+        } => hook::notify(agent, socket, event).await,
     }
 
     Ok(())

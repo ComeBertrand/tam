@@ -6,6 +6,7 @@ use ratatui::widgets::{
     TableState,
 };
 use ratatui::Frame;
+use tam_proto::{AgentDetail, AgentState};
 
 use crate::task::{Task, TaskStatus};
 
@@ -31,9 +32,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         render_tasks(frame, table_area, app);
 
-        let task_name = app.selected_task().map(|t| t.name.as_str()).unwrap_or("—");
+        let selected = app.selected_task();
+        let task_name = selected.map(|t| t.name.as_str()).unwrap_or("—");
+        let detail = selected
+            .and_then(|t| t.agent_info.as_ref())
+            .and_then(|a| agent_detail_line(a.state, &a.detail));
         let content = app.peek.as_deref().unwrap_or("");
-        render_preview(frame, preview_area, task_name, content);
+        render_preview(frame, preview_area, task_name, detail, content);
 
         render_footer(frame, footer_area, app);
     } else {
@@ -269,11 +274,61 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn render_preview(frame: &mut Frame, area: Rect, task_name: &str, raw_content: &str) {
-    let block = Block::default()
+/// What the agent waits on or reported, for the peek pane: the pending
+/// permission or question, the error, or a tool call refused by auto mode.
+fn agent_detail_line(state: AgentState, detail: &AgentDetail) -> Option<(String, Color)> {
+    let pending = |label: &str, color| {
+        detail.pending.as_ref().map(|p| match &p.tool {
+            Some(tool) if label == "permission" => {
+                (format!("{label} · {tool}: {}", p.summary), color)
+            }
+            _ => (format!("{label}: {}", p.summary), color),
+        })
+    };
+    match state {
+        AgentState::Blocked => pending("permission", Color::Red),
+        AgentState::Question => pending("question", Color::Magenta),
+        AgentState::Error => detail.error.as_ref().map(|e| {
+            let text = match &e.message {
+                Some(m) => format!("error · {}: {}", e.kind, first_line(m)),
+                None => format!("error · {}", e.kind),
+            };
+            (text, Color::Red)
+        }),
+        _ => detail.denied.as_ref().map(|d| {
+            let mut text = format!("denied · {}", d.tool);
+            if let Some(s) = &d.summary {
+                text.push_str(&format!(": {s}"));
+            }
+            if let Some(r) = &d.reason {
+                text.push_str(&format!(" ({})", first_line(r)));
+            }
+            (text, Color::Yellow)
+        }),
+    }
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+}
+
+fn render_preview(
+    frame: &mut Frame,
+    area: Rect,
+    task_name: &str,
+    detail: Option<(String, Color)>,
+    raw_content: &str,
+) {
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::DarkGray))
         .title(format!(" {task_name} "));
+    if let Some((text, color)) = detail {
+        block = block.title_bottom(Line::styled(format!(" {text} "), Style::new().fg(color)));
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -528,6 +583,8 @@ fn status_display(status: &TaskStatus) -> (&'static str, Color) {
         TaskStatus::Run => ("● run", Color::Blue),
         TaskStatus::Input => ("▲ input", Color::Yellow),
         TaskStatus::Block => ("▲ block", Color::Red),
+        TaskStatus::Question => ("? question", Color::Magenta),
+        TaskStatus::Error => ("✗ error", Color::Red),
         TaskStatus::Idle => ("○ idle", Color::DarkGray),
         TaskStatus::Stale => ("◌ stale", Color::DarkGray),
         TaskStatus::Gone => ("✗ gone", Color::Red),
@@ -552,4 +609,52 @@ pub fn shorten_home(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tam_proto::{AgentError, DeniedTool, Pending};
+
+    fn text(state: AgentState, d: &AgentDetail) -> Option<String> {
+        agent_detail_line(state, d).map(|(t, _)| t)
+    }
+
+    #[test]
+    fn detail_line_per_state() {
+        let mut d = AgentDetail {
+            pending: Some(Pending {
+                tool: Some("Bash".into()),
+                summary: "touch x".into(),
+            }),
+            error: Some(AgentError {
+                kind: "rate_limit".into(),
+                message: Some("API Error: Rate limit reached\nretry later".into()),
+            }),
+            denied: Some(DeniedTool {
+                tool: "Bash".into(),
+                summary: Some("rm -rf build".into()),
+                reason: Some("destructive".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            text(AgentState::Blocked, &d).unwrap(),
+            "permission · Bash: touch x"
+        );
+        assert_eq!(
+            text(AgentState::Error, &d).unwrap(),
+            "error · rate_limit: API Error: Rate limit reached"
+        );
+        assert_eq!(
+            text(AgentState::Working, &d).unwrap(),
+            "denied · Bash: rm -rf build (destructive)"
+        );
+        d.pending.as_mut().unwrap().summary = "Tea or coffee?".into();
+        assert_eq!(
+            text(AgentState::Question, &d).unwrap(),
+            "question: Tea or coffee?"
+        );
+        assert!(text(AgentState::Input, &AgentDetail::default()).is_none());
+    }
 }

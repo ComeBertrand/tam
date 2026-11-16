@@ -107,9 +107,10 @@ pub enum Commands {
         finder: Option<String>,
     },
 
-    /// Configure agent hooks for state detection
+    /// Remove the agent hooks older versions of tam installed globally
+    /// (hooks are now injected into each agent tam spawns)
     Init {
-        /// Agent to configure (e.g. claude)
+        /// Agent to clean up (e.g. claude)
         #[arg(long)]
         agent: String,
     },
@@ -124,15 +125,23 @@ pub enum Commands {
     #[command(hide = true)]
     Daemon,
 
-    /// Notify the daemon of a hook event (called by agent hooks)
+    /// Forward a hook event to the daemon (run by the hooks tam injects into
+    /// the agents it spawns). Reads the hook's JSON input on stdin.
     #[command(hide = true)]
     HookNotify {
         /// Agent ID (defaults to $TAM_AGENT_ID; exits quietly if absent)
         #[arg(short, long, env = "TAM_AGENT_ID")]
         agent: Option<String>,
 
-        /// Hook event name (e.g. stop, notification:permission_prompt)
+        /// Daemon socket (defaults to $TAM_SOCKET, set by the daemon that
+        /// spawned the agent)
+        #[arg(long, env = "TAM_SOCKET")]
+        socket: Option<std::path::PathBuf>,
+
+        /// Legacy event name, passed by the hooks older `tam init` wrote to
+        /// the global Claude settings. Such calls are ignored: hooks are
+        /// injected per spawn now.
         #[arg(short, long)]
-        event: String,
+        event: Option<String>,
     },
 }

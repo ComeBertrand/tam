@@ -628,7 +628,8 @@ async fn hook_event_updates_agent_state() {
         &mut stream,
         &Request::HookEvent {
             agent_id: "hook-test".into(),
-            event: "stop".into(),
+            event: "Stop".into(),
+            payload: None,
         },
     )
     .await;
@@ -642,7 +643,8 @@ async fn hook_event_updates_agent_state() {
         &mut stream,
         &Request::HookEvent {
             agent_id: "nonexistent".into(),
-            event: "stop".into(),
+            event: "Stop".into(),
+            payload: None,
         },
     )
     .await;

@@ -992,7 +992,8 @@ async fn drop_task(client: &mut Client, app: &mut App, name: &str) -> Result<()>
 
 fn apply_event(app: &mut App, event: tam_proto::Event) {
     match event {
-        tam_proto::Event::AgentSpawned { info, .. } => {
+        tam_proto::Event::AgentSpawned { info, .. }
+        | tam_proto::Event::AgentUpdated { info, .. } => {
             app.update_agent(info);
         }
         tam_proto::Event::StateChange { id, new, .. } => {

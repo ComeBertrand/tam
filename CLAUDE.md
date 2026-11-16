@@ -32,7 +32,16 @@ Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-pro
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
   daemon exits after 30s with no agents and no clients.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
-  detection, generic/codex use PTY heuristic (5s idle timeout).
+  detection, generic/codex use PTY heuristic (5s idle timeout). Claude's hooks
+  are injected per spawn (`claude --settings`) and run `tam hook-notify`, which
+  forwards the hook's JSON input to the daemon (`$TAM_SOCKET`, never starting
+  one); `ClaudeProvider::handle_hook` maps it to a state and per-agent
+  `AgentDetail`. A working Claude agent silent for 10s falls back to input
+  (interrupted turns fire no hook).
+- **Testing hooks by hand** — run the dev daemon with temp `XDG_RUNTIME_DIR`
+  (short path: Unix socket limit), `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
+  `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
+  `CLAUDE*` variables, or nested Claude sessions write no transcript.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
 
 ## Build & check

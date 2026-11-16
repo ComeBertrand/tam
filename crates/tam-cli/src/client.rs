@@ -34,8 +34,12 @@ pub struct Client {
 impl Client {
     /// Try to connect without starting the daemon. Returns None if not running.
     pub async fn try_connect() -> Result<Option<Self>> {
-        let socket_path = tam_proto::default_socket_path();
-        match UnixStream::connect(&socket_path).await {
+        Self::try_connect_at(&tam_proto::default_socket_path()).await
+    }
+
+    /// Like `try_connect`, on a given socket.
+    pub async fn try_connect_at(socket_path: &Path) -> Result<Option<Self>> {
+        match UnixStream::connect(socket_path).await {
             Ok(stream) => {
                 let (reader, writer) = stream.into_split();
                 let mut client = Self {

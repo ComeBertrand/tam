@@ -18,6 +18,10 @@ pub enum AgentState {
     Input,
     /// Running but inactive (heuristic fallback)
     Idle,
+    /// Asked the user a question and waits for the answer
+    Question,
+    /// The last turn failed (e.g. API error); waits for a new prompt
+    Error,
 }
 
 impl std::fmt::Display for AgentState {
@@ -27,6 +31,8 @@ impl std::fmt::Display for AgentState {
             Self::Blocked => write!(f, "blocked"),
             Self::Input => write!(f, "input"),
             Self::Idle => write!(f, "idle"),
+            Self::Question => write!(f, "question"),
+            Self::Error => write!(f, "error"),
         }
     }
 }
@@ -46,6 +52,66 @@ pub struct AgentInfo {
     pub context_percent: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// What the agent reported through its hooks (empty for providers
+    /// without hooks).
+    #[serde(default, skip_serializing_if = "AgentDetail::is_empty")]
+    pub detail: Box<AgentDetail>,
+}
+
+/// Details an agent reports through its hooks, kept by the daemon per agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDetail {
+    /// Agent session id (changes on e.g. `/clear`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// What the agent waits on while `blocked` or `question`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Pending>,
+    /// Text of the agent's last response, once a turn finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<String>,
+    /// Why the last turn failed, while `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AgentError>,
+    /// Last tool call refused by the agent's auto mode in the current turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<DeniedTool>,
+}
+
+impl AgentDetail {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A permission or a question the agent waits on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    /// Tool asking for permission (e.g. `Bash`), or the question tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// One-line summary: the command, file, or question text.
+    pub summary: String,
+}
+
+/// Cause of a failed turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentError {
+    /// Error kind as reported by the agent (e.g. `rate_limit`).
+    pub kind: String,
+    /// Human-readable message, when the agent gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A tool call refused without asking the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeniedTool {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Summary of a task, as derived by the daemon from its ledger.
@@ -126,7 +192,12 @@ pub enum Request {
     /// Hook callback from an agent process (e.g. Claude Code hooks).
     HookEvent {
         agent_id: String,
+        /// Hook event name (e.g. `Stop`, `PermissionRequest`).
         event: String,
+        /// The hook's JSON input, as the agent passed it (bulky fields such
+        /// as tool output stripped by `tam hook-notify`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
     },
     Shutdown,
     /// Version handshake — sent by client on connect.
@@ -209,6 +280,11 @@ pub enum Event {
         id: String,
         context_percent: u8,
     },
+    /// An agent's hook details changed (pending action, last message, error…).
+    AgentUpdated {
+        id: String,
+        info: AgentInfo,
+    },
     TaskCreated {
         task: TaskInfo,
     },
@@ -251,6 +327,8 @@ mod tests {
         assert_eq!(AgentState::Blocked.to_string(), "blocked");
         assert_eq!(AgentState::Input.to_string(), "input");
         assert_eq!(AgentState::Idle.to_string(), "idle");
+        assert_eq!(AgentState::Question.to_string(), "question");
+        assert_eq!(AgentState::Error.to_string(), "error");
     }
 
     #[test]
@@ -260,6 +338,8 @@ mod tests {
             AgentState::Blocked,
             AgentState::Input,
             AgentState::Idle,
+            AgentState::Question,
+            AgentState::Error,
         ] {
             let json = serde_json::to_string(&state).unwrap();
             let back: AgentState = serde_json::from_str(&json).unwrap();
@@ -361,18 +441,60 @@ mod tests {
     fn request_hook_event_serde() {
         let req = Request::HookEvent {
             agent_id: "fix-auth".into(),
-            event: "stop".into(),
+            event: "Stop".into(),
+            payload: Some(serde_json::json!({"last_assistant_message": "done"})),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"hook_event\""));
         let back: Request = serde_json::from_str(&json).unwrap();
         match back {
-            Request::HookEvent { agent_id, event } => {
+            Request::HookEvent {
+                agent_id,
+                event,
+                payload,
+            } => {
                 assert_eq!(agent_id, "fix-auth");
-                assert_eq!(event, "stop");
+                assert_eq!(event, "Stop");
+                assert_eq!(payload.unwrap()["last_assistant_message"], "done");
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn request_hook_event_without_payload() {
+        let json = r#"{"type":"hook_event","agent_id":"a","event":"stop"}"#;
+        match serde_json::from_str::<Request>(json).unwrap() {
+            Request::HookEvent { payload, .. } => assert!(payload.is_none()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn agent_detail_omitted_when_empty() {
+        let mut info = AgentInfo {
+            id: "a".into(),
+            provider: "claude".into(),
+            dir: PathBuf::from("/tmp"),
+            state: AgentState::Question,
+            pid: None,
+            uptime_secs: 0,
+            viewers: 0,
+            context_percent: None,
+            task: None,
+            detail: Default::default(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("detail"), "{json}");
+        assert!(json.contains("\"state\":\"question\""));
+
+        info.detail.pending = Some(Pending {
+            tool: Some("AskUserQuestion".into()),
+            summary: "Tea or coffee?".into(),
+        });
+        let json = serde_json::to_string(&info).unwrap();
+        let back: AgentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.detail, info.detail);
     }
 
     #[test]
@@ -401,6 +523,7 @@ mod tests {
                 viewers: 0,
                 context_percent: None,
                 task: None,
+                detail: Default::default(),
             }],
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -700,6 +823,7 @@ mod tests {
             viewers: 0,
             context_percent: None,
             task: None,
+            detail: Default::default(),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("\"task\""));

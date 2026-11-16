@@ -132,11 +132,11 @@ The daemon writes a PID file next to the socket for health checks. The client au
 
 State detection uses two strategies, selected per provider:
 
-**Hook-based** (Claude Code): the agent process receives `TAM_AGENT_ID` and `TAM_SOCKET` environment variables at spawn. `tam init --agent claude` configures Claude Code hooks (in `~/.claude/settings.json`) that call `tam hook-notify` on events like `stop`, `user_prompt_submit`, `notification:permission_prompt`. The hook-notify command sends a best-effort message to the daemon, which maps the event to an agent state. This is immediate and accurate.
+**Hook-based** (Claude Code): the agent process receives `TAM_AGENT_ID` and `TAM_SOCKET` environment variables at spawn, and its hooks are injected with `claude --settings` (nothing is written to `~/.claude/settings.json`). Each hook runs `tam hook-notify`, which forwards the hook's JSON input to the daemon that spawned the agent (best effort, never starting a daemon). The daemon maps the event to a state (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PermissionRequest`, `Stop`, `StopFailure`…) and keeps per agent what it needs: session id, transcript path, pending permission or question, last response, error cause, last auto-mode denial. A turn the user interrupts fires no hook: a working agent whose PTY stays silent for 10s is taken as back at the prompt. Nothing fires when a permission is granted either; the agent shows blocked until the tool finishes.
 
 **PTY heuristic** (generic/codex): for agents without hooks, the daemon tracks time since last PTY output. Activity within 5 seconds means "working," silence beyond that means "idle." This cannot distinguish "waiting for input" from "thinking quietly," so it's a fallback.
 
-**Context usage**: for Claude Code, the daemon periodically reads the agent's JSONL session file to extract token usage (input + cache tokens) and computes a percentage against the model's context limit. This is done in a two-phase pattern: collect metadata under the daemon lock, release the lock, do file IO, re-acquire and write back. This avoids holding the lock during disk access.
+**Context usage**: for Claude Code, the daemon periodically reads the session transcript its hooks reported (`transcript_path`) to extract token usage (input + cache tokens) and computes a percentage against the model's context limit. This is done in a two-phase pattern: collect metadata under the daemon lock, release the lock, do file IO, re-acquire and write back. This avoids holding the lock during disk access.
 
 ### Configuration
 
@@ -158,8 +158,8 @@ ignore = [".*", "node_modules", "target"]
 scrollback = 1048576                        # bytes per agent
 
 [notify]
-command = "notify-send 'tam: {task}' '{status}'"
-on_states = ["input", "blocked"]
+command = "notify-send 'tam: {task}' '{kind}: {message}'"
+on_states = ["input", "blocked", "question", "error"]
 
 [session]
 finder = "fzf"                              # for tam pick
@@ -229,7 +229,7 @@ tam pick                            # fuzzy project picker, prints selected path
 ### Setup and administration
 
 ```
-tam init --agent claude             # configure agent hooks for state detection
+tam init --agent claude             # remove the global hooks older versions installed
 tam shutdown                        # stop all agents, kill daemon
 tam status                          # check if daemon is running
 ```

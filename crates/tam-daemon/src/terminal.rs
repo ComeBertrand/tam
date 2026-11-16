@@ -1,6 +1,7 @@
 //! The daemon's terminal emulator of an agent's PTY: the screen a viewer
 //! would see, kept at the PTY's size and fed by its reader.
 
+use std::fmt::Write as _;
 use std::num::NonZeroU16;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -20,16 +21,39 @@ pub struct Terminal {
 }
 
 /// Parser callbacks: count the rows dropped from the top of the main
-/// screen's history, to number lines (see [`ScreenInfo`]).
+/// screen's history, to number lines (see [`ScreenInfo`]), and keep the
+/// input modes the parser doesn't.
 #[derive(Default)]
 struct Lines {
     dropped: u64,
+    /// The agent asked for focus events (`CSI ? 1004 h`).
+    focus_reporting: bool,
 }
+
+/// DEC private mode: report focus in and out.
+const FOCUS_REPORTING: u16 = 1004;
 
 impl vt100::Callbacks for Lines {
     fn on_scroll(&mut self, _row: vt100::capture::RowContents<'_>, alternate_screen: bool) {
         if !alternate_screen {
             self.dropped += 1;
+        }
+    }
+
+    fn unhandled_csi(
+        &mut self,
+        _screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if i1 == Some(b'?') && params.contains(&&[FOCUS_REPORTING][..]) {
+            match c {
+                'h' => self.focus_reporting = true,
+                'l' => self.focus_reporting = false,
+                _ => {}
+            }
         }
     }
 }
@@ -81,6 +105,61 @@ impl Terminal {
         }
     }
 
+    /// What a viewer that just attached is sent before the agent's live
+    /// output, to bring its terminal (already at the PTY's size) to the
+    /// agent's state:
+    /// - the history, as lines scrolled into the viewer's own scrollback
+    ///   (with the viewer's screen before it). Wrapped rows are joined: the
+    ///   viewer's terminal wraps them at its width. Only on the main screen:
+    ///   the alternate screen has none, and the main one is out of reach.
+    /// - the screen, row by row, then the cursor, the attributes and the
+    ///   input modes (bracketed paste, mouse, focus events…).
+    ///
+    /// It draws on the rows of the viewer's screen the agent has (from the
+    /// top), and erases only lines of them: rows below, such as the
+    /// dashboard's status bar, stay.
+    pub fn replay(&self) -> String {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        let (rows, cols) = (rows.get(), cols.get());
+        let mut out = String::new();
+        if screen.alternate_screen() {
+            out.push_str("\x1b[?1049h");
+        } else {
+            let _ = write!(out, "\x1b[{rows};1H");
+            write_history(&mut out, screen);
+            // Scroll it all (and the viewer's screen when there is no
+            // history) above the agent's rows.
+            for _ in 0..rows {
+                out.push_str("\x1b[m\r\n");
+            }
+        }
+        for row in 0..rows {
+            let _ = write!(out, "\x1b[{};1H\x1b[m\x1b[2K", row + 1);
+            write_row(&mut out, screen, row, cols);
+        }
+        out.push_str(&screen.cursor_state_formatted());
+        out.push_str(&screen.attributes_formatted());
+        out.push_str(&screen.input_mode_formatted());
+        if self.parser.callbacks().focus_reporting {
+            out.push_str("\x1b[?1004h");
+        }
+        out
+    }
+
+    /// The text of the terminal, without formatting: its history (main
+    /// screen), then its screen. Wrapped rows are joined.
+    pub fn text(&self) -> String {
+        let mut formatted = String::new();
+        let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default());
+        let _ = self
+            .parser
+            .screen()
+            .write_contents_formatted_basic(&mut formatted, range);
+        let text: String = vt100::capture::basic_formatted_to_plain(&formatted).collect();
+        text.trim_end().to_string()
+    }
+
     /// Run `f` on the parser. A parser bug must not take the PTY reader
     /// (and with it the attach relay and silence detection) down: on a
     /// panic, start over on a blank screen.
@@ -92,10 +171,119 @@ impl Terminal {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
         // Keep numbering forward: the history is gone.
+        let callbacks = self.parser.callbacks();
         let lines = Lines {
-            dropped: self.parser.callbacks().dropped + screen.scrollback_len() as u64,
+            dropped: callbacks.dropped + screen.scrollback_len() as u64,
+            focus_reporting: callbacks.focus_reporting,
         };
         self.parser = parser(cols.get(), rows.get(), self.history, lines);
+    }
+}
+
+/// Write the history, oldest line first, each from the bottom row (where
+/// the cursor is) so that it scrolls the line before up.
+fn write_history(out: &mut String, screen: &vt100::Screen) {
+    let history = screen.scrollback_len();
+    if history == 0 {
+        return;
+    }
+    // Paging through it grows each row to the screen's width: on a copy.
+    let mut screen = screen.clone();
+    let page = usize::from(screen.size().0.get());
+    let mut wrapped = false;
+    for start in (0..history).step_by(page) {
+        // The window's rows are history[start..start + page].
+        screen.set_scrollback(history - start);
+        for row in 0..page.min(history - start) as u16 {
+            if !wrapped {
+                out.push_str("\x1b[m\r\n");
+            }
+            // History rows can be wider than the screen after a resize.
+            write_row(out, &screen, row, u16::MAX);
+            wrapped = screen.row_wrapped(row);
+        }
+    }
+}
+
+/// Write the first `cols` cells of a visible row, from the cursor, with
+/// their attributes, up to the last non-blank one. Nothing but SGR and
+/// characters: no cursor motion to other rows.
+fn write_row(out: &mut String, screen: &vt100::Screen, row: u16, cols: u16) {
+    let cells: Vec<&vt100::Cell> = (0..cols).map_while(|col| screen.cell(row, col)).collect();
+    let blank = |cell: &&vt100::Cell| !cell.has_contents() && Sgr::of(cell) == Sgr::default();
+    let end = cells.iter().rposition(|c| !blank(c)).map_or(0, |i| i + 1);
+    let mut current = Sgr::default();
+    for cell in &cells[..end] {
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let sgr = Sgr::of(cell);
+        if sgr != current {
+            sgr.write(out);
+            current = sgr;
+        }
+        out.push_str(if cell.has_contents() {
+            cell.contents()
+        } else {
+            " "
+        });
+    }
+    if current != Sgr::default() {
+        out.push_str("\x1b[m");
+    }
+}
+
+/// A cell's attributes, as SGR parameters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Sgr {
+    fg: Option<vt100::Color>,
+    bg: Option<vt100::Color>,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl Sgr {
+    fn of(cell: &vt100::Cell) -> Self {
+        let color = |c| (c != vt100::Color::Default).then_some(c);
+        Self {
+            fg: color(cell.fgcolor()),
+            bg: color(cell.bgcolor()),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    /// From the default attributes to these.
+    fn write(&self, out: &mut String) {
+        out.push_str("\x1b[0");
+        for (on, code) in [
+            (self.bold, "1"),
+            (self.dim, "2"),
+            (self.italic, "3"),
+            (self.underline, "4"),
+            (self.inverse, "7"),
+        ] {
+            if on {
+                out.push(';');
+                out.push_str(code);
+            }
+        }
+        for (color, base, bright, extended) in [(self.fg, 30, 90, 38), (self.bg, 40, 100, 48)] {
+            let _ = match color {
+                None | Some(vt100::Color::Default) => Ok(()),
+                Some(vt100::Color::Idx(i)) if i < 8 => write!(out, ";{}", base + i),
+                Some(vt100::Color::Idx(i)) if i < 16 => write!(out, ";{}", bright + i - 8),
+                Some(vt100::Color::Idx(i)) => write!(out, ";{extended};5;{i}"),
+                Some(vt100::Color::Rgb(r, g, b)) => write!(out, ";{extended};2;{r};{g};{b}"),
+            };
+        }
+        out.push('m');
     }
 }
 
@@ -189,6 +377,97 @@ mod tests {
         let info = t.screen(Some(0));
         assert_eq!(info.top, 0);
         assert_eq!(rows(&info)[0], "line 1");
+    }
+
+    /// A viewer's terminal after the replay: `rows`×`cols`, plus a status
+    /// bar below that the replay must leave alone (as the dashboard's).
+    fn viewer(t: &Terminal) -> vt100::Parser {
+        let info = t.parser.screen().size();
+        let (rows, cols) = (info.0.get(), info.1.get());
+        let mut viewer = vt100::Parser::new(nonzero(rows + 1), nonzero(cols), 100);
+        viewer.process(
+            format!(
+                "old screen\x1b[{};1Hstatus bar\x1b[1;{rows}r\x1b[H",
+                rows + 1
+            )
+            .as_bytes(),
+        );
+        viewer.process(t.replay().as_bytes());
+        viewer
+    }
+
+    #[test]
+    fn replay_reproduces_the_screen_and_history() {
+        let mut t = Terminal::with_history(20, 3, 10);
+        t.feed(b"line 1\r\nline 2\r\nthis line is longer than twenty\r\nline 4\r\n");
+        t.feed(b"\x1b[1;31mred\x1b[m \x1b[48;5;200mbg\x1b[m\r\n$ \x1b[4m");
+        t.feed(b"\x1b[?2004h\x1b[?1004h");
+        let v = viewer(&t);
+        let (agent, screen) = (t.parser.screen(), v.screen());
+        assert_eq!(
+            screen.rows(0, 20).take(3).collect::<Vec<_>>(),
+            agent.rows(0, 20).collect::<Vec<_>>()
+        );
+        assert_eq!(screen.cursor_position(), agent.cursor_position());
+        assert_eq!(screen.cell(1, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+        assert!(screen.cell(1, 0).unwrap().bold());
+        assert_eq!(screen.cell(1, 4).unwrap().bgcolor(), vt100::Color::Idx(200));
+        // Input modes, and what the agent prints next keeps its attributes.
+        assert!(screen.bracketed_paste());
+        assert!(t.replay().ends_with("\x1b[?1004h"));
+        assert!(screen.underline());
+        // The status bar below the agent's rows is untouched.
+        assert_eq!(screen.rows(0, 20).nth(3).unwrap(), "status bar");
+
+        // The viewer's scrollback: its old screen, then the history, the
+        // wrapped line joined (and wrapped again at the viewer's width). A
+        // line wrapped from history onto the screen would come in two.
+        let mut all = String::new();
+        let range = vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default());
+        v.screen()
+            .write_contents_formatted_basic(&mut all, range)
+            .unwrap();
+        let all: String = vt100::capture::basic_formatted_to_plain(&all).collect();
+        let lines: Vec<&str> = all.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines,
+            [
+                "old screen",
+                "line 1",
+                "line 2",
+                "this line is longer than twenty",
+                "line 4",
+                "red bg",
+                "$ ",
+                "status bar"
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_of_the_alternate_screen() {
+        let mut t = Terminal::with_history(20, 3, 10);
+        t.feed(b"shell\r\n\x1b[?1049h\x1b[2;3Hfull screen");
+        let v = viewer(&t);
+        assert!(v.screen().alternate_screen());
+        assert_eq!(v.screen().rows(0, 20).nth(1).unwrap(), "  full screen");
+        assert_eq!(v.screen().cursor_position(), (1, 13));
+    }
+
+    #[test]
+    fn focus_reporting_follows_the_agent() {
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"\x1b[?1004;2004h");
+        assert!(t.replay().contains("\x1b[?1004h"));
+        t.feed(b"\x1b[?1004l");
+        assert!(!t.replay().contains("\x1b[?1004h"));
+    }
+
+    #[test]
+    fn text_is_history_then_screen() {
+        let mut t = Terminal::with_history(10, 2, 10);
+        t.feed(b"one\r\n\x1b[1mtwo\x1b[m\r\nthree and more\r\n");
+        assert_eq!(t.text(), "one\ntwo\nthree and more");
     }
 
     #[test]

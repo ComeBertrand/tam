@@ -8,7 +8,6 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
     pub spawn: Option<SpawnConfig>,
-    pub daemon: Option<DaemonConfig>,
     pub session: Option<SessionConfig>,
     pub tui: Option<TuiConfig>,
 }
@@ -17,11 +16,6 @@ pub struct ConfigFile {
 pub struct SpawnConfig {
     #[serde(alias = "agent")]
     pub default_agent: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DaemonConfig {
-    pub scrollback: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,7 +46,6 @@ impl CustomCommand {
 #[derive(Debug)]
 pub struct Config {
     pub default_agent: String,
-    pub scrollback: usize,
     pub finder: Option<String>,
     pub commands: Vec<CustomCommand>,
 }
@@ -61,7 +54,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_agent: "claude".into(),
-            scrollback: 1_048_576,
             finder: None,
             commands: Vec::new(),
         }
@@ -78,12 +70,6 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         .and_then(|s| s.default_agent.clone())
         .unwrap_or(defaults.default_agent);
 
-    let scrollback = file
-        .daemon
-        .as_ref()
-        .and_then(|d| d.scrollback)
-        .unwrap_or(defaults.scrollback);
-
     let finder = file.session.as_ref().and_then(|s| s.finder.clone());
 
     let commands = file
@@ -95,7 +81,6 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
 
     Ok(Config {
         default_agent,
-        scrollback,
         finder,
         commands,
     })
@@ -308,7 +293,13 @@ mod tests {
     fn defaults() {
         let config = Config::default();
         assert_eq!(config.default_agent, "claude");
-        assert_eq!(config.scrollback, 1_048_576);
+    }
+
+    #[test]
+    fn retired_daemon_scrollback_setting_is_ignored() {
+        // Its byte buffer is gone: the daemon keeps the agent's terminal.
+        let config = parse_config("[daemon]\nscrollback = 1048576\n").unwrap();
+        assert_eq!(config.default_agent, "claude");
     }
 
     #[test]

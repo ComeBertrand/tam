@@ -323,7 +323,8 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
-    /// Fetch the tail of an agent's scrollback buffer.
+    /// The text of an agent's terminal, without formatting: its history,
+    /// then its screen. Replies `Scrollback`.
     Scrollback {
         id: String,
     },

@@ -99,6 +99,11 @@ adopt). `tam-cli` depends on all three.
   the connection loop, last change always sent). The TUI preview
   (`tui/peek.rs`) draws the cells itself (tui-term pins vt100 0.16), follows
   `ScreenUpdated`, and unwatches while attached (it reads nothing then).
+  Attach replays from it (`Terminal::replay`, taken with the output
+  subscription under the terminal lock): history as lines into the viewer's
+  own scrollback, the screen row by row (erase-line only: rows below, the
+  TUI's status bar, stay), cursor, attributes, input modes (focus reporting
+  tracked in the parser callbacks). `Scrollback` returns its plain text.
   Line reads on both ends of the socket use `read_until`: `read_line` loses
   a partly read line when `select!` cancels it.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,

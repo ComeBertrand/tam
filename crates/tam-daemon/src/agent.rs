@@ -16,7 +16,6 @@ use tokio::sync::{broadcast, watch};
 use tracing::error;
 
 use crate::provider::{HookData, HookResult, Provider};
-use crate::scrollback::ScrollbackBuffer;
 use crate::terminal::{self, Terminal};
 
 /// Lightweight metadata for context refresh — collected under lock, IO done outside.
@@ -36,7 +35,6 @@ pub struct Agent {
     state: AgentState,
     child: Child,
     pty_master: Arc<OwnedFd>,
-    scrollback: Arc<Mutex<ScrollbackBuffer>>,
     /// The screen of the PTY, at its size. Locked by the reader while it
     /// takes in and relays a chunk of output.
     terminal: Arc<Mutex<Terminal>>,
@@ -120,7 +118,6 @@ impl Agent {
         };
 
         let master = Arc::new(master);
-        let scrollback = Arc::new(Mutex::new(ScrollbackBuffer::default()));
         let terminal = Arc::new(Mutex::new(Terminal::new(
             terminal::DEFAULT_COLS,
             terminal::DEFAULT_ROWS,
@@ -129,11 +126,10 @@ impl Agent {
         let (output_tx, _) = broadcast::channel(64);
         let last_output_at = Arc::new(Mutex::new(Instant::now()));
 
-        // Spawn a reader thread that drains PTY output into the terminal,
-        // scrollback + broadcast
+        // Spawn a reader thread that drains PTY output into the terminal +
+        // broadcast
         let reader_handle = {
             let reader = PtyReader {
-                scrollback: scrollback.clone(),
                 terminal: terminal.clone(),
                 screen_changed: screen_changed.clone(),
                 output_tx: output_tx.clone(),
@@ -152,7 +148,6 @@ impl Agent {
             state: AgentState::Working,
             child,
             pty_master: master,
-            scrollback,
             terminal,
             screen_changed,
             output_tx,
@@ -348,14 +343,18 @@ impl Agent {
         self.viewers.clone()
     }
 
-    /// Subscribe to live PTY output. Returns a broadcast receiver.
-    pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
-        self.output_tx.subscribe()
+    /// For a viewer attaching (its terminal at the PTY's size): what to
+    /// show it first, the terminal's state (see `Terminal::replay`), and
+    /// the live PTY output after it. Taken under the terminal's lock: each
+    /// byte of output is in exactly one of them.
+    pub fn attach_output(&self) -> (Vec<u8>, broadcast::Receiver<Vec<u8>>) {
+        let terminal = lock(&self.terminal);
+        (terminal.replay().into_bytes(), self.output_tx.subscribe())
     }
 
-    /// Get a copy of the current scrollback buffer contents.
-    pub fn scrollback_contents(&self) -> Vec<u8> {
-        self.scrollback.lock().unwrap().to_vec()
+    /// The text of the agent's terminal: history, then screen.
+    pub fn text(&self) -> String {
+        lock(&self.terminal).text()
     }
 
     /// Get a clone of the PTY master fd (kept alive by Arc).
@@ -447,7 +446,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Where the PTY reader takes the agent's output.
 struct PtyReader {
-    scrollback: Arc<Mutex<ScrollbackBuffer>>,
     terminal: Arc<Mutex<Terminal>>,
     screen_changed: watch::Sender<()>,
     output_tx: broadcast::Sender<Vec<u8>>,
@@ -456,8 +454,8 @@ struct PtyReader {
 
 impl PtyReader {
     /// Blocking loop that reads PTY master output, tracks when output last
-    /// arrived, feeds the terminal and the scrollback buffer, and broadcasts
-    /// it to any attached clients. Exits when the PTY slave side is closed
+    /// arrived, feeds the terminal, and broadcasts it to any attached
+    /// clients. Exits when the PTY slave side is closed
     /// (agent exits).
     fn run(self, master_fd: i32) {
         let mut buf = [0u8; 4096];
@@ -472,9 +470,6 @@ impl PtyReader {
                     {
                         let mut terminal = lock(&self.terminal);
                         terminal.feed(&data);
-                        if let Ok(mut sb) = self.scrollback.lock() {
-                            sb.write(&data);
-                        }
                         // Ignore send errors (no receivers is fine)
                         let _ = self.output_tx.send(data);
                     }

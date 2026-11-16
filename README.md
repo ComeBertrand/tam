@@ -171,9 +171,6 @@ auto_init = true              # run .tam.toml after worktree creation
 max_depth = 5
 ignore = [".*", "node_modules", "target"]
 
-[daemon]
-scrollback = 1048576
-
 [notify]
 command = "notify-send 'tam: {task}' '{kind}: {message}'"
 on_states = ["input", "blocked", "question", "error"]   # default

@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use tam_proto::{
-    AgentInfo, MemberInfo, NewMember, Request, Response, RunInfo, ServerMessage, SessionChoice,
-    TaskInfo, WorktreeReport,
+    AgentInfo, MemberInfo, NewMember, Request, Response, RunInfo, ScreenInfo, ServerMessage,
+    SessionChoice, TaskInfo, WorktreeReport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
@@ -40,6 +40,8 @@ pub struct Client {
     writer: tokio::net::unix::OwnedWriteHalf,
     /// Events that arrived while waiting for a response, oldest first.
     pending_events: VecDeque<tam_proto::Event>,
+    /// The message being read, kept when a read is cancelled.
+    line: Vec<u8>,
 }
 
 impl Client {
@@ -57,6 +59,7 @@ impl Client {
                     reader: BufReader::new(reader),
                     writer,
                     pending_events: VecDeque::new(),
+                    line: Vec::new(),
                 };
                 client.handshake().await?;
                 Ok(Some(client))
@@ -96,6 +99,7 @@ impl Client {
             reader: BufReader::new(reader),
             writer,
             pending_events: VecDeque::new(),
+            line: Vec::new(),
         };
         client.handshake().await?;
         Ok(client)
@@ -156,15 +160,7 @@ impl Client {
         self.writer.write_all(json.as_bytes()).await?;
 
         loop {
-            let mut line = String::new();
-            self.reader
-                .read_line(&mut line)
-                .await
-                .context("lost connection to daemon")?;
-
-            let msg: ServerMessage =
-                serde_json::from_str(line.trim()).context("failed to parse daemon message")?;
-            match msg {
+            match self.next_message().await? {
                 ServerMessage::Response(resp) => return Ok(resp),
                 ServerMessage::Event(event) => self.pending_events.push_back(event),
             }
@@ -173,21 +169,27 @@ impl Client {
 
     /// Read the next message from the daemon (blocking).
     /// Returns buffered events first, then waits on the socket.
+    /// Cancel-safe: a message partly read is finished by the next call.
     pub async fn read_message(&mut self) -> Result<ServerMessage> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(ServerMessage::Event(event));
         }
+        self.next_message().await
+    }
 
-        let mut line = String::new();
+    /// The next message on the socket. `read_until` keeps what it read in
+    /// `self.line` when cancelled (`read_line` would drop it).
+    async fn next_message(&mut self) -> Result<ServerMessage> {
         let n = self
             .reader
-            .read_line(&mut line)
+            .read_until(b'\n', &mut self.line)
             .await
             .context("lost connection to daemon")?;
         if n == 0 {
             anyhow::bail!("lost connection to daemon");
         }
-        serde_json::from_str(line.trim()).context("failed to parse daemon message")
+        let line = std::mem::take(&mut self.line);
+        serde_json::from_slice(line.trim_ascii()).context("failed to parse daemon message")
     }
 
     /// Receive pushed daemon events on this connection (see `read_message`).
@@ -333,6 +335,30 @@ impl Client {
         match self.send(request).await? {
             Response::Task { task, .. } => Ok(task),
             other => Err(unexpected("AdoptWorktree", other)),
+        }
+    }
+
+    /// An agent's terminal screen: live, or scrolled back to line `from`.
+    pub async fn screen(&mut self, id: &str, from: Option<u64>) -> Result<ScreenInfo> {
+        let request = Request::Screen {
+            id: id.into(),
+            from,
+        };
+        match self.send(request).await? {
+            Response::Screen { screen } => Ok(screen),
+            other => Err(unexpected("Screen", other)),
+        }
+    }
+
+    /// Receive `ScreenUpdated` events for this agent's screen (only), or
+    /// with `None` for no screen.
+    pub async fn watch_screen(&mut self, id: Option<&str>) -> Result<()> {
+        let request = Request::WatchScreen {
+            id: id.map(str::to_string),
+        };
+        match self.send(request).await? {
+            Response::Ok => Ok(()),
+            other => Err(unexpected("WatchScreen", other)),
         }
     }
 

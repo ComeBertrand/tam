@@ -69,7 +69,7 @@ tam
 
 - **Task = worktree + agent** — `tam new feat` creates a branch, a worktree, and optionally starts an agent, all under one name
 - **Derived status** — never stores lifecycle state; computes it from the daemon, git, and filesystem every time you look
-- **TUI dashboard** — real-time task table with peek mode (scrollback preview without attaching)
+- **TUI dashboard** — real-time task table with peek mode (the agent's live screen and its history, without attaching)
 - **Session resume** — a task picks up its current session with no question asked, or starts a fresh one on request; session history is tracked in an append-only ledger
 - **Auto-daemon** — the daemon starts on first command and shuts down after 30s idle; no manual management
 - **Per-repo init** — `.tam.toml` copies untracked files and runs setup commands in new worktrees
@@ -143,7 +143,7 @@ Running `tam` with no arguments opens the dashboard:
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
+Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), `p` toggles peek (the agent's screen, kept by the daemon at the agent's terminal size; `PgUp`/`PgDn` scroll through its history, `Home` goes to the oldest line, `End` back to live), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
 
 Tasks are sorted by repository name, then by status priority (blocked/question → error → input → running → idle → stale → gone), then by task name.
 

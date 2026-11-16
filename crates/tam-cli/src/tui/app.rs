@@ -6,6 +6,8 @@ use tam_proto::{AgentInfo, TaskInfo};
 use crate::config::CustomCommand;
 use crate::task::{Member, Task};
 
+use super::peek::Peek;
+
 pub enum Mode {
     Normal,
     NewTaskPickProject(PickerState),
@@ -107,7 +109,8 @@ pub struct App {
     pub selected: usize,
     pub status: Option<(String, Instant)>,
     pub mode: Mode,
-    pub peek: Option<String>,
+    /// The preview pane, when shown.
+    pub peek: Option<Peek>,
     pub filter: String,
     pub filter_active: bool,
     pub commands: Vec<CustomCommand>,
@@ -290,6 +293,20 @@ impl App {
             }
         }
         self.status.as_ref().map(|(msg, _)| msg.as_str())
+    }
+
+    /// The agent the preview pane should show: the selected task's.
+    pub fn peek_agent(&self) -> Option<String> {
+        self.selected_task()
+            .and_then(Task::agent_info)
+            .map(|a| a.id.clone())
+    }
+
+    /// The preview pane shows another agent than the one it should.
+    pub fn peek_stale(&self) -> bool {
+        self.peek
+            .as_ref()
+            .is_some_and(|p| p.agent != self.peek_agent())
     }
 
     /// Count tasks needing attention (input, blocked, question or error).

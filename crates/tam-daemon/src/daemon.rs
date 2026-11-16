@@ -13,7 +13,7 @@ use tam_proto::{
 use tam_worktree::worktree;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
@@ -56,6 +56,10 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// How often the daemon checks the members' worktrees against git.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Least time between two `ScreenUpdated` events on a connection: a busy
+/// agent redraws far more often than a viewer needs.
+const SCREEN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 impl Daemon {
     /// A daemon serving `socket_path` and owning the ledger at `ledger_path`
@@ -465,6 +469,31 @@ async fn next_event(
     }
 }
 
+/// The agent whose screen a connection watches (`Request::WatchScreen`).
+struct ScreenWatch {
+    id: String,
+    changes: watch::Receiver<()>,
+    /// No update before this instant (throttling).
+    quiet_until: Option<tokio::time::Instant>,
+}
+
+/// Next update of the screen watched on a connection: at most one per
+/// `SCREEN_UPDATE_INTERVAL`, a change during the interval comes at its end.
+/// `None` once the agent is gone; never resolves without a watch.
+/// Cancel-safe.
+async fn next_screen_update(watch: &mut Option<ScreenWatch>) -> Option<String> {
+    let Some(watch) = watch else {
+        return std::future::pending().await;
+    };
+    if let Some(until) = watch.quiet_until {
+        tokio::time::sleep_until(until).await;
+        watch.quiet_until = None;
+    }
+    watch.changes.changed().await.ok()?;
+    watch.quiet_until = Some(tokio::time::Instant::now() + SCREEN_UPDATE_INTERVAL);
+    Some(watch.id.clone())
+}
+
 /// Handle a single client connection.
 /// Starts as newline-delimited JSON request/response.
 /// If the client sends an Attach request, switches to raw byte streaming.
@@ -472,6 +501,7 @@ async fn next_event(
 /// lines between responses.
 async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> Result<()> {
     let mut event_rx: Option<broadcast::Receiver<Event>> = None;
+    let mut screen_watch: Option<ScreenWatch> = None;
     // Track connected clients for auto-shutdown
     let client_counter = state.lock().await.connected_clients.clone();
     client_counter.fetch_add(1, Ordering::Relaxed);
@@ -481,16 +511,18 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
 
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
+    // Bytes, not a String: `read_until` keeps a partly read line when an
+    // event cancels it (`read_line` would lose it).
+    let mut line = Vec::new();
 
     loop {
         tokio::select! {
-            result = buf_reader.read_line(&mut line) => {
+            result = buf_reader.read_until(b'\n', &mut line) => {
                 if result? == 0 {
                     break; // client disconnected
                 }
 
-                let request: Request = match serde_json::from_str(line.trim()) {
+                let request: Request = match serde_json::from_slice(line.trim_ascii()) {
                     Ok(r) => r,
                     Err(e) => {
                         let resp = Response::Error {
@@ -538,6 +570,27 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                     // Subscribe before replying: no event after the Ok is missed.
                     event_rx = Some(state.lock().await.event_tx.subscribe());
                     write_response(&mut writer, &Response::Ok).await?;
+                } else if let Request::WatchScreen { id } = request {
+                    let response = match id {
+                        None => {
+                            screen_watch = None;
+                            Response::Ok
+                        }
+                        Some(id) => match state.lock().await.agents.get(&id) {
+                            Some(agent) => {
+                                screen_watch = Some(ScreenWatch {
+                                    changes: agent.screen_changes(),
+                                    id,
+                                    quiet_until: None,
+                                });
+                                Response::Ok
+                            }
+                            None => Response::Error {
+                                message: format!("agent '{}' not found", id),
+                            },
+                        },
+                    };
+                    write_response(&mut writer, &response).await?;
                 } else {
                     let response = dispatch(request, &state).await;
                     write_response(&mut writer, &response).await?;
@@ -559,6 +612,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            update = next_screen_update(&mut screen_watch) => {
+                match update {
+                    Some(id) => write_event(&mut writer, &Event::ScreenUpdated { id }).await?,
+                    // The agent is gone.
+                    None => screen_watch = None,
                 }
             }
         }
@@ -783,6 +843,17 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::AdoptWorktree { dir, name, join } => {
             handle_adopt_worktree(state, dir, name, join).await
         }
+        Request::Screen { id, from } => match state.lock().await.agents.get(&id) {
+            Some(agent) => Response::Screen {
+                screen: agent.screen(from),
+            },
+            None => Response::Error {
+                message: format!("agent '{}' not found", id),
+            },
+        },
+        Request::WatchScreen { .. } => Response::Error {
+            message: "watch_screen should be handled by connection handler".into(),
+        },
     }
 }
 

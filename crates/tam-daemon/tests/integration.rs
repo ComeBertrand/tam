@@ -2138,3 +2138,198 @@ async fn adopt_can_join_an_existing_task() {
     assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
     assert!(!api.exists() && !web.exists());
 }
+
+// ---------------------------------------------------------------------------
+// Screen
+// ---------------------------------------------------------------------------
+
+async fn spawn_sh(conn: &mut Conn, id: &str, script: &str) {
+    let resp = conn
+        .request(&Request::Spawn {
+            provider: "sh".into(),
+            dir: PathBuf::from("/tmp"),
+            id: Some(id.into()),
+            args: vec!["-c".into(), script.into()],
+            resume_session: None,
+            prompt: None,
+            member: None,
+        })
+        .await;
+    assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+}
+
+async fn screen(conn: &mut Conn, id: &str, from: Option<u64>) -> tam_proto::ScreenInfo {
+    match conn
+        .request(&Request::Screen {
+            id: id.into(),
+            from,
+        })
+        .await
+    {
+        Response::Screen { screen } => screen,
+        other => panic!("expected Screen, got {other:?}"),
+    }
+}
+
+/// The rows of a screen reply, as a viewer draws them.
+fn screen_rows(info: &tam_proto::ScreenInfo) -> Vec<String> {
+    let size = |n: u16| std::num::NonZeroU16::new(n).unwrap();
+    let mut parser = vt100::Parser::new(size(info.rows), size(info.cols), 0);
+    parser.process(info.contents.as_bytes());
+    parser.screen().rows(0, info.cols).collect()
+}
+
+/// Poll the live screen until a row is `row`.
+async fn wait_screen_row(conn: &mut Conn, id: &str, row: &str) -> tam_proto::ScreenInfo {
+    let mut last = Vec::new();
+    for _ in 0..100 {
+        let info = screen(conn, id, None).await;
+        if screen_rows(&info).iter().any(|r| r == row) {
+            return info;
+        }
+        last = screen_rows(&info);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no row {row:?} on the screen: {last:?}");
+}
+
+/// `ScreenUpdated` events for `id` received within `ms`.
+async fn count_screen_updates(conn: &mut Conn, id: &str, ms: u64) -> usize {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let mut count = 0;
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, conn.read()).await {
+        if matches!(msg, ServerMessage::Event(tam_proto::Event::ScreenUpdated { id: ref i }) if i == id)
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+#[tokio::test]
+async fn screen_is_the_agent_terminal_at_its_pty_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut conn = Conn::connect(&sock).await;
+    // A new PTY has the terminal's size (not 0x0).
+    spawn_sh(
+        &mut conn,
+        "size",
+        "echo \"size=$(stty size)\"; trap 'echo \"size=$(stty size)\"' WINCH; \
+         while :; do sleep 0.05; done",
+    )
+    .await;
+    let info = wait_screen_row(&mut conn, "size", "size=24 80").await;
+    assert_eq!((info.cols, info.rows), (80, 24));
+
+    let resp = conn
+        .request(&Request::Resize {
+            id: "size".into(),
+            cols: 100,
+            rows: 30,
+        })
+        .await;
+    assert!(matches!(resp, Response::Ok), "{resp:?}");
+    let info = wait_screen_row(&mut conn, "size", "size=30 100").await;
+    assert_eq!((info.cols, info.rows), (100, 30));
+
+    let resp = conn
+        .request(&Request::Screen {
+            id: "nope".into(),
+            from: None,
+        })
+        .await;
+    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+}
+
+#[tokio::test]
+async fn screen_scrolls_back_to_numbered_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut conn = Conn::connect(&sock).await;
+    // Output ends without a newline: once "end" shows, nothing moves.
+    spawn_sh(&mut conn, "seq", "seq 1 60; printf end; sleep 3600").await;
+    let live = wait_screen_row(&mut conn, "seq", "end").await;
+    // 61 rows on 24: lines 1-37 in history.
+    assert_eq!((live.oldest, live.live, live.top), (0, 37, 37));
+    assert_eq!(screen_rows(&live)[0], "38");
+
+    let back = screen(&mut conn, "seq", Some(10)).await;
+    assert_eq!(back.top, 10);
+    assert_eq!(screen_rows(&back)[0], "11");
+    assert_eq!(screen_rows(&back)[23], "34");
+    // The live screen is left as it was.
+    assert_eq!(screen_rows(&screen(&mut conn, "seq", None).await)[0], "38");
+}
+
+#[tokio::test]
+async fn watched_screen_updates_are_throttled() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut cmd = Conn::connect(&sock).await;
+    // Output every 10ms: about 100 screen changes a second.
+    spawn_sh(&mut cmd, "busy", "while :; do echo tick; sleep 0.01; done").await;
+
+    let mut watcher = Conn::subscribed(&sock).await;
+    let mut other = Conn::subscribed(&sock).await;
+    let resp = watcher
+        .request(&Request::WatchScreen {
+            id: Some("busy".into()),
+        })
+        .await;
+    assert!(matches!(resp, Response::Ok), "{resp:?}");
+
+    // One update per 100ms at most, and they keep coming.
+    let (watched, unwatched) = tokio::join!(
+        count_screen_updates(&mut watcher, "busy", 1000),
+        count_screen_updates(&mut other, "busy", 1000),
+    );
+    // (Fewer on a starved machine, but they keep coming.)
+    assert!((2..=11).contains(&watched), "{watched} updates in 1s");
+    // Only the watching connection gets them.
+    assert_eq!(unwatched, 0);
+
+    let resp = watcher.request(&Request::WatchScreen { id: None }).await;
+    assert!(matches!(resp, Response::Ok), "{resp:?}");
+    assert_eq!(count_screen_updates(&mut watcher, "busy", 400).await, 0);
+
+    let resp = watcher
+        .request(&Request::WatchScreen {
+            id: Some("nope".into()),
+        })
+        .await;
+    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+}
+
+#[tokio::test]
+async fn watched_screen_update_follows_a_single_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut cmd = Conn::connect(&sock).await;
+    spawn_sh(&mut cmd, "quiet", "sleep 3600").await;
+    let mut watcher = Conn::connect(&sock).await;
+    let resp = watcher
+        .request(&Request::WatchScreen {
+            id: Some("quiet".into()),
+        })
+        .await;
+    assert!(matches!(resp, Response::Ok), "{resp:?}");
+    assert_eq!(count_screen_updates(&mut watcher, "quiet", 300).await, 0);
+
+    // A resize changes the screen.
+    cmd.request(&Request::Resize {
+        id: "quiet".into(),
+        cols: 90,
+        rows: 20,
+    })
+    .await;
+    assert_eq!(count_screen_updates(&mut watcher, "quiet", 500).await, 1);
+
+    // The agent's exit ends the watch, without breaking the connection.
+    cmd.request(&Request::Kill { id: "quiet".into() }).await;
+    assert_eq!(count_screen_updates(&mut watcher, "quiet", 500).await, 0);
+    assert!(matches!(
+        watcher.request(&Request::List).await,
+        Response::Agents { .. }
+    ));
+}

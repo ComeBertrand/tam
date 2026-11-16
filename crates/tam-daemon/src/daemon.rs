@@ -1,12 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tam_proto::{AgentInfo, AgentState, Event, NewMember, Request, Response, SessionChoice};
+use tam_proto::{
+    AgentInfo, AgentState, Event, MemberHealth, NewMember, Request, Response, SessionChoice,
+    TaskInfo,
+};
+use tam_worktree::worktree;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
@@ -16,11 +20,12 @@ use crate::agent::Agent;
 use crate::ledger::Ledger;
 use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
-use crate::worktrees::{self, Checked, Removal};
+use crate::worktrees::{self, Checked, Observation, Recorded, Removal};
 
 pub struct Daemon {
     socket_path: PathBuf,
     ledger_path: PathBuf,
+    reconcile_every: Duration,
 }
 
 struct DaemonState {
@@ -29,6 +34,10 @@ struct DaemonState {
     ledger: Ledger,
     /// Tasks being dropped: no agent may start in them meanwhile.
     dropping: HashSet<String>,
+    /// Held while git works on members' worktrees (reconcile, repair, drop):
+    /// one at a time, so a reconcile pass never reports a state a repair or a
+    /// drop changed under it. Never taken while holding the state lock.
+    worktrees: Arc<Mutex<()>>,
     next_id: u64,
     shutdown: bool,
     event_tx: broadcast::Sender<Event>,
@@ -45,6 +54,9 @@ const IDLE_TIMEOUT_SECS: u64 = 30;
 /// behind misses events.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// How often the daemon checks the members' worktrees against git.
+pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
 impl Daemon {
     /// A daemon serving `socket_path` and owning the ledger at `ledger_path`
     /// (see [`crate::ledger::default_path`]).
@@ -52,7 +64,15 @@ impl Daemon {
         Self {
             socket_path,
             ledger_path,
+            reconcile_every: RECONCILE_INTERVAL,
         }
+    }
+
+    /// Check the members' worktrees against git every `interval` instead of
+    /// [`RECONCILE_INTERVAL`] (and on start).
+    pub fn reconcile_every(mut self, interval: Duration) -> Self {
+        self.reconcile_every = interval;
+        self
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -91,6 +111,7 @@ impl Daemon {
             agents: HashMap::new(),
             ledger,
             dropping: HashSet::new(),
+            worktrees: Arc::new(Mutex::new(())),
             next_id: 1,
             shutdown: false,
             event_tx,
@@ -125,6 +146,13 @@ impl Daemon {
         let monitor_state = state.clone();
         tokio::spawn(async move {
             state_monitor(monitor_state, notify_config).await;
+        });
+
+        // Check the members' worktrees against git now, then periodically.
+        let reconcile_state = state.clone();
+        let reconcile_every = self.reconcile_every;
+        tokio::spawn(async move {
+            reconcile_loop(reconcile_state, reconcile_every).await;
         });
 
         loop {
@@ -745,6 +773,16 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             )
             .await
         }
+        Request::Reconcile => {
+            reconcile(state).await;
+            Response::Tasks {
+                tasks: state.lock().await.ledger.tasks(),
+            }
+        }
+        Request::RepairMember { member } => handle_repair_member(state, &member).await,
+        Request::AdoptWorktree { dir, name, join } => {
+            handle_adopt_worktree(state, dir, name, join).await
+        }
     }
 }
 
@@ -1096,9 +1134,12 @@ async fn handle_create_task(
     name: &str,
     members: &[NewMember],
 ) -> Response {
+    // Created with its worktrees' health known (git runs before the lock).
+    let observed = observe(members.iter().map(Recorded::from).collect()).await;
     let mut state = state.lock().await;
     match state.ledger.create_task(name, members) {
         Ok(task) => {
+            let task = state.observe_new(task, observed);
             for m in &task.members {
                 info!(task = %name, member = %m.id, dir = %m.dir.display(), "task member added");
             }
@@ -1145,7 +1186,10 @@ async fn handle_drop_task(
         dirs
     };
 
+    let worktrees = state.lock().await.worktrees.clone();
+    let held = worktrees.lock().await;
     let removal = stop_and_remove(state, name, dirs, force, delete_branch).await;
+    drop(held);
 
     let mut state = state.lock().await;
     state.dropping.remove(name);
@@ -1234,4 +1278,263 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| Response::Error {
             message: format!("drop failed: {e}"),
         })
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation with git, and the actions on members' worktrees
+// ---------------------------------------------------------------------------
+
+/// Check the members' worktrees against git on start, then every `every`.
+async fn reconcile_loop(state: Arc<Mutex<DaemonState>>, every: Duration) {
+    let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if state.lock().await.shutdown {
+            break;
+        }
+        reconcile(&state).await;
+    }
+}
+
+/// Check every member's worktree against git and record its health,
+/// pushing `TaskUpdated` for each task where it changed. Observes only:
+/// nothing is created, removed, or written to the ledger file.
+async fn reconcile(state: &Arc<Mutex<DaemonState>>) {
+    let worktrees = state.lock().await.worktrees.clone();
+    let _held = worktrees.lock().await;
+    let (ids, recorded): (Vec<String>, Vec<Recorded>) =
+        state.lock().await.recorded_worktrees().into_iter().unzip();
+    let observed = observe(recorded).await;
+    state
+        .lock()
+        .await
+        .record_health(ids.into_iter().zip(observed));
+}
+
+/// [`worktrees::observe`], off the async runtime.
+async fn observe(recorded: Vec<Recorded>) -> Vec<Observation> {
+    run_git(move || Ok(worktrees::observe(&recorded)))
+        .await
+        .unwrap_or_else(|e| {
+            error!("cannot check worktrees: {e:#}");
+            Vec::new()
+        })
+}
+
+/// Run git work off the async runtime.
+async fn run_git<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow::anyhow!("git work failed: {e}"))?
+}
+
+impl From<&NewMember> for Recorded {
+    fn from(m: &NewMember) -> Self {
+        Recorded {
+            dir: m.dir.clone(),
+            branch: m.branch.clone(),
+            repo: Some(m.repo_root.clone()),
+        }
+    }
+}
+
+impl DaemonState {
+    /// The worktrees of the members of tasks not being dropped, with their
+    /// member ids.
+    fn recorded_worktrees(&self) -> Vec<(String, Recorded)> {
+        self.ledger
+            .tasks()
+            .into_iter()
+            .filter(|t| !self.dropping.contains(&t.name))
+            .flat_map(|t| t.members)
+            .map(|m| {
+                let recorded = Recorded {
+                    repo: self.ledger.repo_root(&m.id),
+                    dir: m.dir,
+                    branch: m.branch,
+                };
+                (m.id, recorded)
+            })
+            .collect()
+    }
+
+    /// Record observed health, pushing `TaskUpdated` for each task where it
+    /// changed. Members dropped, or being dropped, meanwhile are skipped.
+    fn record_health(&mut self, observed: impl IntoIterator<Item = (String, Observation)>) {
+        let mut changed = BTreeSet::new();
+        for (member, observation) in observed {
+            let Some(task) = self.ledger.member_task(&member) else {
+                continue;
+            };
+            if self.dropping.contains(task) {
+                continue;
+            }
+            let was_unhealthy = self
+                .ledger
+                .health(&member)
+                .is_some_and(MemberHealth::is_unhealthy);
+            let health = observation.health.clone();
+            if let Some(task) = self
+                .ledger
+                .observe(&member, observation.health, observation.repo)
+            {
+                if health.is_unhealthy() {
+                    warn!(task = %task, member = %member, health = ?health, "member worktree unhealthy");
+                } else if was_unhealthy {
+                    info!(task = %task, member = %member, "member worktree back");
+                }
+                changed.insert(task);
+            }
+        }
+        for name in changed {
+            if let Some(task) = self.ledger.task(&name) {
+                self.broadcast(Event::TaskUpdated { task });
+            }
+        }
+    }
+
+    /// Record the observed health of a task's new members (`observed` in
+    /// member order) and return the task with it. Pushes nothing: the caller
+    /// announces the task.
+    fn observe_new(&mut self, task: TaskInfo, observed: Vec<Observation>) -> TaskInfo {
+        for (member, o) in task.members.iter().zip(observed) {
+            self.ledger.observe(&member.id, o.health, o.repo);
+        }
+        self.ledger.task(&task.name).unwrap_or(task)
+    }
+}
+
+/// Recreate a gone member's worktree on its branch (`Request::RepairMember`).
+/// Holds the worktree lock, so no reconcile pass or drop runs meanwhile;
+/// [`worktree::recreate`] checks again right before acting.
+async fn handle_repair_member(state: &Arc<Mutex<DaemonState>>, target: &str) -> Response {
+    let error = |message: String| Response::Error { message };
+    let worktrees = state.lock().await.worktrees.clone();
+    let _held = worktrees.lock().await;
+
+    let (label, member, repo) = {
+        let state = state.lock().await;
+        let (task, member) = match state.ledger.resolve(target) {
+            Ok(found) => found,
+            Err(e) => return error(format!("{e:#}")),
+        };
+        let label = task.member_label(&member);
+        if state.dropping.contains(&task.name) {
+            return error(format!("task '{}' is being dropped", task.name));
+        }
+        if state.agents.contains_key(&member.id) {
+            return error(format!("'{label}' has a running agent: stop it first"));
+        }
+        let Some(repo) = state.ledger.repo_root(&member.id) else {
+            return error(format!(
+                "cannot recreate the worktree of '{label}': its repository is unknown \
+                 (a task from an older tam)"
+            ));
+        };
+        (label, member, repo)
+    };
+
+    let (dir, branch, at) = (member.dir.clone(), member.branch.clone(), repo.clone());
+    if let Err(e) = run_git(move || worktree::recreate(&at, &dir, &branch)).await {
+        return error(format!("cannot recreate the worktree of '{label}': {e:#}"));
+    }
+    info!(member = %member.id, dir = %member.dir.display(), "worktree recreated");
+
+    let observed = observe(vec![Recorded {
+        dir: member.dir.clone(),
+        branch: member.branch.clone(),
+        repo: Some(repo),
+    }])
+    .await;
+    let mut state = state.lock().await;
+    state.record_health(observed.into_iter().map(|o| (member.id.clone(), o)));
+    match state.ledger.member(&member.id) {
+        Some((task, member)) => Response::Member {
+            runs: state.ledger.member_runs(&member.id),
+            task,
+            member: Box::new(member),
+        },
+        None => error(format!("'{label}' was dropped meanwhile")),
+    }
+}
+
+/// Turn the existing worktree containing `dir` into a member: of a new task
+/// (`name`, default its branch) or of the task `join`.
+async fn handle_adopt_worktree(
+    state: &Arc<Mutex<DaemonState>>,
+    dir: PathBuf,
+    name: Option<String>,
+    join: Option<String>,
+) -> Response {
+    let error = |message: String| Response::Error { message };
+    if name.is_some() && join.is_some() {
+        return error("adopt into a new task (name) or an existing one (join), not both".into());
+    }
+    let member = match run_git(move || worktrees::adoptable(&dir)).await {
+        Ok(member) => member,
+        Err(e) => return error(format!("cannot adopt: {e:#}")),
+    };
+    let observed = observe(vec![Recorded::from(&member)]).await;
+    // Only a worktree its repository lists (e.g. not one of a bare
+    // repository, whose root tam cannot tell).
+    let why_not = match observed.first().map(|o| &o.health) {
+        Some(MemberHealth::Ok { .. }) => None,
+        Some(MemberHealth::Broken { problem }) => Some(problem.clone()),
+        Some(MemberHealth::Gone { .. }) => Some("it is gone".into()),
+        None => Some("it could not be checked".into()),
+    };
+    if let Some(why) = why_not {
+        return error(format!("cannot adopt {}: {why}", member.dir.display()));
+    }
+
+    let mut state = state.lock().await;
+    // Recorded directories may go through symlinks: compare them resolved.
+    let tasks = state.ledger.tasks();
+    let existing = tasks.iter().find(|t| {
+        t.members
+            .iter()
+            .any(|m| worktree::same_path(&m.dir, &member.dir))
+    });
+    if let Some(task) = existing {
+        return error(format!(
+            "{} is already a member of task '{}'",
+            member.dir.display(),
+            task.name
+        ));
+    }
+    let added = match &join {
+        Some(task) if state.dropping.contains(task) => {
+            return error(format!("task '{task}' is being dropped"));
+        }
+        Some(task) => state.ledger.add_member(task, &member),
+        None => {
+            let name = name.unwrap_or_else(|| member.branch.clone());
+            state
+                .ledger
+                .create_task(&name, std::slice::from_ref(&member))
+        }
+    };
+    let task = match added {
+        Ok(task) => task,
+        Err(e) => return error(format!("{e:#}")),
+    };
+    // The adopted worktree joined last.
+    let id = task
+        .members
+        .last()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+    for o in observed {
+        state.ledger.observe(&id, o.health, o.repo);
+    }
+    let task = state.ledger.task(&task.name).unwrap_or(task);
+    info!(task = %task.name, member = %id, dir = %member.dir.display(), "worktree adopted");
+    if join.is_some() {
+        state.broadcast(Event::TaskUpdated { task: task.clone() });
+    } else {
+        state.broadcast(Event::TaskCreated { task: task.clone() });
+    }
+    let runs = state.ledger.runs(&task.name);
+    Response::Task { task, runs }
 }

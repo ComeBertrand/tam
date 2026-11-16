@@ -213,6 +213,87 @@ pub fn worktree_list(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The repository's common git directory (`.git` of the main checkout, or the
+/// bare repository), from any of its worktrees.
+pub fn common_dir(dir: &Path) -> Result<PathBuf> {
+    let common = PathBuf::from(git(dir, &["rev-parse", "--git-common-dir"])?);
+    if common.is_absolute() {
+        Ok(common)
+    } else {
+        Ok(dir.join(common).canonicalize()?)
+    }
+}
+
+/// Whether the index of the worktree whose git directory is `git_dir` has
+/// staged changes (differs from its HEAD). Needs no working tree: it also
+/// reads the index of a worktree whose directory is gone.
+pub fn has_staged_changes(git_dir: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(git_dir)
+        .output()
+        .context("git is not installed or not in PATH")?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => bail!(
+            "cannot read the index of {}: {}",
+            git_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+/// A worktree of a repository, as `git worktree list --porcelain` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// Its directory, as git recorded it (absolute, symlinks resolved).
+    pub path: PathBuf,
+    /// Branch checked out there; `None` on a detached HEAD (also during a
+    /// rebase) and for a bare repository.
+    pub branch: Option<String>,
+    /// The bare repository itself (no working tree).
+    pub bare: bool,
+    /// Locked (`git worktree lock`): git refuses to remove or prune it.
+    pub locked: bool,
+    /// Git would prune it, e.g. its directory is gone. Older git versions do
+    /// not report it: check the directory instead.
+    pub prunable: bool,
+}
+
+/// The worktrees of the repository containing `dir`, main checkout first.
+pub fn worktree_entries(dir: &Path) -> Result<Vec<WorktreeEntry>> {
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    for line in git_lines(dir, &["worktree", "list", "--porcelain"])? {
+        let (key, value) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+        if key == "worktree" {
+            entries.push(WorktreeEntry {
+                path: PathBuf::from(value),
+                branch: None,
+                bare: false,
+                locked: false,
+                prunable: false,
+            });
+            continue;
+        }
+        let Some(entry) = entries.last_mut() else {
+            continue;
+        };
+        match key {
+            "branch" => {
+                entry.branch = Some(value.strip_prefix("refs/heads/").unwrap_or(value).into())
+            }
+            "bare" => entry.bare = true,
+            "locked" => entry.locked = true,
+            "prunable" => entry.prunable = true,
+            _ => {} // HEAD <sha>, detached
+        }
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +427,47 @@ mod tests {
 
         worktree_remove(&repo, &wt_path).unwrap();
         assert!(!wt_path.exists());
+    }
+
+    #[test]
+    fn test_worktree_entries() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let _ = git(&repo, &["branch", "-M", "main"]);
+        let path = |name: &str| tmp.path().canonicalize().unwrap().join(name);
+        for name in ["feat/x", "detached", "locked", "deleted"] {
+            let wt = tmp.path().join(name.replace('/', "-"));
+            worktree_add_new_branch(&repo, &wt, name, "HEAD").unwrap();
+        }
+        git(&path("detached"), &["checkout", "-q", "--detach"]).unwrap();
+        git(
+            &repo,
+            &["worktree", "lock", "--reason", "usb disk", "../locked"],
+        )
+        .unwrap();
+        fs::remove_dir_all(path("deleted")).unwrap();
+
+        let entries = worktree_entries(&repo).unwrap();
+        let summary: Vec<(PathBuf, Option<&str>, bool, bool)> = entries
+            .iter()
+            .map(|e| (e.path.clone(), e.branch.as_deref(), e.locked, e.bare))
+            .collect();
+        assert_eq!(
+            summary,
+            // Main checkout first, then by path.
+            [
+                (path("repo"), Some("main"), false, false),
+                (path("deleted"), Some("deleted"), false, false),
+                (path("detached"), None, false, false),
+                (path("feat-x"), Some("feat/x"), false, false),
+                (path("locked"), Some("locked"), true, false),
+            ]
+        );
+        assert!(entries[1].prunable, "{:?}", entries[1]);
+        assert!(!entries[3].prunable);
+        // Asked from a linked worktree, the list is the same.
+        assert_eq!(worktree_entries(&path("feat-x")).unwrap(), entries);
     }
 
     #[test]

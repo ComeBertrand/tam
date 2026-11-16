@@ -170,6 +170,52 @@ pub struct MemberInfo {
     pub branch: String,
     /// The member's worktree.
     pub dir: PathBuf,
+    /// What the daemon last saw of the worktree in git; `None` until checked
+    /// (unknown, not gone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<MemberHealth>,
+}
+
+/// What the daemon last saw of a member's worktree, checked against `git
+/// worktree list` of its repository (on start, periodically and on
+/// `Reconcile`). Observed only: the daemon never acts on it by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MemberHealth {
+    /// The member's directory is a worktree of its repository.
+    Ok {
+        /// Branch checked out there now. It may differ from the member's
+        /// (switched, renamed); `None` on a detached HEAD, e.g. mid-rebase.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
+    /// The directory is gone (deleted, or removed with `git worktree remove`).
+    Gone {
+        /// Why `RepairMember` cannot recreate the worktree (e.g. its branch
+        /// was deleted, or is checked out elsewhere); `None` when it can.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cannot_repair: Option<String>,
+    },
+    /// The directory exists but is not a worktree of the repository (e.g. the
+    /// repository moved). A forced drop forgets it, leaving the directory.
+    Broken { problem: String },
+}
+
+impl MemberHealth {
+    /// Whether the worktree is gone or unusable.
+    pub fn is_unhealthy(&self) -> bool {
+        !matches!(self, Self::Ok { .. })
+    }
+
+    /// Whether `RepairMember` can recreate the worktree.
+    pub fn is_repairable(&self) -> bool {
+        matches!(
+            self,
+            Self::Gone {
+                cannot_repair: None
+            }
+        )
+    }
 }
 
 /// A member to create a task with: a worktree the client created.
@@ -335,6 +381,32 @@ pub enum Request {
         args: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+    },
+    /// Check every member's worktree against git now (the daemon also does on
+    /// start and periodically). Replies `Tasks` once done, and pushes
+    /// `TaskUpdated` for each task whose members' health changed. Observes
+    /// only: nothing is created or removed.
+    Reconcile,
+    /// Recreate the worktree of a member whose worktree is gone, on the
+    /// member's branch. Refused, changing nothing, unless its health allows
+    /// it (`MemberHealth::is_repairable`, checked again first) and no agent
+    /// runs for it. Replies `Member`; pushes `TaskUpdated`.
+    RepairMember {
+        /// What `ResolveMember` takes as a target: a member id, a task name
+        /// (its only member) or `<task>/<member>`.
+        member: String,
+    },
+    /// Turn an existing linked worktree, the one containing `dir`, into a
+    /// task member on the branch it has checked out: a new task named `name`
+    /// (default: the branch), or a new member of the task `join`. Refused for
+    /// a main checkout, a detached HEAD, or a worktree a task already has.
+    /// Replies `Task`; pushes `TaskCreated` (new task) or `TaskUpdated`.
+    AdoptWorktree {
+        dir: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        join: Option<String>,
     },
 }
 
@@ -825,6 +897,7 @@ mod tests {
             repo_root: Some(PathBuf::from("/src/myapp")),
             branch: "feat".into(),
             dir: PathBuf::from("/tmp/myapp--feat"),
+            health: None,
         }
     }
 
@@ -1029,6 +1102,101 @@ mod tests {
                 assert_eq!(member.id, "m-1")
             }
             other => panic!("wrong message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_health_wire_format() {
+        let mut member = sample_member("m-1", "myapp");
+        let json = serde_json::to_string(&member).unwrap();
+        assert!(
+            !json.contains("health"),
+            "unknown health is omitted: {json}"
+        );
+
+        for (health, wire) in [
+            (
+                MemberHealth::Ok {
+                    branch: Some("feat".into()),
+                },
+                r#"{"state":"ok","branch":"feat"}"#,
+            ),
+            (MemberHealth::Ok { branch: None }, r#"{"state":"ok"}"#),
+            (
+                MemberHealth::Gone {
+                    cannot_repair: None,
+                },
+                r#"{"state":"gone"}"#,
+            ),
+            (
+                MemberHealth::Gone {
+                    cannot_repair: Some("branch 'feat' no longer exists".into()),
+                },
+                r#"{"state":"gone","cannot_repair":"branch 'feat' no longer exists"}"#,
+            ),
+            (
+                MemberHealth::Broken {
+                    problem: "not a worktree".into(),
+                },
+                r#"{"state":"broken","problem":"not a worktree"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&health).unwrap(), wire);
+            member.health = Some(health.clone());
+            let back: MemberInfo =
+                serde_json::from_str(&serde_json::to_string(&member).unwrap()).unwrap();
+            assert_eq!(back.health, Some(health));
+        }
+    }
+
+    #[test]
+    fn member_health_predicates() {
+        let ok = MemberHealth::Ok { branch: None };
+        let repairable = MemberHealth::Gone {
+            cannot_repair: None,
+        };
+        let lost = MemberHealth::Gone {
+            cannot_repair: Some("no branch".into()),
+        };
+        let broken = MemberHealth::Broken {
+            problem: "x".into(),
+        };
+        assert!(!ok.is_unhealthy() && !ok.is_repairable());
+        assert!(repairable.is_unhealthy() && repairable.is_repairable());
+        assert!(lost.is_unhealthy() && !lost.is_repairable());
+        assert!(broken.is_unhealthy() && !broken.is_repairable());
+    }
+
+    #[test]
+    fn reconcile_requests_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&Request::Reconcile).unwrap(),
+            r#"{"type":"reconcile"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::RepairMember {
+                member: "feat/api".into()
+            })
+            .unwrap(),
+            r#"{"type":"repair_member","member":"feat/api"}"#
+        );
+        let json = serde_json::to_string(&Request::AdoptWorktree {
+            dir: PathBuf::from("/w/app--fix"),
+            name: None,
+            join: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"adopt_worktree","dir":"/w/app--fix"}"#);
+        let req: Request =
+            serde_json::from_str(r#"{"type":"adopt_worktree","dir":"/w/web--feat","join":"feat"}"#)
+                .unwrap();
+        match req {
+            Request::AdoptWorktree { dir, name, join } => {
+                assert_eq!(dir, PathBuf::from("/w/web--feat"));
+                assert!(name.is_none());
+                assert_eq!(join.as_deref(), Some("feat"));
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

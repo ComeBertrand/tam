@@ -29,6 +29,16 @@ pub enum Mode {
         title: String,
         lines: Vec<String>,
     },
+    /// A task with a worktree gone or unusable (`lines` say what): recreate
+    /// the worktrees that can be (`repairable`), or drop the task. Deleting
+    /// branches is offered only when some worktree is `in_place`: a drop keeps
+    /// the branch of a gone one.
+    ConfirmRepairOrDrop {
+        name: String,
+        lines: Vec<String>,
+        repairable: bool,
+        in_place: bool,
+    },
 }
 
 pub struct PickerItem {
@@ -263,7 +273,6 @@ impl App {
     pub fn remove_agent(&mut self, id: &str) {
         if let Some(member) = self.member_mut(id) {
             member.agent_info = None;
-            member.refresh_git_status();
             self.sort_tasks();
         }
         self.clamp_selection();
@@ -281,15 +290,6 @@ impl App {
             }
         }
         self.status.as_ref().map(|(msg, _)| msg.as_str())
-    }
-
-    /// Refresh git branch status for members without an agent and re-sort.
-    pub fn refresh_git_status(&mut self) {
-        for t in &mut self.tasks {
-            t.refresh_git_status();
-        }
-        self.sort_tasks();
-        self.clamp_selection();
     }
 
     /// Count tasks needing attention (input, blocked, question or error).

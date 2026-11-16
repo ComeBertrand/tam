@@ -19,6 +19,10 @@
 //! Ledgers written before tasks had members are migrated on open (see
 //! [`LegacyEvent`]): the old file is kept as `<ledger>.pre-members` and the
 //! ledger is rewritten in the current format.
+//!
+//! Next to the folded tasks, the ledger keeps what reconciliation observed of
+//! the members' worktrees (their health, their repository): in memory only,
+//! never written, like any other derived state.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -29,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tam_proto::{MemberInfo, NewMember, RunInfo, TaskInfo};
+use tam_proto::{MemberHealth, MemberInfo, NewMember, RunInfo, TaskInfo};
 
 /// A single event recorded in the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +183,18 @@ struct MemberRecord {
 struct State {
     tasks: BTreeMap<String, TaskRecord>,
     members: HashMap<String, MemberRecord>,
+    /// What reconciliation last observed of the members' worktrees, by member
+    /// id. In memory only.
+    observed: HashMap<String, Observed>,
+}
+
+/// What reconciliation observed of a member's worktree.
+#[derive(Debug, Clone, Default)]
+struct Observed {
+    health: Option<MemberHealth>,
+    /// The worktree's repository, as found from its directory: lets a gone
+    /// worktree be recreated when the ledger does not record its repository.
+    repo_root: Option<PathBuf>,
 }
 
 /// The daemon's view of the ledger: active tasks, plus the open file.
@@ -750,6 +766,7 @@ impl State {
         if let Some(record) = self.tasks.remove(name) {
             for id in &record.members {
                 self.members.remove(id);
+                self.observed.remove(id);
             }
         }
     }
@@ -780,6 +797,7 @@ impl State {
                     repo_root: m.repo_root.clone(),
                     branch: m.branch.clone(),
                     dir: m.dir.clone(),
+                    health: self.observed.get(&m.id).and_then(|o| o.health.clone()),
                 })
                 .collect(),
             created_at: task.created_at,
@@ -804,6 +822,67 @@ impl State {
             .collect();
         events.sort_by_key(|(seq, _)| *seq);
         events
+    }
+}
+
+/// Members' worktrees as reconciliation observes them, and members joining an
+/// existing task.
+impl Ledger {
+    /// Record what was observed of a member's worktree: its health, and its
+    /// repository when found. Never written to the file. Returns the member's
+    /// task when its health changed (`None` too for an unknown member).
+    pub fn observe(
+        &mut self,
+        member: &str,
+        health: MemberHealth,
+        repo_root: Option<PathBuf>,
+    ) -> Option<String> {
+        let task = self.state.members.get(member)?.task.clone();
+        let observed = self.state.observed.entry(member.to_string()).or_default();
+        if repo_root.is_some() {
+            observed.repo_root = repo_root;
+        }
+        let changed = observed.health.as_ref() != Some(&health);
+        observed.health = Some(health);
+        changed.then_some(task)
+    }
+
+    /// What was last observed of a member's worktree.
+    pub fn health(&self, member: &str) -> Option<&MemberHealth> {
+        self.state.observed.get(member)?.health.as_ref()
+    }
+
+    /// A member's repository: recorded, else last observed.
+    pub fn repo_root(&self, member: &str) -> Option<PathBuf> {
+        let recorded = self.state.members.get(member)?.repo_root.clone();
+        recorded.or_else(|| self.state.observed.get(member)?.repo_root.clone())
+    }
+
+    /// Add a worktree to an existing task as a new member (it joins last).
+    /// Returns the updated task.
+    pub fn add_member(&mut self, task: &str, member: &NewMember) -> Result<TaskInfo> {
+        self.require(task)?;
+        if let Some(existing) = self.state.members.values().find(|e| e.dir == member.dir) {
+            bail!(
+                "directory {} already has an active task: '{}'",
+                member.dir.display(),
+                existing.task
+            );
+        }
+        let Some(repo) = member.repo_root.file_name() else {
+            bail!("invalid repository root {}", member.repo_root.display());
+        };
+        let id = new_member_id(|id| self.state.members.contains_key(id));
+        self.append(LedgerEvent::MemberAdded {
+            task: task.into(),
+            member: id,
+            repo: repo.to_string_lossy().into_owned(),
+            repo_root: Some(member.repo_root.clone()),
+            branch: member.branch.clone(),
+            dir: member.dir.clone(),
+            timestamp: now(),
+        })?;
+        Ok(self.task(task).expect("task exists"))
     }
 }
 
@@ -1673,6 +1752,130 @@ mod tests {
         assert_eq!(ledger.tasks().len(), 2);
         assert_eq!(ledger.task("old").unwrap().run_count, 1);
         assert_eq!(ledger.member("m-n").unwrap().0.name, "new");
+    }
+
+    fn ok(branch: &str) -> MemberHealth {
+        MemberHealth::Ok {
+            branch: Some(branch.into()),
+        }
+    }
+
+    #[test]
+    fn observed_health_shows_in_task_info_and_is_never_written() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let m = create(&mut ledger, "feat", "/w/app--feat");
+        assert_eq!(ledger.task("feat").unwrap().members[0].health, None);
+
+        // First observation, then a change: the task is returned.
+        assert_eq!(
+            ledger.observe(&m, ok("feat"), None).as_deref(),
+            Some("feat")
+        );
+        assert_eq!(ledger.observe(&m, ok("feat"), None), None, "unchanged");
+        let gone = MemberHealth::Gone {
+            cannot_repair: None,
+        };
+        assert_eq!(
+            ledger.observe(&m, gone.clone(), None).as_deref(),
+            Some("feat")
+        );
+        assert_eq!(ledger.health(&m), Some(&gone));
+        assert_eq!(ledger.task("feat").unwrap().members[0].health, Some(gone));
+        assert_eq!(
+            ledger.member(&m).unwrap().1.health,
+            ledger.health(&m).cloned()
+        );
+        // Unknown members are ignored.
+        assert_eq!(ledger.observe("m-nope", ok("x"), None), None);
+
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(
+            !before.contains("health") && !before.contains("gone"),
+            "{before}"
+        );
+        drop(ledger);
+        let ledger = Ledger::open(&path).unwrap().0;
+        assert_eq!(ledger.health(&m), None, "not persisted");
+    }
+
+    #[test]
+    fn observed_repo_root_fills_in_for_unrecorded_ones() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        // A migrated member: no repository recorded.
+        write_lines(
+            &path,
+            &[
+                created("old", 1),
+                member_added("old", "m-o", "/w/a--old", 1),
+            ],
+            &[],
+        );
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        assert_eq!(ledger.repo_root("m-o"), None);
+        ledger.observe("m-o", ok("old"), Some(PathBuf::from("/src/a")));
+        // A later observation that could not find it keeps the last one.
+        ledger.observe(
+            "m-o",
+            MemberHealth::Gone {
+                cannot_repair: None,
+            },
+            None,
+        );
+        assert_eq!(ledger.repo_root("m-o"), Some(PathBuf::from("/src/a")));
+        // The member's info still shows what the ledger records.
+        assert_eq!(ledger.member("m-o").unwrap().1.repo_root, None);
+
+        let m = create(&mut ledger, "feat", "/w/app--feat");
+        ledger.observe(&m, ok("feat"), Some(PathBuf::from("/elsewhere")));
+        assert_eq!(
+            ledger.repo_root(&m),
+            Some(PathBuf::from("/src/app")),
+            "recorded wins"
+        );
+    }
+
+    #[test]
+    fn dropping_a_task_forgets_its_observations() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = open(&tmp);
+        let m = create(&mut ledger, "feat", "/a");
+        ledger.observe(&m, ok("feat"), Some(PathBuf::from("/src/app")));
+        ledger.drop_task("feat", false).unwrap();
+        assert!(ledger.state.observed.is_empty());
+        assert_eq!(ledger.repo_root(&m), None);
+    }
+
+    #[test]
+    fn add_member_joins_an_existing_task() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let first = create(&mut ledger, "feat", "/w/app--feat");
+        let task = ledger
+            .add_member("feat", &new_member("web", "feat", "/w/web--feat"))
+            .unwrap();
+        assert_eq!(task.members.len(), 2);
+        assert_eq!(task.members[0].id, first);
+        let web = task.members[1].clone();
+        assert_eq!(web.name, "web");
+        assert_eq!(web.repo_root.as_deref(), Some(Path::new("/src/web")));
+        assert_eq!(ledger.member(&web.id).unwrap().0.name, "feat");
+
+        let err = ledger.add_member("feat", &new_member("web", "x", "/w/web--feat"));
+        assert!(err.unwrap_err().to_string().contains("already has"));
+        let err = ledger.add_member("nope", &new_member("api", "x", "/w/api--x"));
+        assert!(err.unwrap_err().to_string().contains("not found"));
+
+        drop(ledger);
+        assert_eq!(
+            event_types(&path),
+            ["task_created", "member_added", "member_added"]
+        );
+        let ledger = Ledger::open(&path).unwrap().0;
+        assert_eq!(ledger.task("feat").unwrap().members[1].id, web.id);
     }
 
     #[test]

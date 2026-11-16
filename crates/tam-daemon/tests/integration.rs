@@ -1726,3 +1726,415 @@ fn alive(pid: u32) -> bool {
     }
     true
 }
+
+// ---------------------------------------------------------------------------
+// Reconciliation with git: member health, repair, adopt
+// ---------------------------------------------------------------------------
+
+use tam_proto::{Event, MemberHealth, TaskInfo};
+
+/// Start a daemon checking worktrees against git every `every`.
+async fn start_daemon_reconciling(dir: &std::path::Path, every: std::time::Duration) -> PathBuf {
+    let sock = dir.join("test.sock");
+    let daemon = Daemon::new(sock.clone(), dir.join("ledger.jsonl")).reconcile_every(every);
+    tokio::spawn(async move {
+        let _ = daemon.run().await;
+    });
+    for _ in 0..40 {
+        if UnixStream::connect(&sock).await.is_ok() {
+            return sock;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("daemon did not start");
+}
+
+impl Conn {
+    /// Create a single-member task for the worktree `wt` of `repo`.
+    async fn create_in_repo(
+        &mut self,
+        name: &str,
+        repo: &std::path::Path,
+        wt: &std::path::Path,
+    ) -> TaskInfo {
+        match self
+            .request(&Request::CreateTask {
+                name: name.into(),
+                members: vec![tam_proto::NewMember {
+                    repo_root: repo.into(),
+                    branch: name.into(),
+                    dir: wt.into(),
+                }],
+            })
+            .await
+        {
+            Response::Task { task, .. } => task,
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    /// Reconcile now; the health of the task's first member.
+    async fn reconcile_health(&mut self, task: &str) -> Option<MemberHealth> {
+        match self.request(&Request::Reconcile).await {
+            Response::Tasks { tasks } => tasks
+                .into_iter()
+                .find(|t| t.name == task)
+                .and_then(|t| t.members[0].health.clone()),
+            other => panic!("expected Tasks, got {other:?}"),
+        }
+    }
+
+    async fn repair(&mut self, member: &str) -> Response {
+        self.request(&Request::RepairMember {
+            member: member.into(),
+        })
+        .await
+    }
+
+    async fn adopt(
+        &mut self,
+        dir: &std::path::Path,
+        name: Option<&str>,
+        join: Option<&str>,
+    ) -> Response {
+        self.request(&Request::AdoptWorktree {
+            dir: dir.into(),
+            name: name.map(str::to_string),
+            join: join.map(str::to_string),
+        })
+        .await
+    }
+}
+
+fn ok_on(branch: &str) -> MemberHealth {
+    MemberHealth::Ok {
+        branch: Some(branch.into()),
+    }
+}
+
+fn repairable() -> MemberHealth {
+    MemberHealth::Gone {
+        cannot_repair: None,
+    }
+}
+
+/// A `TaskUpdated` for `task` whose first member has `health`.
+fn health_update(task: &str, health: &MemberHealth) -> impl Fn(&Event) -> bool {
+    let (task, health) = (task.to_string(), health.clone());
+    move |e| {
+        matches!(e, Event::TaskUpdated { task: t }
+            if t.name == task && t.members[0].health.as_ref() == Some(&health))
+    }
+}
+
+fn error_message(resp: Response) -> String {
+    match resp {
+        Response::Error { message } => message,
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn removed_worktree_is_reported_and_can_be_recreated() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    git(&wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
+    let mut watcher = Conn::subscribed(&sock).await;
+    let mut cmd = Conn::connect(&sock).await;
+
+    // Created with its health known.
+    let task = cmd.create_in_repo("feat", &repo, &wt).await;
+    assert_eq!(task.members[0].health, Some(ok_on("feat")));
+
+    git(&repo, &["worktree", "remove", wt.to_str().unwrap()]);
+    assert_eq!(cmd.reconcile_health("feat").await, Some(repairable()));
+    watcher
+        .wait_event(3, health_update("feat", &repairable()))
+        .await
+        .expect("TaskUpdated with the worktree gone");
+    // Observed only: nothing was recreated, and nothing changes on a recheck.
+    assert!(!wt.exists());
+    cmd.reconcile_health("feat").await;
+    assert!(
+        watcher
+            .wait_event(1, |e| matches!(e, Event::TaskUpdated { .. }))
+            .await
+            .is_none(),
+        "no change, no event"
+    );
+
+    match cmd.repair("feat").await {
+        Response::Member { task, member, .. } => {
+            assert_eq!(task.name, "feat");
+            assert_eq!(member.health, Some(ok_on("feat")));
+        }
+        other => panic!("expected Member, got {other:?}"),
+    }
+    watcher
+        .wait_event(3, health_update("feat", &ok_on("feat")))
+        .await
+        .expect("TaskUpdated with the worktree back");
+    assert_eq!(git(&wt, &["log", "-1", "--format=%s"]).trim(), "work");
+
+    // In place now: nothing to repair.
+    let err = error_message(cmd.repair("feat").await);
+    assert!(err.contains("exists"), "{err}");
+}
+
+#[tokio::test]
+async fn periodic_reconcile_pushes_a_deleted_worktree_unasked() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon_reconciling(dir.path(), std::time::Duration::from_millis(200)).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_in_repo("feat", &repo, &wt).await;
+    let mut watcher = Conn::subscribed(&sock).await;
+
+    // Deleted by hand: git still has it registered.
+    std::fs::remove_dir_all(&wt).unwrap();
+    watcher
+        .wait_event(5, health_update("feat", &repairable()))
+        .await
+        .expect("the periodic pass reports the worktree gone");
+
+    // Recreated (registration replaced), and reported back by the next pass.
+    assert!(matches!(cmd.repair("feat").await, Response::Member { .. }));
+    assert!(wt.join(".git").exists());
+}
+
+#[tokio::test]
+async fn worktree_deleted_while_the_daemon_was_down_is_reported_on_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_in_repo("feat", &repo, &wt).await;
+    cmd.request(&Request::Shutdown).await;
+    drop(cmd);
+    wait_ledger_released(&dir.path().join("ledger.jsonl")).await;
+
+    git(&repo, &["worktree", "remove", wt.to_str().unwrap()]);
+    let sock = start_daemon(dir.path()).await;
+    let mut cmd = Conn::connect(&sock).await;
+    for _ in 0..60 {
+        match cmd.request(&Request::ListTasks).await {
+            Response::Tasks { tasks } if tasks[0].members[0].health.is_some() => {
+                assert_eq!(tasks[0].members[0].health, Some(repairable()));
+                return;
+            }
+            Response::Tasks { .. } => {}
+            other => panic!("expected Tasks, got {other:?}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no health after start");
+}
+
+#[tokio::test]
+async fn repair_refuses_when_the_branch_moved_or_went() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_in_repo("feat", &repo, &wt).await;
+
+    // Moved with git: the branch is checked out elsewhere.
+    let moved = dir.path().join("moved");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "move",
+            wt.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    match cmd.reconcile_health("feat").await {
+        Some(MemberHealth::Gone {
+            cannot_repair: Some(why),
+        }) => assert!(why.contains("checked out at"), "{why}"),
+        other => panic!("expected gone, unrepairable: {other:?}"),
+    }
+    let err = error_message(cmd.repair("feat").await);
+    assert!(err.contains("checked out at"), "{err}");
+    assert!(!wt.exists() && moved.exists(), "nothing touched");
+
+    // Removed, and the branch deleted: only a drop is left.
+    git(&repo, &["worktree", "remove", moved.to_str().unwrap()]);
+    git(&repo, &["branch", "-D", "feat"]);
+    let err = error_message(cmd.repair("feat").await);
+    assert!(err.contains("no longer exists"), "{err}");
+    let resp = cmd.request(&drop_request("feat", false, false)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
+}
+
+#[tokio::test]
+async fn repair_waits_for_the_agent_to_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+    let member = cmd.create_in_repo("feat", &repo, &wt).await.members[0]
+        .id
+        .clone();
+    let resp = cmd.spawn_for_member(&member, "sleep", &["3600"]).await;
+    assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+    git(&repo, &["worktree", "remove", wt.to_str().unwrap()]);
+
+    let err = error_message(cmd.repair(&member).await);
+    assert!(err.contains("running agent"), "{err}");
+    assert!(!wt.exists());
+
+    let resp = cmd.request(&Request::Kill { id: member.clone() }).await;
+    assert!(matches!(resp, Response::Ok), "{resp:?}");
+    assert!(matches!(cmd.repair(&member).await, Response::Member { .. }));
+    assert!(wt.exists());
+}
+
+#[tokio::test]
+async fn adopted_worktree_behaves_like_any_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    // Made by hand, outside tam.
+    let (repo, wt) = git_worktree(dir.path(), "fix/login");
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+    let mut watcher = Conn::subscribed(&sock).await;
+    let mut cmd = Conn::connect(&sock).await;
+
+    // From a directory inside it; named after its branch.
+    let task = match cmd.adopt(&wt.join("src"), None, None).await {
+        Response::Task { task, runs } => {
+            assert!(runs.is_empty());
+            task
+        }
+        other => panic!("expected Task, got {other:?}"),
+    };
+    assert_eq!(task.name, "fix/login");
+    let member = task.members[0].clone();
+    assert_eq!(member.dir, wt.canonicalize().unwrap());
+    assert_eq!(member.repo_root, Some(repo.canonicalize().unwrap()));
+    assert_eq!(member.branch, "fix/login");
+    assert_eq!(member.health, Some(ok_on("fix/login")));
+    let event = watcher
+        .wait_event(3, |e| matches!(e, Event::TaskCreated { .. }))
+        .await;
+    assert!(
+        matches!(&event, Some(Event::TaskCreated { task: t }) if *t == task),
+        "{event:?}"
+    );
+
+    // Already a task's: refused, by any path to it.
+    let err = error_message(cmd.adopt(&wt, Some("again"), None).await);
+    assert!(
+        err.contains("already a member of task 'fix/login'"),
+        "{err}"
+    );
+
+    // Runs agents, resolves from its directory, drops like any task.
+    let resp = cmd.spawn_for_member(&member.id, "sleep", &["3600"]).await;
+    assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+    match cmd.resolve(None, Some(&member.dir.join("src"))).await {
+        Response::Member { member: m, .. } => assert_eq!(m.id, member.id),
+        other => panic!("expected Member, got {other:?}"),
+    }
+    let resp = cmd.request(&drop_request("fix/login", false, false)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
+    assert!(!wt.exists());
+    assert!(branch_exists(&repo, "fix/login"));
+}
+
+#[tokio::test]
+async fn adopt_refuses_what_is_not_a_linked_worktree_on_a_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (repo, wt) = git_worktree(dir.path(), "feat");
+    let mut cmd = Conn::connect(&sock).await;
+
+    let err = error_message(cmd.adopt(&repo, None, None).await);
+    assert!(err.contains("main checkout"), "{err}");
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let err = error_message(cmd.adopt(&plain, None, None).await);
+    assert!(err.contains("cannot adopt"), "{err}");
+    let err = error_message(cmd.adopt(&wt, Some("x"), Some("y")).await);
+    assert!(err.contains("not both"), "{err}");
+
+    // A task name already taken.
+    cmd.create_task("feat", &dir.path().join("elsewhere")).await;
+    let err = error_message(cmd.adopt(&wt, None, None).await);
+    assert!(err.contains("already exists"), "{err}");
+
+    // A worktree of a bare repository: tam cannot tell its repository.
+    let bare = dir.path().join("bare.git");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            repo.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    let bare_wt = dir.path().join("bare--x");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "x",
+            bare_wt.to_str().unwrap(),
+        ],
+    );
+    let err = error_message(cmd.adopt(&bare_wt, None, None).await);
+    assert!(err.starts_with("cannot adopt"), "{err}");
+
+    git(&wt, &["checkout", "-q", "--detach"]);
+    let err = error_message(cmd.adopt(&wt, Some("other"), None).await);
+    assert!(err.contains("detached HEAD"), "{err}");
+    match cmd.request(&Request::ListTasks).await {
+        Response::Tasks { tasks } => assert_eq!(tasks.len(), 1),
+        other => panic!("expected Tasks, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn adopt_can_join_an_existing_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let (api_repo, api) = git_worktree(&dir.path().join("api"), "feat");
+    let (_, web) = git_worktree(&dir.path().join("web"), "feat");
+    let mut watcher = Conn::subscribed(&sock).await;
+    let mut cmd = Conn::connect(&sock).await;
+    cmd.create_in_repo("feat", &api_repo, &api).await;
+
+    let task = match cmd.adopt(&web, None, Some("feat")).await {
+        Response::Task { task, .. } => task,
+        other => panic!("expected Task, got {other:?}"),
+    };
+    assert_eq!(task.members.len(), 2);
+    // Both repositories are named `repo`: the newcomer gets the branch too.
+    assert_eq!(task.members[1].name, "repo-feat");
+    assert_eq!(task.members[1].health, Some(ok_on("feat")));
+    watcher
+        .wait_event(
+            3,
+            |e| matches!(e, Event::TaskUpdated { task: t } if t.members.len() == 2),
+        )
+        .await
+        .expect("TaskUpdated with the new member");
+
+    let err = error_message(cmd.adopt(&web, None, Some("nope")).await);
+    assert!(err.contains("already a member"), "{err}");
+    let (_, other) = git_worktree(&dir.path().join("other"), "x");
+    let err = error_message(cmd.adopt(&other, None, Some("nope")).await);
+    assert!(err.contains("not found"), "{err}");
+
+    // Dropping the task removes both worktrees.
+    let resp = cmd.request(&drop_request("feat", false, false)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
+    assert!(!api.exists() && !web.exists());
+}

@@ -4,7 +4,7 @@ use std::time::Instant;
 use tam_proto::{AgentInfo, TaskInfo};
 
 use crate::config::CustomCommand;
-use crate::task::Task;
+use crate::task::{Member, Task};
 
 pub enum Mode {
     Normal,
@@ -12,10 +12,10 @@ pub enum Mode {
     NewTaskEnterName {
         project_dir: PathBuf,
         name: String,
-        create_worktree: bool,
     },
     RunPickSession {
-        task_name: String,
+        /// Id of the member to run an agent in.
+        member: String,
         picker: PickerState,
     },
     SpawnEnterPath(String),
@@ -139,7 +139,7 @@ impl App {
     fn sort_tasks(&mut self) {
         self.tasks.sort_by_key(|t| {
             (
-                t.repo_name.to_lowercase(),
+                t.repo_name().to_lowercase(),
                 t.status().sort_priority(),
                 t.name.to_lowercase(),
             )
@@ -155,12 +155,13 @@ impl App {
                 .iter()
                 .filter(|t| {
                     t.name.to_lowercase().contains(&lower)
-                        || t.repo_name.to_lowercase().contains(&lower)
-                        || t.dir.to_string_lossy().to_lowercase().contains(&lower)
-                        || t.agent_info
-                            .as_ref()
-                            .map(|a| a.provider.to_lowercase().contains(&lower))
-                            .unwrap_or(false)
+                        || t.repo_name().to_lowercase().contains(&lower)
+                        || t.members.iter().any(|m| {
+                            m.info.dir.to_string_lossy().to_lowercase().contains(&lower)
+                                || m.agent_info
+                                    .as_ref()
+                                    .is_some_and(|a| a.provider.to_lowercase().contains(&lower))
+                        })
                 })
                 .collect()
         }
@@ -228,17 +229,27 @@ impl App {
         self.clamp_selection();
     }
 
-    /// Update agent info for a task by matching agent ID to task name.
+    /// The member an agent runs for (agent ids are member ids).
+    fn member_mut(&mut self, id: &str) -> Option<&mut Member> {
+        self.tasks.iter_mut().find_map(|t| t.member_mut(id))
+    }
+
+    /// A member and its task, by member id.
+    pub fn find_member(&self, id: &str) -> Option<(&Task, &Member)> {
+        self.tasks.iter().find_map(|t| t.member(id).map(|m| (t, m)))
+    }
+
+    /// Update the agent info of the member it runs for.
     pub fn update_agent(&mut self, info: AgentInfo) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.name == info.id) {
-            task.agent_info = Some(info);
+        if let Some(member) = self.member_mut(&info.id) {
+            member.agent_info = Some(info);
             self.sort_tasks();
         }
     }
 
     pub fn update_state(&mut self, id: &str, new_state: tam_proto::AgentState) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.name == id) {
-            if let Some(ref mut info) = task.agent_info {
+        if let Some(member) = self.member_mut(id) {
+            if let Some(ref mut info) = member.agent_info {
                 info.state = new_state;
             }
             self.sort_tasks();
@@ -246,18 +257,18 @@ impl App {
     }
 
     pub fn update_context(&mut self, id: &str, context_percent: u8) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.name == id) {
-            if let Some(ref mut info) = task.agent_info {
+        if let Some(member) = self.member_mut(id) {
+            if let Some(ref mut info) = member.agent_info {
                 info.context_percent = Some(context_percent);
             }
         }
     }
 
-    /// Remove agent info from a task (agent exited, task becomes idle).
+    /// Remove agent info from a member (agent exited, member becomes idle).
     pub fn remove_agent(&mut self, id: &str) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.name == id) {
-            task.agent_info = None;
-            task.refresh_git_status();
+        if let Some(member) = self.member_mut(id) {
+            member.agent_info = None;
+            member.refresh_git_status();
             self.sort_tasks();
         }
         self.clamp_selection();
@@ -277,7 +288,7 @@ impl App {
         self.status.as_ref().map(|(msg, _)| msg.as_str())
     }
 
-    /// Refresh git branch status for owned idle tasks and re-sort.
+    /// Refresh git branch status for members without an agent and re-sort.
     pub fn refresh_git_status(&mut self) {
         for t in &mut self.tasks {
             t.refresh_git_status();

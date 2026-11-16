@@ -25,7 +25,7 @@
 
 > Manage units of work, not just processes.
 
-TAM manages **tasks** — named units of work that bind a directory to a series of AI agent runs. It unifies git worktree management and agent process supervision into a single tool.
+TAM manages **tasks** — named units of work, each with its own git worktree and a series of AI agent runs. It unifies git worktree management and agent process supervision into a single tool.
 
 Running multiple AI coding agents means juggling tmux panes, manual worktree creation, and remembering which session to resume. TAM replaces that with a single abstraction: create a task, and it gets a worktree, a branch, and an agent — all under one name. Status is always derived from reality (daemon, git, filesystem), never stored, so it can't drift.
 
@@ -33,7 +33,7 @@ Running multiple AI coding agents means juggling tmux panes, manual worktree cre
 
 ```bash
 # Create a task — this creates branch "fix-auth" and worktree "myapp--fix-auth"
-tam new fix-auth -w
+tam new fix-auth
 
 # Start an agent and attach to it (full-screen, like tmux)
 tam run fix-auth
@@ -48,10 +48,9 @@ tam
 
 ## Key concepts
 
-**Task** — a named unit of work binding a directory to agent runs. Tasks have two flavors:
+**Task** — a named unit of work. TAM creates a git worktree for it, on a branch named after the task, and `tam drop` cleans it up.
 
-- **Owned**: TAM creates a git worktree for the task. The task name becomes the branch name. `tam drop` removes the worktree (and with `-b` the branch).
-- **Borrowed**: TAM tracks agents in an existing directory without touching the filesystem.
+**Member** — a task's worktree, with at most one agent session. A task is built to hold several members (one per repository, for work spanning e.g. a backend and a frontend); for now `tam new` creates one. Members have a stable id, which is also their agent's id (`$TAM_AGENT_ID`), and a short name within the task: the repository name. Name one as `TASK/MEMBER`; a bare task name means its only member.
 
 **Status is always derived**, never stored. TAM checks the daemon (is an agent running?), the filesystem (does the worktree exist?), git (does the branch exist?), and activity timestamps (is the task stale?) every time you look.
 
@@ -68,7 +67,7 @@ tam
 
 ## Features
 
-- **Task = worktree + agent** — `tam new feat -w` creates a branch, a worktree, and optionally starts an agent, all under one name
+- **Task = worktree + agent** — `tam new feat` creates a branch, a worktree, and optionally starts an agent, all under one name
 - **Derived status** — never stores lifecycle state; computes it from the daemon, git, and filesystem every time you look
 - **TUI dashboard** — real-time task table with peek mode (scrollback preview without attaching)
 - **Session resume** — pick up where you left off or start fresh; session history is tracked in an append-only ledger
@@ -82,25 +81,26 @@ tam
 ### Task lifecycle
 
 ```
-tam new NAME                   Create task bound to current directory
-tam new NAME -w                Create task with its own worktree
-tam new NAME -w -s REF         Worktree branched from a specific ref
+tam new NAME                   Create task: branch NAME and its worktree, in the current repo
+tam new NAME -s REF            Branch from a specific ref
 
 tam run NAME                   Start/resume an agent in the task
 tam run NAME --new-session     Start a fresh session
 
-tam stop NAME                  Kill the agent (task persists)
-tam stop                       Resolve task from current directory
+tam stop NAME                  Kill the task's agents (task persists)
+tam stop                       Resolve the member from the current directory
 
 tam attach NAME                Full-screen attach to running agent
 tam attach                     Resolve from current directory
 
-tam drop NAME                  Stop agent + remove worktree + forget task
-tam drop NAME -b               Also delete the git branch
+tam drop NAME                  Stop agents + remove worktrees + forget task
+tam drop NAME -b               Also delete the git branches
 tam drop NAME -f               Drop even if work would be lost
+
+NAME is a task name, or TASK/MEMBER for one member of the task.
 ```
 
-`tam drop` checks first: it refuses when uncommitted changes would be lost, or, with `-b`, commits that no other branch, tag or remote branch holds. It lists them and, on a terminal, asks before going on. If the worktree cannot be removed, the task is kept.
+`tam drop` checks first: it refuses when uncommitted changes would be lost, or, with `-b`, commits that no other branch, tag or remote branch holds. It lists them and, on a terminal, asks before going on. If a worktree cannot be removed, the task is kept.
 
 ### Observing
 
@@ -123,11 +123,11 @@ Running `tam` with no arguments opens the dashboard:
 ┌────────────────────────────────────────────────────────────────────────────┐
 │  tam — 4 tasks (1 needs input)                                             │
 ├────────────────────────────────────────────────────────────────────────────┤
-│  STATUS    REPO     TASK          AGENT   OWN  DIR                   CTX   │
-│  ● run     myapp    feat          claude   ✔   ~/wt/myapp--feat      34%   │
-│▸ ▲ input   myapp    fix-nav       claude   ✔   ~/wt/myapp--fix-nav   67%   │
-│  ○ idle    myapp    refactor      -        ✔   ~/wt/myapp--refac     -     │
-│  ◌ stale   other    old-thing     -        ✘   ~/projects/other      -     │
+│  STATUS    REPO     TASK          AGENT   DIR                        CTX   │
+│  ● run     myapp    feat          claude  ~/wt/myapp--feat           34%   │
+│▸ ▲ input   myapp    fix-nav       claude  ~/wt/myapp--fix-nav        67%   │
+│  ○ idle    myapp    refactor      -       ~/wt/myapp--refactor       -     │
+│  ◌ stale   other    old-thing     -       ~/wt/other--old-thing      -     │
 ├────────────────────────────────────────────────────────────────────────────┤
 │  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit                │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -181,14 +181,14 @@ The notify command runs with `sh -c` on state changes, except while you are atta
 
 | Placeholder | Value |
 |---|---|
-| `{task}`, `{id}` | Task name, agent id |
+| `{task}`, `{id}` | Task name, agent id (the member id) |
 | `{state}` (alias `{status}`), `{old_state}` | New and previous agent state |
 | `{kind}` | `question`, `permission`, `done` or `error` |
 | `{message}` | The question or permission asked, the agent's last response, or the error |
 | `{tool}` | Tool waiting for permission (e.g. `Bash`) |
 | `{error}` | Error kind (e.g. `rate_limit`) |
 
-Per-repo worktree initialization is configured via `.tam.toml` at the project root. When `tam new NAME -w` creates a worktree, it copies files matching `include` globs from the main checkout (useful for untracked secrets or editor config) and runs `commands` inside the new worktree:
+Per-repo worktree initialization is configured via `.tam.toml` at the project root. When `tam new NAME` creates a worktree, it copies files matching `include` globs from the main checkout (useful for untracked secrets or editor config) and runs `commands` inside the new worktree:
 
 ```toml
 [init]

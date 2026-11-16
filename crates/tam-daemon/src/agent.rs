@@ -45,8 +45,10 @@ pub struct Agent {
     reported_state: AgentState,
     /// Cached context usage percentage, updated periodically.
     context_percent: Option<u8>,
-    /// Task this agent runs for, if any (its runs are recorded in the ledger).
-    task: Option<String>,
+    /// Id of the task member this agent runs for, if any (its runs are
+    /// recorded in the ledger). The member's task is looked up when needed:
+    /// it can change.
+    member: Option<String>,
     /// What the agent's hooks reported (session, pending action, …).
     hook_data: HookData,
     _reader_handle: JoinHandle<()>,
@@ -136,7 +138,7 @@ impl Agent {
             last_output_at,
             reported_state: AgentState::Working,
             context_percent: None,
-            task: None,
+            member: None,
             hook_data: HookData::default(),
             _reader_handle: reader_handle,
         })
@@ -188,13 +190,13 @@ impl Agent {
         let _ = self.kill();
     }
 
-    /// Bind the agent to a task.
-    pub fn set_task(&mut self, task: Option<String>) {
-        self.task = task;
+    /// Bind the agent to a task member.
+    pub fn set_member(&mut self, member: Option<String>) {
+        self.member = member;
     }
 
-    pub fn task(&self) -> Option<&str> {
-        self.task.as_deref()
+    pub fn member(&self) -> Option<&str> {
+        self.member.as_deref()
     }
 
     pub fn pid(&self) -> u32 {
@@ -268,7 +270,8 @@ impl Agent {
         )
     }
 
-    /// Build an AgentInfo snapshot for reporting to clients.
+    /// Build an AgentInfo snapshot for reporting to clients. Its `task` is
+    /// left for the caller, who knows the member's task.
     pub fn info(&self, id: &str) -> AgentInfo {
         AgentInfo {
             id: id.to_string(),
@@ -279,7 +282,7 @@ impl Agent {
             uptime_secs: self.started_at.elapsed().as_secs(),
             viewers: self.viewers.load(Ordering::Relaxed),
             context_percent: self.context_percent,
-            task: self.task.clone(),
+            task: None,
             detail: Box::new(self.hook_data.detail.clone()),
         }
     }

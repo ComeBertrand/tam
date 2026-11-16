@@ -35,7 +35,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let selected = app.selected_task();
         let task_name = selected.map(|t| t.name.as_str()).unwrap_or("—");
         let detail = selected
-            .and_then(|t| t.agent_info.as_ref())
+            .and_then(|t| t.agent_info())
             .and_then(|a| agent_detail_line(a.state, &a.detail));
         let content = app.peek.as_deref().unwrap_or("");
         render_preview(frame, preview_area, task_name, detail, content);
@@ -65,12 +65,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::NewTaskPickProject(picker) | Mode::RunPickSession { picker, .. } => {
             render_picker_popup(frame, picker);
         }
-        Mode::NewTaskEnterName {
-            name,
-            create_worktree,
-            ..
-        } => {
-            render_new_task_popup(frame, name, *create_worktree);
+        Mode::NewTaskEnterName { name, .. } => {
+            render_new_task_popup(frame, name);
         }
         Mode::SpawnEnterPath(path) => {
             render_enter_path_popup(frame, path);
@@ -147,7 +143,6 @@ fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize)
         Cell::from("REPO"),
         Cell::from("TASK"),
         Cell::from("AGENT"),
-        Cell::from("OWN"),
         Cell::from("DIR"),
         Cell::from("CTX"),
     ])
@@ -159,30 +154,25 @@ fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize)
         .map(|task| {
             let status = task.status();
             let (icon, color) = status_display(&status);
-            let dir = shorten_home(&task.dir.display().to_string());
+            let dir = task
+                .dir()
+                .map(|d| shorten_home(&d.display().to_string()))
+                .unwrap_or_default();
             let agent = task
-                .agent_info
-                .as_ref()
+                .agent_info()
                 .map(|a| a.provider.as_str())
                 .unwrap_or("-");
             let ctx = task
-                .agent_info
-                .as_ref()
+                .agent_info()
                 .and_then(|a| a.context_percent)
                 .map(|p| context_display(p))
                 .unwrap_or_else(|| Span::raw(""));
-            let owned = if task.owned {
-                Span::styled("✔", Style::new().fg(Color::Green))
-            } else {
-                Span::styled("✘", Style::new().fg(Color::DarkGray))
-            };
 
             Row::new([
                 Cell::from(Span::styled(icon, Style::new().fg(color))),
-                Cell::from(task.repo_name.as_str()),
+                Cell::from(task.repo_name()),
                 Cell::from(task.name.as_str()),
                 Cell::from(agent),
-                Cell::from(owned),
                 Cell::from(dir),
                 Cell::from(ctx),
             ])
@@ -194,7 +184,6 @@ fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize)
         Constraint::Length(15), // REPO
         Constraint::Length(15), // TASK
         Constraint::Length(10), // AGENT
-        Constraint::Length(3),  // OWN
         Constraint::Fill(1),    // DIR
         Constraint::Length(6),  // CTX
     ];
@@ -220,7 +209,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
         let hints = match app.mode {
             Mode::Normal => {
                 let selected = app.selected_task();
-                let has_agent = selected.map(|t| t.agent_info.is_some()).unwrap_or(false);
+                let has_agent = selected.is_some_and(|t| t.agent_info().is_some());
 
                 let mut hints = Vec::new();
                 if has_agent {
@@ -256,8 +245,6 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
             Mode::NewTaskEnterName { .. } => vec![
                 Span::styled(" enter", Style::new().bold()),
                 Span::raw(":create  "),
-                Span::styled("tab", Style::new().bold()),
-                Span::raw(":toggle  "),
                 Span::styled("esc", Style::new().bold()),
                 Span::raw(":cancel"),
             ],
@@ -470,9 +457,9 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
     frame.render_widget(List::new(items), list_area);
 }
 
-fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool) {
-    // 3 content rows + 2 border + 2 vertical padding = 7
-    let area = centered_fixed_rect(50, 7, frame.area());
+fn render_new_task_popup(frame: &mut Frame, name: &str) {
+    // 1 content row + 2 border + 2 vertical padding = 5
+    let area = centered_fixed_rect(50, 5, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -486,36 +473,12 @@ fn render_new_task_popup(frame: &mut Frame, name: &str, create_worktree: bool) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [name_area, _, wt_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-
     let name_line = Line::from(vec![
         Span::raw("Task name: "),
         Span::styled(name, Style::new().bold()),
         Span::styled("█", Style::new().fg(Color::DarkGray)),
     ]);
-    frame.render_widget(name_line, name_area);
-
-    let wt_check = if create_worktree { "x" } else { " " };
-    let wt_line = Line::from(vec![
-        Span::raw("["),
-        Span::styled(
-            wt_check,
-            Style::new().fg(if create_worktree {
-                Color::Green
-            } else {
-                Color::DarkGray
-            }),
-        ),
-        Span::raw("] Create worktree  "),
-        Span::styled("tab", Style::new().fg(Color::DarkGray)),
-        Span::styled(" toggle", Style::new().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(wt_line, wt_area);
+    frame.render_widget(name_line, inner);
 }
 
 fn render_enter_path_popup(frame: &mut Frame, path: &str) {

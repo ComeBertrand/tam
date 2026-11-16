@@ -13,7 +13,7 @@ mod task;
 mod tui;
 
 use cli::{Cli, Commands};
-use tam_proto::TaskInfo;
+use tam_proto::{MemberInfo, RunInfo, TaskInfo};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,7 +28,6 @@ async fn main() -> Result<()> {
     match command {
         Commands::New {
             name,
-            worktree,
             source,
             no_start,
         } => {
@@ -37,33 +36,23 @@ async fn main() -> Result<()> {
                 anyhow::bail!("task '{}' already exists", name);
             }
 
-            let worktree = worktree || source.is_some();
+            // A task owns its worktree: branch NAME of the current repository.
             let cwd = std::fs::canonicalize(".")?;
+            let wt_config = tam_worktree::config::load_config()?;
+            let member = task::create_worktree(&name, source.as_deref(), &wt_config, &cwd)?;
+            if wt_config.auto_init {
+                tam_worktree::init::run(&member.dir)?;
+            }
 
-            let task = if worktree {
-                // Owned context: create a worktree
-                let wt_config = tam_worktree::config::load_config()?;
-                let wt_path =
-                    tam_worktree::worktree::create(&name, source.as_deref(), &wt_config, &cwd)?;
-
-                if wt_config.auto_init {
-                    tam_worktree::init::run(&wt_path)?;
-                }
-
-                let task = client.create_task(&name, &wt_path, true).await?;
-                println!("Created task '{}' at {}", name, task.dir.display());
-                task
-            } else {
-                // Borrowed context: bind to cwd
-                let task = client.create_task(&name, &cwd, false).await?;
-                println!("Created task '{}' in {}", name, task.dir.display());
-                task
-            };
+            let task = client.create_task(&name, vec![member]).await?;
+            let member = task.members[0].clone();
+            println!("Created task '{}' at {}", name, member.dir.display());
 
             if !no_start {
                 spawn_and_attach(
                     &mut client,
                     &task,
+                    &member,
                     config.default_agent.clone(),
                     vec![],
                     None,
@@ -81,8 +70,7 @@ async fn main() -> Result<()> {
             args,
         } => {
             let mut client = client::Client::connect().await?;
-            let name = resolve_task_name(name, &client.list_tasks().await?)?;
-            let (task, runs) = client.get_task(&name).await?;
+            let (task, member, runs) = resolve_member(&mut client, name.as_deref()).await?;
 
             let agent = agent.unwrap_or_else(|| config.default_agent.clone());
             config::validate_provider(&agent)?;
@@ -91,7 +79,7 @@ async fn main() -> Result<()> {
             let resume_session = if new_session || !std::io::stdin().is_terminal() {
                 None
             } else {
-                let found = sessions::list_sessions_for_task(&agent, &task.dir, &runs);
+                let found = sessions::list_sessions_for_task(&agent, &member.dir, &runs);
                 if found.is_empty() {
                     None
                 } else {
@@ -99,31 +87,74 @@ async fn main() -> Result<()> {
                 }
             };
 
-            spawn_and_attach(&mut client, &task, agent, args, resume_session, prompt).await?;
+            spawn_and_attach(
+                &mut client,
+                &task,
+                &member,
+                agent,
+                args,
+                resume_session,
+                prompt,
+            )
+            .await?;
         }
 
         Commands::Stop { name } => {
             let mut client = client::Client::connect().await?;
-            let name = resolve_task_name(name, &client.list_tasks().await?)?;
-
-            // The daemon records the end of the run.
-            let resp = client
-                .send(tam_proto::Request::Kill { id: name.clone() })
-                .await?;
-            match resp {
-                tam_proto::Response::Ok => println!("Stopped agent in task '{}'", name),
-                tam_proto::Response::Error { message } => {
-                    eprintln!("Error: {}", message);
-                    std::process::exit(1);
+            // A task name stops all its members; TASK/MEMBER or the current
+            // directory, one member.
+            let task = match name.as_deref() {
+                Some(name) => client.get_task(name).await.ok().map(|(task, _)| task),
+                None => None,
+            };
+            let (label, task, members) = match task {
+                Some(task) => (task.name.clone(), task.clone(), task.members),
+                None => {
+                    let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
+                    (task.member_label(&member), task, vec![member])
                 }
-                _ => {}
+            };
+
+            let running = client.list_agents().await?;
+            let mut stopped = 0;
+            for member in members
+                .iter()
+                .filter(|m| running.iter().any(|a| a.id == m.id))
+            {
+                // The daemon records the end of the run.
+                let resp = client
+                    .send(tam_proto::Request::Kill {
+                        id: member.id.clone(),
+                    })
+                    .await?;
+                match resp {
+                    tam_proto::Response::Ok => {
+                        println!("Stopped agent in task '{}'", task.member_label(member));
+                        stopped += 1;
+                    }
+                    tam_proto::Response::Error { message } => eprintln!("Error: {}", message),
+                    _ => {}
+                }
+            }
+            if stopped == 0 {
+                eprintln!("Error: no agent running in task '{}'", label);
+                std::process::exit(1);
             }
         }
 
         Commands::Attach { name } => {
             let mut client = client::Client::connect().await?;
-            let name = resolve_task_name(name, &client.list_tasks().await?)?;
-            client.attach(&name).await?;
+            let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
+            let label = task.member_label(&member);
+            if !client
+                .list_agents()
+                .await?
+                .iter()
+                .any(|a| a.id == member.id)
+            {
+                anyhow::bail!("no agent running in task '{}'", label);
+            }
+            client.attach(&member.id, &label).await?;
         }
 
         Commands::Drop {
@@ -164,13 +195,10 @@ async fn main() -> Result<()> {
 
             let mut tasks: Vec<task::Task> = infos
                 .into_iter()
-                .map(|info| {
-                    let agent_info = agents.iter().find(|a| a.id == info.name).cloned();
-                    task::Task::from_info(info, agent_info)
-                })
+                .map(|info| task::Task::from_info(info, &agents))
                 .collect();
 
-            // Populate git branch status for owned tasks without a running agent
+            // Populate git branch status for members without a running agent
             for t in &mut tasks {
                 t.refresh_git_status();
             }
@@ -181,15 +209,30 @@ async fn main() -> Result<()> {
                 let entries: Vec<serde_json::Value> = tasks
                     .iter()
                     .map(|t| {
+                        let members: Vec<serde_json::Value> = t
+                            .members
+                            .iter()
+                            .map(|m| {
+                                serde_json::json!({
+                                    "id": m.info.id,
+                                    "name": m.info.name,
+                                    "repo": m.info.repo,
+                                    "branch": m.info.branch,
+                                    "dir": m.info.dir,
+                                    "status": t.member_status(m).to_string(),
+                                    "agent": m.agent_info.as_ref().map(|a| &a.provider),
+                                })
+                            })
+                            .collect();
                         serde_json::json!({
                             "name": t.name,
                             "status": t.status().to_string(),
-                            "dir": t.dir,
-                            "owned": t.owned,
-                            "agent": t.agent_info.as_ref().map(|a| &a.provider),
-                            "context_percent": t.agent_info.as_ref().and_then(|a| a.context_percent),
+                            "dir": t.dir(),
+                            "agent": t.agent_info().map(|a| &a.provider),
+                            "context_percent": t.agent_info().and_then(|a| a.context_percent),
                             "run_count": t.run_count,
                             "last_activity": t.last_activity,
+                            "members": members,
                         })
                     })
                     .collect();
@@ -202,15 +245,13 @@ async fn main() -> Result<()> {
                     "STATUS", "TASK", "AGENT", "RUNS", "LAST", "DIR", "CTX"
                 );
                 for t in &tasks {
-                    let dir = shorten_home(&t.dir.display().to_string());
-                    let agent = t
-                        .agent_info
-                        .as_ref()
-                        .map(|a| a.provider.as_str())
-                        .unwrap_or("-");
+                    let dir = t
+                        .dir()
+                        .map(|d| shorten_home(&d.display().to_string()))
+                        .unwrap_or_else(|| "-".into());
+                    let agent = t.agent_info().map(|a| a.provider.as_str()).unwrap_or("-");
                     let ctx = t
-                        .agent_info
-                        .as_ref()
+                        .agent_info()
                         .and_then(|a| a.context_percent)
                         .map(|p| format!("{}%", p))
                         .unwrap_or_else(|| "-".into());
@@ -359,10 +400,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Start an agent for a task (the daemon records the run), then attach.
+/// Start an agent for a task member (the daemon runs it in the member's
+/// worktree and records the run), then attach.
 async fn spawn_and_attach(
     client: &mut client::Client,
     task: &TaskInfo,
+    member: &MemberInfo,
     provider: String,
     args: Vec<String>,
     resume_session: Option<String>,
@@ -371,19 +414,19 @@ async fn spawn_and_attach(
     let resp = client
         .send(tam_proto::Request::Spawn {
             provider,
-            dir: task.dir.clone(),
-            id: Some(task.name.clone()),
+            dir: std::path::PathBuf::new(),
+            id: None,
             args,
             resume_session,
             prompt,
-            task: Some(task.name.clone()),
+            member: Some(member.id.clone()),
         })
         .await?;
 
     match resp {
         tam_proto::Response::Spawned { id } => {
             let client = client::Client::connect().await?;
-            client.attach(&id).await
+            client.attach(&id, &task.member_label(member)).await
         }
         tam_proto::Response::Error { message } => {
             eprintln!("Error: {}", message);
@@ -406,15 +449,21 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-/// Resolve a task name from explicit argument or from cwd.
-fn resolve_task_name(name: Option<String>, tasks: &[TaskInfo]) -> Result<String> {
-    if let Some(name) = name {
-        return Ok(name);
-    }
-    let cwd = std::fs::canonicalize(".")?;
-    match tasks.iter().find(|t| t.dir == cwd) {
-        Some(task) => Ok(task.name.clone()),
-        None => anyhow::bail!("no task in current directory"),
+/// Find the member a command acts on: named (a task, `<task>/<member>` or a
+/// member id), else the one whose worktree contains the current directory.
+async fn resolve_member(
+    client: &mut client::Client,
+    name: Option<&str>,
+) -> Result<(TaskInfo, MemberInfo, Vec<RunInfo>)> {
+    match name {
+        Some(name) => client.resolve_member(Some(name), None).await,
+        None => {
+            let cwd = std::fs::canonicalize(".")?;
+            client
+                .resolve_member(None, Some(&cwd))
+                .await
+                .map_err(|_| anyhow::anyhow!("no task in current directory"))
+        }
     }
 }
 
@@ -485,40 +534,6 @@ mod tests {
     fn test_format_age_days() {
         let ts = task::now() - 172800; // 2 days ago
         assert_eq!(format_age(Some(ts)), "2d");
-    }
-
-    fn task_info(name: &str, dir: std::path::PathBuf) -> TaskInfo {
-        TaskInfo {
-            name: name.into(),
-            dir,
-            owned: false,
-            created_at: task::now(),
-            run_count: 0,
-            last_activity: None,
-        }
-    }
-
-    #[test]
-    fn test_resolve_task_name_explicit() {
-        let name = resolve_task_name(Some("my-task".into()), &[]).unwrap();
-        assert_eq!(name, "my-task");
-    }
-
-    #[test]
-    fn test_resolve_task_name_from_cwd() {
-        let cwd = std::fs::canonicalize(".").unwrap();
-        let tasks = [
-            task_info("other", "/nonexistent".into()),
-            task_info("cwd-task", cwd),
-        ];
-        let name = resolve_task_name(None, &tasks).unwrap();
-        assert_eq!(name, "cwd-task");
-    }
-
-    #[test]
-    fn test_resolve_task_name_no_match() {
-        let tasks = [task_info("other", "/nonexistent".into())];
-        assert!(resolve_task_name(None, &tasks).is_err());
     }
 
     /// Helper: create a git repo with an initial commit.

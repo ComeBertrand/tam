@@ -50,6 +50,8 @@ pub struct AgentInfo {
     pub viewers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_percent: Option<u8>,
+    /// Task of the member the agent runs for (resolved when asked: a member
+    /// can change task).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     /// What the agent reported through its hooks (empty for providers
@@ -116,17 +118,16 @@ pub struct DeniedTool {
 
 /// Summary of a task, as derived by the daemon from its ledger.
 ///
-/// New fields must be optional (`#[serde(default)]`) so older clients keep
-/// decoding it.
+/// A task is a named unit of work with one or more members. New fields must
+/// be optional (`#[serde(default)]`) so older clients keep decoding it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskInfo {
     pub name: String,
-    pub dir: PathBuf,
-    /// The task owns its directory (a worktree created for it).
-    pub owned: bool,
+    /// Members in the order they joined the task.
+    pub members: Vec<MemberInfo>,
     /// Unix timestamp (seconds) of the task's creation.
     pub created_at: u64,
-    /// Number of agent runs started in this task.
+    /// Number of agent runs started in this task (all members).
     #[serde(default)]
     pub run_count: usize,
     /// Unix timestamp (seconds) of the latest task or run event.
@@ -134,9 +135,58 @@ pub struct TaskInfo {
     pub last_activity: Option<u64>,
 }
 
-/// One agent run in a task, from the daemon's ledger.
+impl TaskInfo {
+    pub fn member(&self, id: &str) -> Option<&MemberInfo> {
+        self.members.iter().find(|m| m.id == id)
+    }
+
+    /// How to name one of the task's members to the user: the task name
+    /// while it has a single member, `<task>/<member>` otherwise.
+    pub fn member_label(&self, member: &MemberInfo) -> String {
+        if self.members.len() == 1 {
+            self.name.clone()
+        } else {
+            format!("{}/{}", self.name, member.name)
+        }
+    }
+}
+
+/// A member of a task: one worktree in one repository, with at most one
+/// agent session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberInfo {
+    /// Stable id, independent of the task and branch names. The member's
+    /// agent runs under this id.
+    pub id: String,
+    /// Short name, unique within the task: the repository name, or
+    /// `<repo>-<branch>` when another member already uses it.
+    pub name: String,
+    /// Repository name (the directory name of its main checkout).
+    pub repo: String,
+    /// The repository's main checkout, when known (members migrated from
+    /// older ledgers may not have it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<PathBuf>,
+    pub branch: String,
+    /// The member's worktree.
+    pub dir: PathBuf,
+}
+
+/// A member to create a task with: a worktree the client created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewMember {
+    /// The repository's main checkout. Its directory name is the repo name.
+    pub repo_root: PathBuf,
+    pub branch: String,
+    /// The worktree.
+    pub dir: PathBuf,
+}
+
+/// One agent run of a task member, from the daemon's ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
+    /// Id of the member the run belongs to.
+    pub member: String,
     pub provider: String,
     /// Agent session id, once known (resumed session or reported by the agent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +227,8 @@ pub struct WorktreeReport {
 pub enum Request {
     Spawn {
         provider: String,
+        /// Working directory. Empty for a member spawn.
+        #[serde(default)]
         dir: PathBuf,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -186,10 +238,12 @@ pub enum Request {
         resume_session: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
-        /// Task the agent runs for. The daemon records the run in the task's
-        /// ledger (start, session, end). Must name an existing task.
+        /// Id of the task member the agent runs for. The daemon runs it in
+        /// the member's worktree under the member id (leave `dir` empty and
+        /// `id` unset, or give the same values) and records the run in the
+        /// ledger (start, session, end).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        task: Option<String>,
+        member: Option<String>,
     },
     List,
     Kill {
@@ -225,11 +279,11 @@ pub enum Request {
     Hello {
         protocol_version: u32,
     },
-    /// Record a new task. Replies `Task`; pushes `TaskCreated`.
+    /// Record a new task with its members (worktrees the client created).
+    /// Replies `Task`; pushes `TaskCreated`.
     CreateTask {
         name: String,
-        dir: PathBuf,
-        owned: bool,
+        members: Vec<NewMember>,
     },
     /// All active tasks. Replies `Tasks`.
     ListTasks,
@@ -237,11 +291,22 @@ pub enum Request {
     GetTask {
         name: String,
     },
-    /// Drop a task: stop its agent, remove its worktree (owned tasks) and
+    /// Find one task member. Replies `Member`.
+    ///
+    /// `target` is a task name (the task's only member), `<task>/<member>`
+    /// (member short name) or a member id. Without a target, `dir` picks the
+    /// member whose worktree contains it.
+    ResolveMember {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
+    },
+    /// Drop a task: stop its agents, remove its members' worktrees and
     /// forget it. Replies `Dropped` and pushes `TaskDropped`; or replies
     /// `DropRefused`, changing nothing, when the drop would lose work and
-    /// `force` is unset; or replies `Error` when the worktree cannot be
-    /// removed (the agent is stopped then, the task kept).
+    /// `force` is unset; or replies `Error` when a worktree cannot be
+    /// removed (the agents are stopped then, the task kept).
     DropTask {
         name: String,
         /// Drop even if uncommitted changes or unmerged commits are lost.
@@ -282,6 +347,14 @@ pub enum Response {
     },
     Task {
         task: TaskInfo,
+        #[serde(default)]
+        runs: Vec<RunInfo>,
+    },
+    /// A task member, its task, and the member's runs.
+    Member {
+        task: TaskInfo,
+        /// Boxed: keeps `Response` small.
+        member: Box<MemberInfo>,
         #[serde(default)]
         runs: Vec<RunInfo>,
     },
@@ -410,7 +483,7 @@ mod tests {
             args: vec!["--verbose".into()],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -440,7 +513,7 @@ mod tests {
             args: vec![],
             resume_session: None,
             prompt: None,
-            task: None,
+            member: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -604,7 +677,7 @@ mod tests {
                 args,
                 resume_session,
                 prompt,
-                task,
+                member,
             } => {
                 assert_eq!(provider, "claude");
                 assert_eq!(dir, PathBuf::from("/tmp"));
@@ -613,7 +686,7 @@ mod tests {
                 // Backward compat: missing fields default correctly
                 assert!(resume_session.is_none());
                 assert!(prompt.is_none());
-                assert!(task.is_none());
+                assert!(member.is_none());
             }
             _ => panic!("wrong variant"),
         }
@@ -705,15 +778,45 @@ mod tests {
         }
     }
 
+    fn sample_member(id: &str, name: &str) -> MemberInfo {
+        MemberInfo {
+            id: id.into(),
+            name: name.into(),
+            repo: "myapp".into(),
+            repo_root: Some(PathBuf::from("/src/myapp")),
+            branch: "feat".into(),
+            dir: PathBuf::from("/tmp/myapp--feat"),
+        }
+    }
+
     fn sample_task() -> TaskInfo {
         TaskInfo {
             name: "feat".into(),
-            dir: PathBuf::from("/tmp/myapp--feat"),
-            owned: true,
+            members: vec![sample_member("m-1", "myapp")],
             created_at: 100,
             run_count: 2,
             last_activity: Some(200),
         }
+    }
+
+    #[test]
+    fn member_label_is_qualified_only_with_several_members() {
+        let mut task = sample_task();
+        assert_eq!(task.member_label(&task.members[0]), "feat");
+        task.members.push(sample_member("m-2", "api"));
+        assert_eq!(task.member_label(&task.members[1]), "feat/api");
+        assert_eq!(task.member("m-2").unwrap().name, "api");
+        assert!(task.member("m-3").is_none());
+    }
+
+    #[test]
+    fn member_info_omits_unknown_repo_root() {
+        let mut member = sample_member("m-1", "myapp");
+        member.repo_root = None;
+        let json = serde_json::to_string(&member).unwrap();
+        assert!(!json.contains("repo_root"), "{json}");
+        let back: MemberInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, member);
     }
 
     #[test]
@@ -748,14 +851,26 @@ mod tests {
     fn task_requests_wire_format() {
         let json = serde_json::to_string(&Request::CreateTask {
             name: "feat".into(),
-            dir: PathBuf::from("/tmp/feat"),
-            owned: true,
+            members: vec![NewMember {
+                repo_root: PathBuf::from("/src/app"),
+                branch: "feat".into(),
+                dir: PathBuf::from("/tmp/app--feat"),
+            }],
         })
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"create_task","name":"feat","dir":"/tmp/feat","owned":true}"#
+            r#"{"type":"create_task","name":"feat","members":[{"repo_root":"/src/app","branch":"feat","dir":"/tmp/app--feat"}]}"#
         );
+        let req: Request =
+            serde_json::from_str(r#"{"type":"resolve_member","target":"feat/app"}"#).unwrap();
+        match req {
+            Request::ResolveMember { target, dir } => {
+                assert_eq!(target.as_deref(), Some("feat/app"));
+                assert!(dir.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
         assert_eq!(
             serde_json::to_string(&Request::ListTasks).unwrap(),
             r#"{"type":"list_tasks"}"#
@@ -813,6 +928,7 @@ mod tests {
         let resp = Response::Task {
             task: sample_task(),
             runs: vec![RunInfo {
+                member: "m-1".into(),
                 provider: "claude".into(),
                 session_id: Some("s1".into()),
                 started_at: 150,
@@ -836,21 +952,44 @@ mod tests {
     }
 
     #[test]
-    fn spawn_task_field_roundtrip() {
+    fn spawn_member_field_roundtrip() {
         let req = Request::Spawn {
             provider: "claude".into(),
-            dir: PathBuf::from("/tmp"),
-            id: Some("feat".into()),
+            dir: PathBuf::new(),
+            id: None,
             args: vec![],
             resume_session: None,
             prompt: None,
-            task: Some("feat".into()),
+            member: Some("m-1".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"task\":\"feat\""));
+        assert!(json.contains("\"member\":\"m-1\""));
         match serde_json::from_str::<Request>(&json).unwrap() {
-            Request::Spawn { task, .. } => assert_eq!(task.as_deref(), Some("feat")),
+            Request::Spawn { member, .. } => assert_eq!(member.as_deref(), Some("m-1")),
             _ => panic!("wrong variant"),
+        }
+        // A member spawn may leave out the directory.
+        let json = r#"{"type":"spawn","provider":"claude","member":"m-1"}"#;
+        match serde_json::from_str::<Request>(json).unwrap() {
+            Request::Spawn { dir, .. } => assert!(dir.as_os_str().is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_member_is_not_mistaken_for_an_event() {
+        let resp = Response::Member {
+            task: sample_task(),
+            member: Box::new(sample_member("m-1", "myapp")),
+            runs: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"member\""));
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::Member { member, .. }) => {
+                assert_eq!(member.id, "m-1")
+            }
+            other => panic!("wrong message: {other:?}"),
         }
     }
 

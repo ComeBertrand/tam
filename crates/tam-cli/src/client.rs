@@ -6,7 +6,10 @@ use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
 use std::collections::VecDeque;
 use std::path::Path;
 
-use tam_proto::{AgentInfo, Request, Response, RunInfo, ServerMessage, TaskInfo, WorktreeReport};
+use tam_proto::{
+    AgentInfo, MemberInfo, NewMember, Request, Response, RunInfo, ServerMessage, TaskInfo,
+    WorktreeReport,
+};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::UnixStream;
@@ -217,11 +220,10 @@ impl Client {
         }
     }
 
-    pub async fn create_task(&mut self, name: &str, dir: &Path, owned: bool) -> Result<TaskInfo> {
+    pub async fn create_task(&mut self, name: &str, members: Vec<NewMember>) -> Result<TaskInfo> {
         let request = Request::CreateTask {
             name: name.into(),
-            dir: dir.into(),
-            owned,
+            members,
         };
         match self.send(request).await? {
             Response::Task { task, .. } => Ok(task),
@@ -229,8 +231,26 @@ impl Client {
         }
     }
 
-    /// Ask the daemon to drop a task (stop its agent, remove its worktree,
-    /// with `delete_branch` its branch too).
+    /// Find one task member: from a task name, `<task>/<member>` or a member
+    /// id, else from the member whose worktree contains `dir`. Returns the
+    /// member's task and runs too.
+    pub async fn resolve_member(
+        &mut self,
+        target: Option<&str>,
+        dir: Option<&Path>,
+    ) -> Result<(TaskInfo, MemberInfo, Vec<RunInfo>)> {
+        let request = Request::ResolveMember {
+            target: target.map(str::to_string),
+            dir: dir.map(Path::to_path_buf),
+        };
+        match self.send(request).await? {
+            Response::Member { task, member, runs } => Ok((task, *member, runs)),
+            other => Err(unexpected("ResolveMember", other)),
+        }
+    }
+
+    /// Ask the daemon to drop a task (stop its agents, remove its worktrees,
+    /// with `delete_branch` their branches too).
     pub async fn drop_task(
         &mut self,
         name: &str,
@@ -250,7 +270,8 @@ impl Client {
     }
 
     /// Attach to an agent from the CLI: enter raw mode, relay, restore on exit.
-    pub async fn attach(self, id: &str) -> Result<()> {
+    /// `label` names it in the detach message.
+    pub async fn attach(self, id: &str, label: &str) -> Result<()> {
         anyhow::ensure!(
             std::io::stdin().is_terminal(),
             "cannot attach: stdin is not a terminal"
@@ -261,7 +282,7 @@ impl Client {
         let result = self.attach_relay(id, cols, rows, terminal_size).await;
         restore_terminal(&original);
         reset_terminal_state();
-        eprintln!("[detached from {}]", id);
+        eprintln!("[detached from {}]", label);
         result
     }
 

@@ -14,16 +14,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Create a new task and start an agent
+    /// Create a new task in the current repository (a worktree on branch NAME)
+    /// and start an agent
     New {
-        /// Task name (used as branch name for owned worktrees)
+        /// Task name, also the name of its branch
         name: String,
 
-        /// Create an owned worktree for this task
-        #[arg(short, long)]
-        worktree: bool,
-
-        /// Branch from a specific ref (implies -w)
+        /// Branch from a specific ref (default: the repository's default branch)
         #[arg(short, long)]
         source: Option<String>,
 
@@ -34,7 +31,7 @@ pub enum Commands {
 
     /// Start or resume an agent in a task
     Run {
-        /// Task name (resolved from current directory if omitted)
+        /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
         name: Option<String>,
 
         /// Skip session picker, always start a new session
@@ -53,19 +50,19 @@ pub enum Commands {
         args: Vec<String>,
     },
 
-    /// Stop the agent in a task
+    /// Stop the agents of a task (or of one member: TASK/MEMBER)
     Stop {
-        /// Task name (resolved from current directory if omitted)
+        /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
         name: Option<String>,
     },
 
     /// Attach to a running agent
     Attach {
-        /// Task name (resolved from current directory if omitted)
+        /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
         name: Option<String>,
     },
 
-    /// Stop a task's agent, remove its worktree and forget it
+    /// Stop a task's agents, remove its worktrees and forget it
     ///
     /// Refuses when uncommitted changes would be lost, or with -b commits no
     /// other branch holds, unless confirmed or forced.
@@ -73,7 +70,7 @@ pub enum Commands {
         /// Task name
         name: String,
 
-        /// Also delete the worktree's git branch
+        /// Also delete the worktrees' git branches
         #[arg(short, long)]
         branch: bool,
 

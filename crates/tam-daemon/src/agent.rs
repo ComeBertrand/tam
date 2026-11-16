@@ -43,6 +43,8 @@ pub struct Agent {
     reported_state: AgentState,
     /// Cached context usage percentage, updated periodically.
     context_percent: Option<u8>,
+    /// Task this agent runs for, if any (its runs are recorded in the ledger).
+    task: Option<String>,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -130,6 +132,7 @@ impl Agent {
             last_output_at,
             reported_state: AgentState::Working,
             context_percent: None,
+            task: None,
             _reader_handle: reader_handle,
         })
     }
@@ -180,6 +183,23 @@ impl Agent {
         let _ = self.kill();
     }
 
+    /// Bind the agent to a task.
+    pub fn set_task(&mut self, task: Option<String>) {
+        self.task = task;
+    }
+
+    pub fn task(&self) -> Option<&str> {
+        self.task.as_deref()
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn provider_name(&self) -> &str {
+        self.provider.name()
+    }
+
     /// Set the stored state directly (used by hook-based providers).
     pub fn set_state(&mut self, state: AgentState) {
         self.state = state;
@@ -226,7 +246,7 @@ impl Agent {
             uptime_secs: self.started_at.elapsed().as_secs(),
             viewers: self.viewers.load(Ordering::Relaxed),
             context_percent: self.context_percent,
-            task: Some(id.to_string()),
+            task: self.task.clone(),
         }
     }
 

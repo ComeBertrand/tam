@@ -8,9 +8,9 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 ## Crate structure
 
 - `tam-proto`    — wire protocol types (daemon <-> client)
-- `tam-daemon`   — daemon: PTY management, agent lifecycle, state detection
+- `tam-daemon`   — daemon: PTY management, agent lifecycle, state detection, task ledger
 - `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init
-- `tam-cli`      — binary `tam`: CLI, TUI, task ledger, bridges worktrees and agents
+- `tam-cli`      — binary `tam`: CLI, TUI, bridges worktrees and agents
 
 Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-proto`.
 `tam-cli` depends on all three.
@@ -21,8 +21,14 @@ Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-pro
   filesystem + activity timestamps, never stored. See `task.rs`
   `GitBranchStatus` + `Task::status()`. Staleness is time-based (30 days
   without activity), not git-merge-based.
-- **Ledger is append-only JSONL** — `~/.local/share/tam/ledger.jsonl`. Records
-  events (TaskCreated, AgentRunStarted, etc.), never states.
+- **Daemon owns the ledger** — append-only JSONL at
+  `$XDG_DATA_HOME/tam/ledger.jsonl` (`tam-daemon/src/ledger.rs`). Records events
+  (TaskCreated, AgentRunStarted, etc.), never states. The daemon is the only
+  writer (flock on `ledger.jsonl.lock`), records agent runs itself (Spawn with
+  `task`), compacts on start and sets malformed lines aside in
+  `ledger.jsonl.rejected`. Clients use task requests (CreateTask, ListTasks,
+  GetTask, DropTask) and get TaskCreated/TaskUpdated/TaskDropped events after
+  `Subscribe`; `tam-cli` never touches the ledger file.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
   daemon exits after 30s with no agents and no clients.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state

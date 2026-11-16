@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Protocol version. Increment on any breaking wire format change.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What an agent is doing right now.
 /// Agents that exit (successfully or with error) are cleaned up immediately —
@@ -48,6 +48,42 @@ pub struct AgentInfo {
     pub task: Option<String>,
 }
 
+/// Summary of a task, as derived by the daemon from its ledger.
+///
+/// New fields must be optional (`#[serde(default)]`) so older clients keep
+/// decoding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub name: String,
+    pub dir: PathBuf,
+    /// The task owns its directory (a worktree created for it).
+    pub owned: bool,
+    /// Unix timestamp (seconds) of the task's creation.
+    pub created_at: u64,
+    /// Number of agent runs started in this task.
+    #[serde(default)]
+    pub run_count: usize,
+    /// Unix timestamp (seconds) of the latest task or run event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<u64>,
+}
+
+/// One agent run in a task, from the daemon's ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInfo {
+    pub provider: String,
+    /// Agent session id, once known (resumed session or reported by the agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub started_at: u64,
+    /// `None` while the run is still going (or if the daemon died under it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<u64>,
+    /// Exit code of the agent; -1 when it was killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 /// Client -> Daemon request.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -63,6 +99,10 @@ pub enum Request {
         resume_session: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        /// Task the agent runs for. The daemon records the run in the task's
+        /// ledger (start, session, end). Must name an existing task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
     },
     List,
     Kill {
@@ -93,19 +133,59 @@ pub enum Request {
     Hello {
         protocol_version: u32,
     },
+    /// Record a new task. Replies `Task`; pushes `TaskCreated`.
+    CreateTask {
+        name: String,
+        dir: PathBuf,
+        owned: bool,
+    },
+    /// All active tasks. Replies `Tasks`.
+    ListTasks,
+    /// One task with its run history. Replies `Task`.
+    GetTask {
+        name: String,
+    },
+    /// Stop the task's agent (if running) and forget the task. The client
+    /// removes the worktree first and says so with `worktree_deleted`.
+    /// Replies `Ok`; pushes `TaskDropped`.
+    DropTask {
+        name: String,
+        #[serde(default)]
+        worktree_deleted: bool,
+    },
+    /// Receive pushed `Event`s on this connection from now on. Replies `Ok`.
+    Subscribe,
 }
 
 /// Daemon -> Client response.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Spawned { id: String },
-    Agents { agents: Vec<AgentInfo> },
+    Spawned {
+        id: String,
+    },
+    Agents {
+        agents: Vec<AgentInfo>,
+    },
     Attached,
-    Scrollback { data: String },
+    Scrollback {
+        data: String,
+    },
     Ok,
-    Error { message: String },
-    Hello { protocol_version: u32 },
+    Error {
+        message: String,
+    },
+    Hello {
+        protocol_version: u32,
+    },
+    Tasks {
+        tasks: Vec<TaskInfo>,
+    },
+    Task {
+        task: TaskInfo,
+        #[serde(default)]
+        runs: Vec<RunInfo>,
+    },
 }
 
 /// Daemon -> Client pushed event (unsolicited).
@@ -130,9 +210,11 @@ pub enum Event {
         context_percent: u8,
     },
     TaskCreated {
-        name: String,
-        dir: PathBuf,
-        owned: bool,
+        task: TaskInfo,
+    },
+    /// A task's summary changed (e.g. a run started or ended).
+    TaskUpdated {
+        task: TaskInfo,
     },
     TaskDropped {
         name: String,
@@ -210,6 +292,7 @@ mod tests {
             args: vec!["--verbose".into()],
             resume_session: None,
             prompt: None,
+            task: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -239,6 +322,7 @@ mod tests {
             args: vec![],
             resume_session: None,
             prompt: None,
+            task: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -359,6 +443,7 @@ mod tests {
                 args,
                 resume_session,
                 prompt,
+                task,
             } => {
                 assert_eq!(provider, "claude");
                 assert_eq!(dir, PathBuf::from("/tmp"));
@@ -367,6 +452,7 @@ mod tests {
                 // Backward compat: missing fields default correctly
                 assert!(resume_session.is_none());
                 assert!(prompt.is_none());
+                assert!(task.is_none());
             }
             _ => panic!("wrong variant"),
         }
@@ -458,22 +544,120 @@ mod tests {
         }
     }
 
-    #[test]
-    fn event_task_created_serde() {
-        let event = Event::TaskCreated {
+    fn sample_task() -> TaskInfo {
+        TaskInfo {
             name: "feat".into(),
             dir: PathBuf::from("/tmp/myapp--feat"),
             owned: true,
+            created_at: 100,
+            run_count: 2,
+            last_activity: Some(200),
+        }
+    }
+
+    #[test]
+    fn event_task_created_serde() {
+        let event = Event::TaskCreated {
+            task: sample_task(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"task_created\""));
         let back: Event = serde_json::from_str(&json).unwrap();
         match back {
-            Event::TaskCreated { name, dir, owned } => {
+            Event::TaskCreated { task } => assert_eq!(task, sample_task()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn event_task_updated_serde() {
+        let event = Event::TaskUpdated {
+            task: sample_task(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"task_updated\""));
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::Event(Event::TaskUpdated { .. })
+        ));
+    }
+
+    #[test]
+    fn task_requests_wire_format() {
+        let json = serde_json::to_string(&Request::CreateTask {
+            name: "feat".into(),
+            dir: PathBuf::from("/tmp/feat"),
+            owned: true,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"create_task","name":"feat","dir":"/tmp/feat","owned":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ListTasks).unwrap(),
+            r#"{"type":"list_tasks"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Subscribe).unwrap(),
+            r#"{"type":"subscribe"}"#
+        );
+        let req: Request = serde_json::from_str(r#"{"type":"drop_task","name":"feat"}"#).unwrap();
+        match req {
+            Request::DropTask {
+                name,
+                worktree_deleted,
+            } => {
                 assert_eq!(name, "feat");
-                assert_eq!(dir, PathBuf::from("/tmp/myapp--feat"));
-                assert!(owned);
+                assert!(!worktree_deleted);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn response_task_is_not_mistaken_for_an_event() {
+        let resp = Response::Task {
+            task: sample_task(),
+            runs: vec![RunInfo {
+                provider: "claude".into(),
+                session_id: Some("s1".into()),
+                started_at: 150,
+                ended_at: None,
+                exit_code: None,
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("ended_at"),
+            "open run omits ended_at: {json}"
+        );
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::Task { task, runs }) => {
+                assert_eq!(task, sample_task());
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].session_id.as_deref(), Some("s1"));
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_task_field_roundtrip() {
+        let req = Request::Spawn {
+            provider: "claude".into(),
+            dir: PathBuf::from("/tmp"),
+            id: Some("feat".into()),
+            args: vec![],
+            resume_session: None,
+            prompt: None,
+            task: Some("feat".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"task\":\"feat\""));
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Spawn { task, .. } => assert_eq!(task.as_deref(), Some("feat")),
             _ => panic!("wrong variant"),
         }
     }

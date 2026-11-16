@@ -17,17 +17,17 @@ struct SessionInfo {
 pub fn list_sessions_for_task(
     provider: &str,
     dir: &Path,
-    task_runs: &[crate::ledger::RunInfo],
+    task_runs: &[tam_proto::RunInfo],
 ) -> Vec<SessionDisplay> {
     let all = list_sessions(provider, dir);
 
     // Only consider ledger runs matching this provider, collect session IDs
     // ordered by most recent run timestamp.
-    let mut matching: Vec<&crate::ledger::RunInfo> = task_runs
+    let mut matching: Vec<&tam_proto::RunInfo> = task_runs
         .iter()
         .filter(|r| r.provider == provider && r.session_id.is_some())
         .collect();
-    matching.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
+    matching.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     let mut known_ids: Vec<&str> = matching
         .iter()
         .filter_map(|r| r.session_id.as_deref())

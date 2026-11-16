@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tam_proto::AgentInfo;
+use tam_proto::{AgentInfo, TaskInfo};
 
 use crate::config::CustomCommand;
 use crate::task::{Task, TaskStatus};
@@ -178,6 +178,44 @@ impl App {
         }
     }
 
+    /// Add a task, or replace the one with the same name.
+    pub fn upsert_task(&mut self, task: Task) {
+        let prev = self.selected_task().map(|t| t.name.clone());
+        match self.tasks.iter_mut().find(|t| t.name == task.name) {
+            Some(existing) => *existing = task,
+            None => self.tasks.push(task),
+        }
+        self.sort_tasks();
+        self.reselect(prev);
+    }
+
+    /// Apply the daemon's latest summary of a task.
+    pub fn update_task_info(&mut self, info: TaskInfo) {
+        let prev = self.selected_task().map(|t| t.name.clone());
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.name == info.name) {
+            task.update_info(info);
+            self.sort_tasks();
+            self.reselect(prev);
+        }
+    }
+
+    pub fn remove_task(&mut self, name: &str) {
+        let prev = self.selected_task().map(|t| t.name.clone());
+        self.tasks.retain(|t| t.name != name);
+        self.reselect(prev);
+    }
+
+    /// Keep the selection on the named task if it is still visible.
+    fn reselect(&mut self, name: Option<String>) {
+        if let Some(name) = name {
+            if let Some(pos) = self.visible_tasks().iter().position(|t| t.name == name) {
+                self.selected = pos;
+                return;
+            }
+        }
+        self.clamp_selection();
+    }
+
     /// Update agent info for a task by matching agent ID to task name.
     pub fn update_agent(&mut self, info: AgentInfo) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.name == info.id) {
@@ -207,6 +245,7 @@ impl App {
     pub fn remove_agent(&mut self, id: &str) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.name == id) {
             task.agent_info = None;
+            task.refresh_git_status();
             self.sort_tasks();
         }
         self.clamp_selection();
@@ -229,9 +268,7 @@ impl App {
     /// Refresh git branch status for owned idle tasks and re-sort.
     pub fn refresh_git_status(&mut self) {
         for t in &mut self.tasks {
-            if t.owned && t.agent_info.is_none() {
-                t.git_branch_status = crate::task::check_git_branch_status(&t.name, &t.dir);
-            }
+            t.refresh_git_status();
         }
         self.sort_tasks();
         self.clamp_selection();

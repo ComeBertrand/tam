@@ -3,7 +3,10 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result};
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg, Termios};
-use tam_proto::{Request, Response, ServerMessage};
+use std::collections::VecDeque;
+use std::path::Path;
+
+use tam_proto::{AgentInfo, Request, Response, RunInfo, ServerMessage, TaskInfo};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::UnixStream;
@@ -24,7 +27,8 @@ const RESIZE_TIMEOUT: Duration = Duration::from_millis(500);
 pub struct Client {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
-    pending_events: Vec<tam_proto::Event>,
+    /// Events that arrived while waiting for a response, oldest first.
+    pending_events: VecDeque<tam_proto::Event>,
 }
 
 impl Client {
@@ -37,7 +41,7 @@ impl Client {
                 let mut client = Self {
                     reader: BufReader::new(reader),
                     writer,
-                    pending_events: Vec::new(),
+                    pending_events: VecDeque::new(),
                 };
                 client.handshake().await?;
                 Ok(Some(client))
@@ -76,7 +80,7 @@ impl Client {
         let mut client = Self {
             reader: BufReader::new(reader),
             writer,
-            pending_events: Vec::new(),
+            pending_events: VecDeque::new(),
         };
         client.handshake().await?;
         Ok(client)
@@ -147,7 +151,7 @@ impl Client {
                 serde_json::from_str(line.trim()).context("failed to parse daemon message")?;
             match msg {
                 ServerMessage::Response(resp) => return Ok(resp),
-                ServerMessage::Event(event) => self.pending_events.push(event),
+                ServerMessage::Event(event) => self.pending_events.push_back(event),
             }
         }
     }
@@ -155,7 +159,7 @@ impl Client {
     /// Read the next message from the daemon (blocking).
     /// Returns buffered events first, then waits on the socket.
     pub async fn read_message(&mut self) -> Result<ServerMessage> {
-        if let Some(event) = self.pending_events.pop() {
+        if let Some(event) = self.pending_events.pop_front() {
             return Ok(ServerMessage::Event(event));
         }
 
@@ -169,6 +173,59 @@ impl Client {
             anyhow::bail!("lost connection to daemon");
         }
         serde_json::from_str(line.trim()).context("failed to parse daemon message")
+    }
+
+    /// Receive pushed daemon events on this connection (see `read_message`).
+    pub async fn subscribe(&mut self) -> Result<()> {
+        match self.send(Request::Subscribe).await? {
+            Response::Ok => Ok(()),
+            other => Err(unexpected("Subscribe", other)),
+        }
+    }
+
+    pub async fn list_agents(&mut self) -> Result<Vec<AgentInfo>> {
+        match self.send(Request::List).await? {
+            Response::Agents { agents } => Ok(agents),
+            other => Err(unexpected("List", other)),
+        }
+    }
+
+    pub async fn list_tasks(&mut self) -> Result<Vec<TaskInfo>> {
+        match self.send(Request::ListTasks).await? {
+            Response::Tasks { tasks } => Ok(tasks),
+            other => Err(unexpected("ListTasks", other)),
+        }
+    }
+
+    /// A task and its run history. Errors if the task does not exist.
+    pub async fn get_task(&mut self, name: &str) -> Result<(TaskInfo, Vec<RunInfo>)> {
+        match self.send(Request::GetTask { name: name.into() }).await? {
+            Response::Task { task, runs } => Ok((task, runs)),
+            other => Err(unexpected("GetTask", other)),
+        }
+    }
+
+    pub async fn create_task(&mut self, name: &str, dir: &Path, owned: bool) -> Result<TaskInfo> {
+        let request = Request::CreateTask {
+            name: name.into(),
+            dir: dir.into(),
+            owned,
+        };
+        match self.send(request).await? {
+            Response::Task { task, .. } => Ok(task),
+            other => Err(unexpected("CreateTask", other)),
+        }
+    }
+
+    pub async fn drop_task(&mut self, name: &str, worktree_deleted: bool) -> Result<()> {
+        let request = Request::DropTask {
+            name: name.into(),
+            worktree_deleted,
+        };
+        match self.send(request).await? {
+            Response::Ok => Ok(()),
+            other => Err(unexpected("DropTask", other)),
+        }
     }
 
     /// Attach to an agent from the CLI: enter raw mode, relay, restore on exit.
@@ -291,6 +348,14 @@ impl Client {
         }
 
         Ok(())
+    }
+}
+
+/// Turn a daemon error (or an unexpected reply) into an error.
+fn unexpected(request: &str, response: Response) -> anyhow::Error {
+    match response {
+        Response::Error { message } => anyhow::anyhow!("{message}"),
+        other => anyhow::anyhow!("unexpected response to {request}: {other:?}"),
     }
 }
 

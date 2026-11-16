@@ -170,7 +170,7 @@ pub fn run_custom_command(
     Ok(())
 }
 
-const RESERVED_KEYS: &[char] = &['q', 'j', 'k', 'n', 'r', 's', 'p', 'd', '/'];
+const RESERVED_KEYS: &[char] = &['q', 'j', 'k', 'n', 'r', 'R', 's', 'p', 'd', '/'];
 
 fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
@@ -195,93 +195,6 @@ fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Display info for a session in the picker.
-pub struct SessionDisplay {
-    pub id: String,
-    pub summary: String,
-    pub turns: usize,
-    pub age: String,
-}
-
-fn format_session_line(s: &SessionDisplay) -> String {
-    format!("[{}] {} ({} turns)", s.age, s.summary, s.turns)
-}
-
-pub fn pick_session(sessions: &[SessionDisplay]) -> Result<Option<String>> {
-    if let Ok(result) = pick_session_fzf(sessions) {
-        return Ok(result);
-    }
-    let mut stdin = std::io::stdin().lock();
-    let mut stderr = std::io::stderr();
-    pick_session_fallback(&mut stdin, &mut stderr, sessions)
-}
-
-fn pick_session_fzf(sessions: &[SessionDisplay]) -> Result<Option<String>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("fzf")
-        .args(["--header", "Pick session", "--height", "~50%"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-
-    let mut fzf_stdin = child.stdin.take().context("failed to open fzf stdin")?;
-    writeln!(fzf_stdin, "new session")?;
-    for s in sessions {
-        writeln!(fzf_stdin, "{}", format_session_line(s))?;
-    }
-    drop(fzf_stdin);
-
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let choice = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if choice == "new session" || choice.is_empty() {
-        return Ok(None);
-    }
-
-    for s in sessions {
-        if format_session_line(s) == choice {
-            return Ok(Some(s.id.clone()));
-        }
-    }
-
-    Ok(None)
-}
-
-pub fn pick_session_fallback(
-    reader: &mut dyn std::io::BufRead,
-    writer: &mut dyn std::io::Write,
-    sessions: &[SessionDisplay],
-) -> Result<Option<String>> {
-    writeln!(writer, "  1) new session (default)")?;
-    for (i, s) in sessions.iter().enumerate() {
-        writeln!(writer, "  {}) {}", i + 2, format_session_line(s))?;
-    }
-    write!(writer, "Pick session [1]: ")?;
-    writer.flush()?;
-
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let trimmed = line.trim();
-
-    if trimmed.is_empty() || trimmed == "1" {
-        return Ok(None);
-    }
-
-    match trimmed.parse::<usize>() {
-        Ok(n) if n >= 2 && n <= sessions.len() + 1 => Ok(Some(sessions[n - 2].id.clone())),
-        _ => {
-            writeln!(writer, "Invalid choice, starting new session.")?;
-            Ok(None)
-        }
-    }
 }
 
 pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex"];
@@ -425,6 +338,16 @@ finder = "fzf"
     }
 
     #[test]
+    fn run_keys_are_reserved() {
+        for key in ["r", "R"] {
+            let toml =
+                format!("[[tui.commands]]\nname = \"x\"\nkey = \"{key}\"\ncommand = \"true\"\n");
+            let err = parse_config(&toml).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{key}: {err}");
+        }
+    }
+
+    #[test]
     fn validate_known_provider() {
         assert!(validate_provider("claude").is_ok());
     }
@@ -448,41 +371,6 @@ finder = "fzf"
     #[test]
     fn shell_quote_injection() {
         assert_eq!(shell_quote("/tmp/foo; rm -rf /"), "'/tmp/foo; rm -rf /'");
-    }
-
-    fn make_sessions() -> Vec<SessionDisplay> {
-        vec![
-            SessionDisplay {
-                id: "sess-1".into(),
-                summary: "fix-auth-bug".into(),
-                turns: 42,
-                age: "2h ago".into(),
-            },
-            SessionDisplay {
-                id: "sess-2".into(),
-                summary: "add-tests".into(),
-                turns: 15,
-                age: "1d ago".into(),
-            },
-        ]
-    }
-
-    #[test]
-    fn pick_session_default_is_new() {
-        let sessions = make_sessions();
-        let mut reader = std::io::Cursor::new(b"\n".to_vec());
-        let mut writer = Vec::new();
-        let result = pick_session_fallback(&mut reader, &mut writer, &sessions).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn pick_session_select_first() {
-        let sessions = make_sessions();
-        let mut reader = std::io::Cursor::new(b"2\n".to_vec());
-        let mut writer = Vec::new();
-        let result = pick_session_fallback(&mut reader, &mut writer, &sessions).unwrap();
-        assert_eq!(result.as_deref(), Some("sess-1"));
     }
 
     #[test]

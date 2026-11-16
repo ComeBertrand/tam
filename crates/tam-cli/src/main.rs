@@ -8,12 +8,11 @@ mod client;
 mod config;
 mod drop_report;
 mod hook;
-mod sessions;
 mod task;
 mod tui;
 
 use cli::{Cli, Commands};
-use tam_proto::{MemberInfo, RunInfo, TaskInfo};
+use tam_proto::{MemberInfo, RunInfo, SessionChoice, TaskInfo};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,54 +48,41 @@ async fn main() -> Result<()> {
             println!("Created task '{}' at {}", name, member.dir.display());
 
             if !no_start {
-                spawn_and_attach(
-                    &mut client,
-                    &task,
-                    &member,
-                    config.default_agent.clone(),
-                    vec![],
-                    None,
-                    None,
-                )
-                .await?;
+                let start = Start {
+                    agent: None,
+                    session: SessionChoice::New,
+                    prompt: None,
+                    args: vec![],
+                };
+                run_and_attach(&mut client, &task, &member, &config, start).await?;
             }
         }
 
         Commands::Run {
             name,
             new_session,
+            session,
             agent,
             prompt,
             args,
         } => {
             let mut client = client::Client::connect().await?;
-            let (task, member, runs) = resolve_member(&mut client, name.as_deref()).await?;
+            let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
+            config::validate_provider(agent.as_ref().unwrap_or(&config.default_agent))?;
 
-            let agent = agent.unwrap_or_else(|| config.default_agent.clone());
-            config::validate_provider(&agent)?;
-
-            // Resolve session — cross-reference ledger runs with filesystem sessions
-            let resume_session = if new_session || !std::io::stdin().is_terminal() {
-                None
-            } else {
-                let found = sessions::list_sessions_for_task(&agent, &member.dir, &runs);
-                if found.is_empty() {
-                    None
-                } else {
-                    config::pick_session(&found)?
-                }
+            // The daemon resumes the member's current session by default.
+            let session = match session {
+                Some(id) => SessionChoice::Id(id),
+                None if new_session => SessionChoice::New,
+                None => SessionChoice::Current,
             };
-
-            spawn_and_attach(
-                &mut client,
-                &task,
-                &member,
+            let start = Start {
                 agent,
-                args,
-                resume_session,
+                session,
                 prompt,
-            )
-            .await?;
+                args,
+            };
+            run_and_attach(&mut client, &task, &member, &config, start).await?;
         }
 
         Commands::Stop { name } => {
@@ -400,40 +386,36 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Start an agent for a task member (the daemon runs it in the member's
-/// worktree and records the run), then attach.
-async fn spawn_and_attach(
+/// How to start a member's agent.
+struct Start {
+    /// Unset: the member's last agent, else the configured default.
+    agent: Option<String>,
+    session: SessionChoice,
+    prompt: Option<String>,
+    args: Vec<String>,
+}
+
+/// Start an agent for a task member (the daemon picks the session, runs it
+/// in the member's worktree and records the run), then attach.
+async fn run_and_attach(
     client: &mut client::Client,
     task: &TaskInfo,
     member: &MemberInfo,
-    provider: String,
-    args: Vec<String>,
-    resume_session: Option<String>,
-    prompt: Option<String>,
+    config: &config::Config,
+    start: Start,
 ) -> Result<()> {
-    let resp = client
-        .send(tam_proto::Request::Spawn {
-            provider,
-            dir: std::path::PathBuf::new(),
-            id: None,
-            args,
-            resume_session,
-            prompt,
-            member: Some(member.id.clone()),
-        })
+    let (id, _resumed) = client
+        .run_agent(
+            &member.id,
+            start.agent,
+            &config.default_agent,
+            start.session,
+            start.prompt,
+            start.args,
+        )
         .await?;
-
-    match resp {
-        tam_proto::Response::Spawned { id } => {
-            let client = client::Client::connect().await?;
-            client.attach(&id, &task.member_label(member)).await
-        }
-        tam_proto::Response::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
-        }
-        _ => Ok(()),
-    }
+    let client = client::Client::connect().await?;
+    client.attach(&id, &task.member_label(member)).await
 }
 
 /// Ask a yes/no question on the terminal; `false` without one.

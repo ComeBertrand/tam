@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tam_proto::{AgentInfo, AgentState, Event, NewMember, Request, Response};
+use tam_proto::{AgentInfo, AgentState, Event, NewMember, Request, Response, SessionChoice};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
@@ -368,9 +368,12 @@ impl DaemonState {
     }
 
     /// Agents bound to a member whose current run has no session id yet.
+    /// Not those whose hooks report their sessions: they report one once it
+    /// has a turn, and a session found earlier could not be resumed.
     fn session_jobs(&self) -> Vec<SessionJob> {
         self.agents
             .values()
+            .filter(|agent| !agent.reports_sessions())
             .filter_map(|agent| {
                 let member = agent.member()?;
                 let run = self.ledger.member_runs(member).pop()?;
@@ -383,12 +386,12 @@ impl DaemonState {
             .collect()
     }
 
-    /// Record the session id reported by an agent's hooks for its member's
-    /// current run (first one only; later ones are e.g. `/clear`).
+    /// Record the session an agent's hooks showed a turn in as its member's
+    /// current run's session (it changes on e.g. `/clear`).
     fn record_hook_session(&mut self, member: &str, session_id: &str) {
-        match self.ledger.session_identified(member, session_id) {
+        match self.ledger.session_reported(member, session_id) {
             Ok(true) => {
-                info!(member = %member, session = %session_id, "session identified by hook")
+                info!(member = %member, session = %session_id, "session reported by hook")
             }
             Ok(false) => {}
             Err(e) => error!(member = %member, "failed to record session: {e:#}"),
@@ -721,6 +724,27 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                 }
             }
         }
+        Request::RunAgent {
+            member,
+            provider,
+            default_provider,
+            session,
+            args,
+            prompt,
+        } => {
+            handle_run_agent(
+                state,
+                RunSpec {
+                    member,
+                    provider,
+                    default_provider,
+                    session,
+                    args,
+                    prompt,
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -834,6 +858,102 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
     }
 }
 
+struct RunSpec {
+    member: String,
+    provider: Option<String>,
+    default_provider: String,
+    session: SessionChoice,
+    args: Vec<String>,
+    prompt: Option<String>,
+}
+
+/// Start a member's agent: the requested agent, else the member's last one,
+/// in the member's current session for that agent unless told otherwise.
+async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Response {
+    let RunSpec {
+        member,
+        provider,
+        default_provider,
+        session,
+        args,
+        prompt,
+    } = spec;
+
+    let (label, provider, current) = {
+        let state = state.lock().await;
+        let Some((task, info)) = state.ledger.member(&member) else {
+            return Response::Error {
+                message: format!("member '{}' not found", member),
+            };
+        };
+        let label = task.member_label(&info);
+        // Before looking for the session: it would not be resumed anyway.
+        if state.agents.contains_key(&member) {
+            return Response::Error {
+                message: format!("'{}' already has a running agent", label),
+            };
+        }
+        let provider = provider
+            .or_else(|| state.ledger.last_provider(&member))
+            .unwrap_or(default_provider);
+        let current = state.ledger.current_session(&member, &provider);
+        (label, provider, current)
+    };
+
+    let agent = provider::resolve(&provider);
+    let resume_session = match session {
+        SessionChoice::New => None,
+        SessionChoice::Id(id) => {
+            if !agent.can_resume() {
+                return Response::Error {
+                    message: format!("agent '{}' cannot resume a session", provider),
+                };
+            }
+            Some(id)
+        }
+        // Agents that report no sessions have no current one: tam would
+        // resume the one it started them in, not the one they ended in.
+        SessionChoice::Current => match current {
+            Some(id) if agent.reports_sessions() => {
+                // Outside the lock: it reads the provider's files.
+                if !agent.session_exists(&id) {
+                    return Response::Error {
+                        message: format!(
+                            "the {} session of '{}' ({}) can no longer be resumed: start a \
+                             new one (R in the TUI, tam run --new-session)",
+                            provider, label, id
+                        ),
+                    };
+                }
+                Some(id)
+            }
+            _ => None,
+        },
+    };
+
+    // The spawn checks the member again (e.g. no agent started meanwhile).
+    let response = handle_spawn(
+        state,
+        SpawnSpec {
+            provider,
+            dir: PathBuf::new(),
+            id: None,
+            args,
+            resume_session: resume_session.clone(),
+            prompt,
+            member: Some(member),
+        },
+    )
+    .await;
+    match response {
+        Response::Spawned { id } => Response::Running {
+            id,
+            resumed: resume_session,
+        },
+        other => other,
+    }
+}
+
 async fn handle_list(state: &Arc<Mutex<DaemonState>>) -> Response {
     let mut state = state.lock().await;
 
@@ -932,7 +1052,7 @@ async fn handle_hook_event(
     let changed = agent.info(agent_id).detail != before;
     let session = agent
         .member()
-        .zip(agent.session_id())
+        .zip(agent.resumable_session())
         .map(|(member, session)| (member.to_string(), session.to_string()));
     if changed {
         if let Some(info) = state.agent_info(agent_id) {

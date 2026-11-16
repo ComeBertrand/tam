@@ -70,7 +70,7 @@ tam
 - **Task = worktree + agent** — `tam new feat` creates a branch, a worktree, and optionally starts an agent, all under one name
 - **Derived status** — never stores lifecycle state; computes it from the daemon, git, and filesystem every time you look
 - **TUI dashboard** — real-time task table with peek mode (scrollback preview without attaching)
-- **Session resume** — pick up where you left off or start fresh; session history is tracked in an append-only ledger
+- **Session resume** — a task picks up its current session with no question asked, or starts a fresh one on request; session history is tracked in an append-only ledger
 - **Auto-daemon** — the daemon starts on first command and shuts down after 30s idle; no manual management
 - **Per-repo init** — `.tam.toml` copies untracked files and runs setup commands in new worktrees
 - **Desktop notifications** — configurable alerts when agents need input or hit permission prompts
@@ -84,8 +84,9 @@ tam
 tam new NAME                   Create task: branch NAME and its worktree, in the current repo
 tam new NAME -s REF            Branch from a specific ref
 
-tam run NAME                   Start/resume an agent in the task
-tam run NAME --new-session     Start a fresh session
+tam run NAME                   Start the task's agent, resuming its current session
+tam run NAME --new-session     Start a new session instead
+tam run NAME --session ID      Resume a given agent session
 
 tam stop NAME                  Kill the task's agents (task persists)
 tam stop                       Resolve the member from the current directory
@@ -129,11 +130,11 @@ Running `tam` with no arguments opens the dashboard:
 │  ○ idle    myapp    refactor      -       ~/wt/myapp--refactor       -     │
 │  ◌ stale   other    old-thing     -       ~/wt/other--old-thing      -     │
 ├────────────────────────────────────────────────────────────────────────────┤
-│  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit                │
+│  enter:attach  n:new  r:run  R:new session  s:stop  d:drop  p:peek  q:quit │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs an agent, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation), `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
+Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation), `p` toggles peek (scrollback preview), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
 
 Tasks are sorted by repository name, then by status priority (blocked/question → error → input → running → idle → stale → gone), then by task name.
 
@@ -205,6 +206,8 @@ commands = ["npm install"]
 | **Any CLI** | PTY heuristic (5s idle) | None | None |
 
 Claude Code reports state changes through hooks that TAM injects into each agent it spawns (`claude --settings`, nothing is written to your Claude settings): TAM knows the moment an agent finishes, asks a question, needs a permission or fails on an API error. Claude runs no hooks until a folder is trusted, so a new worktree shows `input` while Claude's trust prompt waits. An interrupted turn fires no hook; TAM takes a working agent silent for 10s as back at the prompt. If you ran `tam init --agent claude` with an older version, run it again to remove the global hooks it installed. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
+
+Each task member has a current session per agent, which `tam run` and `r` resume: for Claude Code, the last session the agent had a turn in, as its hooks report it (so a `/clear` followed by a prompt moves it). `tam run --new-session` and `R` start a new one, which becomes current once you use it. A session whose transcript Claude deleted is not resumed: TAM says so and you start a new one. Codex and other agents report no sessions: they start a new session unless given one (`tam run --session ID`, codex only).
 
 ## Install
 

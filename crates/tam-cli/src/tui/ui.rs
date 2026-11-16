@@ -64,7 +64,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Overlay popups
     match &app.mode {
         Mode::Normal => {}
-        Mode::NewTaskPickProject(picker) | Mode::RunPickSession { picker, .. } => {
+        Mode::NewTaskPickProject(picker) => {
             render_picker_popup(frame, picker);
         }
         Mode::NewTaskEnterName { name, .. } => {
@@ -222,7 +222,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                         Span::raw(":stop  "),
                     ]);
                 } else if selected.is_some() {
-                    hints.extend([Span::styled(" r", Style::new().bold()), Span::raw(":run  ")]);
+                    hints.extend([
+                        Span::styled(" r", Style::new().bold()),
+                        Span::raw(":run  "),
+                        Span::styled("R", Style::new().bold()),
+                        Span::raw(":new session  "),
+                    ]);
                 }
                 hints.extend([
                     Span::styled("n", Style::new().bold()),

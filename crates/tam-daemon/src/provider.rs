@@ -28,6 +28,10 @@ pub struct HookData {
     pub detail: AgentDetail,
     /// The agent's session transcript (used for context usage).
     pub transcript_path: Option<PathBuf>,
+    /// The last session the agent had a turn in (or was resumed into): one
+    /// it can be resumed into later. A session nobody typed in has no
+    /// transcript yet, and resuming it fails.
+    pub resumable_session: Option<String>,
 }
 
 /// Outcome of a hook event for a provider.
@@ -97,10 +101,31 @@ pub trait Provider: Send + Sync {
         None
     }
 
-    /// Session id of the running agent process, if the provider can tell.
-    /// Used to record new sessions in the ledger so they can be resumed.
+    /// Session id of the running agent process, if the provider can tell
+    /// without hooks. Used to record new sessions in the ledger so they can
+    /// be resumed. Not asked of providers that `reports_sessions()`: a
+    /// session found this way may have no turn yet, and none to resume.
     fn session_id(&self, _pid: u32) -> Option<String> {
         None
+    }
+
+    /// Whether the agent can start in an existing session (`resume_session`
+    /// of `build_command`).
+    fn can_resume(&self) -> bool {
+        false
+    }
+
+    /// Whether the agent reports the sessions it has turns in (through its
+    /// hooks), so that tam knows which one to resume. Without it a member
+    /// has no current session for this agent.
+    fn reports_sessions(&self) -> bool {
+        false
+    }
+
+    /// Whether `session` can still be resumed, as far as the provider can
+    /// tell (`true` when it cannot).
+    fn session_exists(&self, _session: &str) -> bool {
+        true
     }
 }
 
@@ -238,8 +263,19 @@ impl Provider for ClaudeProvider {
         claude_context_usage(pid, dir, transcript)
     }
 
-    fn session_id(&self, pid: u32) -> Option<String> {
-        claude_session_id(pid)
+    fn can_resume(&self) -> bool {
+        true
+    }
+
+    fn reports_sessions(&self) -> bool {
+        true
+    }
+
+    fn session_exists(&self, session: &str) -> bool {
+        match claude_config_dir() {
+            Some(dir) => claude_transcript_exists(&dir, session),
+            None => true,
+        }
     }
 }
 
@@ -256,6 +292,16 @@ fn claude_handle_hook(
     // Every event carries the session; it changes on /clear, /resume…
     if let Some(id) = str_field(p, "session_id") {
         data.detail.session_id = Some(id.to_string());
+        // A session can be resumed once it has a conversation: after a turn,
+        // or when it was resumed. Not a new one (startup, /clear) yet.
+        let resumable = match event {
+            "SessionStart" => str_field(p, "source") == Some("resume"),
+            "SessionEnd" | "Notification" => false,
+            _ => true,
+        };
+        if resumable {
+            data.resumable_session = Some(id.to_string());
+        }
     }
     if let Some(path) = str_field(p, "transcript_path") {
         data.transcript_path = Some(PathBuf::from(path));
@@ -453,16 +499,28 @@ struct ClaudeUsage {
     cache_read_input_tokens: u64,
 }
 
-/// Read the session id Claude writes to `~/.claude/sessions/<pid>.json`.
-fn claude_session_id(pid: u32) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home)
-        .join(".claude")
-        .join("sessions")
-        .join(format!("{pid}.json"));
-    let content = std::fs::read_to_string(path).ok()?;
-    let session: ClaudeSessionFile = serde_json::from_str(&content).ok()?;
-    Some(session.session_id)
+/// Claude's data directory: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+fn claude_config_dir() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude")),
+    }
+}
+
+/// Whether a transcript of `session` is in one of Claude's project
+/// directories (`<claude dir>/projects/<encoded cwd>/<session>.jsonl`).
+/// Every project is looked at: the encoding of the directory is Claude's.
+fn claude_transcript_exists(claude_dir: &Path, session: &str) -> bool {
+    if session.is_empty() || session.contains(['/', '\\']) || session.starts_with('.') {
+        return false;
+    }
+    let file = format!("{session}.jsonl");
+    let Ok(projects) = std::fs::read_dir(claude_dir.join("projects")) else {
+        return false;
+    };
+    projects
+        .filter_map(|e| e.ok())
+        .any(|project| project.path().join(&file).is_file())
 }
 
 fn claude_context_usage(pid: u32, dir: &Path, transcript: Option<&Path>) -> Option<ContextUsage> {
@@ -611,6 +669,10 @@ impl Provider for CodexProvider {
         _transcript: Option<&Path>,
     ) -> Option<ContextUsage> {
         codex_context_usage(dir)
+    }
+
+    fn can_resume(&self) -> bool {
+        true
     }
 }
 
@@ -1361,5 +1423,99 @@ mod tests {
             return;
         }
         panic!("token_count event not found");
+    }
+
+    #[test]
+    fn claude_session_is_resumable_after_a_turn() {
+        let mut d = HookData::default();
+        let start =
+            |id: &str, source: &str| serde_json::json!({"session_id": id, "source": source});
+        // A new session has no conversation yet.
+        hook(
+            "SessionStart",
+            start("s1", "startup"),
+            AgentState::Input,
+            &mut d,
+        );
+        assert_eq!(d.resumable_session, None);
+        hook(
+            "Notification",
+            serde_json::json!({"session_id": "s1", "notification_type": "idle_prompt"}),
+            AgentState::Input,
+            &mut d,
+        );
+        assert_eq!(d.resumable_session, None);
+        hook(
+            "UserPromptSubmit",
+            serde_json::json!({"session_id": "s1"}),
+            AgentState::Input,
+            &mut d,
+        );
+        assert_eq!(d.resumable_session.as_deref(), Some("s1"));
+
+        // /clear: the previous session stays the resumable one until a turn.
+        hook(
+            "SessionStart",
+            start("s2", "clear"),
+            AgentState::Input,
+            &mut d,
+        );
+        hook(
+            "SessionEnd",
+            serde_json::json!({"session_id": "s2"}),
+            AgentState::Input,
+            &mut d,
+        );
+        assert_eq!(d.detail.session_id.as_deref(), Some("s2"));
+        assert_eq!(d.resumable_session.as_deref(), Some("s1"));
+        hook(
+            "Stop",
+            serde_json::json!({"session_id": "s2", "last_assistant_message": "done"}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(d.resumable_session.as_deref(), Some("s2"));
+
+        // A resumed session has a conversation.
+        hook(
+            "SessionStart",
+            start("s0", "resume"),
+            AgentState::Input,
+            &mut d,
+        );
+        assert_eq!(d.resumable_session.as_deref(), Some("s0"));
+    }
+
+    #[test]
+    fn session_capabilities() {
+        let claude = ClaudeProvider::new(None);
+        assert!(claude.can_resume() && claude.reports_sessions());
+        // Its hooks report sessions once they have a turn; a session found
+        // by pid could have none.
+        assert_eq!(claude.session_id(std::process::id()), None);
+        assert!(CodexProvider.can_resume() && !CodexProvider.reports_sessions());
+        let generic = GenericProvider::new("sh");
+        assert!(!generic.can_resume() && !generic.reports_sessions());
+        assert!(generic.session_exists("anything"));
+    }
+
+    #[test]
+    fn claude_transcripts_are_found_in_any_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path();
+        assert!(!claude_transcript_exists(claude, "s1"), "no projects dir");
+        let project = claude.join("projects").join("-w-app-feat");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("s1.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(claude.join("projects").join("-w-other")).unwrap();
+
+        assert!(claude_transcript_exists(claude, "s1"));
+        assert!(!claude_transcript_exists(claude, "s2"));
+        // Not a session id: never looked up as a path.
+        assert!(!claude_transcript_exists(claude, ""));
+        assert!(!claude_transcript_exists(
+            claude,
+            "../projects/-w-app-feat/s1"
+        ));
     }
 }

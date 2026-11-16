@@ -29,16 +29,25 @@ pub enum Commands {
         no_start: bool,
     },
 
-    /// Start or resume an agent in a task
+    /// Start an agent in a task, resuming its current session
+    ///
+    /// The current session is the last one the agent had a turn in (Claude
+    /// reports it through its hooks). Agents without hooks (codex) start a
+    /// new session unless given one with --session.
     Run {
         /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
         name: Option<String>,
 
-        /// Skip session picker, always start a new session
-        #[arg(long)]
+        /// Start a new session (it becomes current once you use it)
+        #[arg(long, conflicts_with = "session")]
         new_session: bool,
 
-        /// Agent tool to use (e.g. claude, codex)
+        /// Resume this agent session instead of the current one
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+
+        /// Agent tool to use (e.g. claude, codex; default: the task's last
+        /// agent, else the configured one)
         #[arg(short, long)]
         agent: Option<String>,
 

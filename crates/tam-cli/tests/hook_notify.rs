@@ -48,6 +48,17 @@ fn hook_notify(sock: &Path, agent: &str, payload: &serde_json::Value) {
     assert!(child.wait().unwrap().success());
 }
 
+/// Session of the latest run of task `feat`.
+async fn run_session(stream: &mut UnixStream) -> Option<String> {
+    let request = Request::GetTask {
+        name: "feat".into(),
+    };
+    match send(stream, &request).await {
+        Response::Task { runs, .. } => runs.last().unwrap().session_id.clone(),
+        other => panic!("expected Task, got {other:?}"),
+    }
+}
+
 async fn agent(stream: &mut UnixStream, id: &str) -> AgentInfo {
     match send(stream, &Request::List).await {
         Response::Agents { agents } => agents.into_iter().find(|a| a.id == id).unwrap(),
@@ -165,20 +176,9 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
             "source": "startup",
         }),
     );
-    // The session is recorded for the task's run right away
-    match send(
-        &mut stream,
-        &Request::GetTask {
-            name: "feat".into(),
-        },
-    )
-    .await
-    {
-        Response::Task { runs, .. } => {
-            assert_eq!(runs.last().unwrap().session_id.as_deref(), Some("sess-1"))
-        }
-        other => panic!("expected Task, got {other:?}"),
-    }
+    // A session nobody had a turn in yet is not the run's session: it could
+    // not be resumed.
+    assert_eq!(run_session(&mut stream).await, None);
 
     hook_notify(
         &sock,
@@ -194,6 +194,8 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
     assert_eq!(info.state, AgentState::Blocked);
     assert_eq!(info.detail.session_id.as_deref(), Some("sess-1"));
     assert_eq!(info.detail.pending.as_ref().unwrap().summary, "cargo test");
+    // A turn: the session is recorded for the task's run.
+    assert_eq!(run_session(&mut stream).await.as_deref(), Some("sess-1"));
 
     // AgentUpdated carries the detail
     let mut reader = BufReader::new(&mut events);

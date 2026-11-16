@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use tam_proto::{
-    AgentInfo, MemberInfo, NewMember, Request, Response, RunInfo, ServerMessage, TaskInfo,
-    WorktreeReport,
+    AgentInfo, MemberInfo, NewMember, Request, Response, RunInfo, ServerMessage, SessionChoice,
+    TaskInfo, WorktreeReport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
@@ -246,6 +246,33 @@ impl Client {
         match self.send(request).await? {
             Response::Member { task, member, runs } => Ok((task, *member, runs)),
             other => Err(unexpected("ResolveMember", other)),
+        }
+    }
+
+    /// Start a member's agent (`provider`: else the member's last agent, else
+    /// `default_provider`) in the chosen session. Returns the agent id and
+    /// the session it resumed, if any.
+    pub async fn run_agent(
+        &mut self,
+        member: &str,
+        provider: Option<String>,
+        default_provider: &str,
+        session: SessionChoice,
+        prompt: Option<String>,
+        args: Vec<String>,
+    ) -> Result<(String, Option<String>)> {
+        let request = Request::RunAgent {
+            member: member.into(),
+            provider,
+            default_provider: default_provider.into(),
+            session,
+            args,
+            prompt,
+        };
+        match self.send(request).await? {
+            Response::Running { id, resumed } => Ok((id, resumed)),
+            Response::Error { message } => anyhow::bail!("{message}"),
+            other => Err(unexpected("RunAgent", other)),
         }
     }
 

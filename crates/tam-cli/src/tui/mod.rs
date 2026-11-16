@@ -15,8 +15,8 @@ use tam_proto::ServerMessage;
 
 use crate::client::{self, Client, DropOutcome};
 use crate::config::{self, Config};
-use crate::sessions;
 use crate::task::{self, Member, Task};
+use tam_proto::SessionChoice;
 
 use self::app::{App, Mode, PickerItem, PickerState};
 
@@ -48,10 +48,6 @@ enum Action {
         name: String,
         dir: PathBuf,
     },
-    DoRun {
-        member: String,
-        resume_session: Option<String>,
-    },
     CustomCommand {
         name: String,
         command: String,
@@ -61,6 +57,10 @@ enum Action {
     },
     TogglePeek,
     RefreshPeek,
+    /// Start a member's agent in a new session.
+    RunNewSession {
+        member: String,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -248,22 +248,10 @@ async fn run_loop(
                 start_new_task_flow(app, config);
             }
             Action::RunAgent { member } => {
-                if let Some(Action::DoRun {
-                    member,
-                    resume_session,
-                }) = start_run_flow(client, app, config, &member).await
-                {
-                    do_run(client, app, config, &member, resume_session).await?;
-                }
+                do_run(client, app, config, &member, SessionChoice::Current).await?;
             }
             Action::DoNewTask { name, dir } => {
                 do_new_task(client, app, &name, &dir, config).await?;
-            }
-            Action::DoRun {
-                member,
-                resume_session,
-            } => {
-                do_run(client, app, config, &member, resume_session).await?;
             }
             Action::CustomCommand {
                 name,
@@ -285,6 +273,9 @@ async fn run_loop(
             }
             Action::RefreshPeek => {
                 refresh_peek(client, app).await;
+            }
+            Action::RunNewSession { member } => {
+                do_run(client, app, config, &member, SessionChoice::New).await?;
             }
             Action::None => {}
         }
@@ -332,6 +323,12 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('n'), _) => Action::NewTask,
         (KeyCode::Char('r'), _) => match selected_member(app) {
             Some((_, member)) if member.agent_info.is_none() => Action::RunAgent {
+                member: member.id().to_string(),
+            },
+            _ => Action::None,
+        },
+        (KeyCode::Char('R'), _) => match selected_member(app) {
+            Some((_, member)) if member.agent_info.is_none() => Action::RunNewSession {
                 member: member.id().to_string(),
             },
             _ => Action::None,
@@ -554,9 +551,8 @@ fn selected_member(app: &App) -> Option<(&Task, &Member)> {
 }
 
 fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
-    match &mut app.mode {
-        Mode::NewTaskPickProject(p) | Mode::RunPickSession { picker: p, .. } => f(p),
-        _ => {}
+    if let Mode::NewTaskPickProject(p) = &mut app.mode {
+        f(p)
     }
 }
 
@@ -602,55 +598,9 @@ fn start_new_task_flow(app: &mut App, _config: &Config) {
     app.mode = Mode::NewTaskPickProject(PickerState::new("Pick project", items));
 }
 
-async fn start_run_flow(
-    client: &mut Client,
-    app: &mut App,
-    config: &Config,
-    member: &str,
-) -> Option<Action> {
-    let (task_name, dir) = app
-        .find_member(member)
-        .map(|(t, m)| (t.name.clone(), m.info.dir.clone()))?;
-    let runs: Vec<_> = client
-        .get_task(&task_name)
-        .await
-        .map(|(_, runs)| runs)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.member == member)
-        .collect();
-
-    let found = sessions::list_sessions_for_task(&config.default_agent, &dir, &runs);
-    if found.is_empty() {
-        return Some(Action::DoRun {
-            member: member.to_string(),
-            resume_session: None,
-        });
-    }
-
-    let mut items = vec![PickerItem {
-        display: "new session".into(),
-        id: "__new__".into(),
-    }];
-    for s in &found {
-        items.push(PickerItem {
-            display: format!("[{}] {} ({} turns)", s.age, s.summary, s.turns),
-            id: s.id.clone(),
-        });
-    }
-
-    app.mode = Mode::RunPickSession {
-        member: member.to_string(),
-        picker: PickerState::new("Pick session", items),
-    };
-    None
-}
-
 fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
     let selected_id = match &app.mode {
-        Mode::NewTaskPickProject(p) | Mode::RunPickSession { picker: p, .. } => {
-            p.selected_item().map(|item| item.id.clone())
-        }
+        Mode::NewTaskPickProject(p) => p.selected_item().map(|item| item.id.clone()),
         _ => return Action::None,
     };
 
@@ -688,17 +638,6 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
                     );
                     Action::None
                 }
-            }
-        }
-        Mode::RunPickSession { member, .. } => {
-            let resume_session = if selected_id == "__new__" {
-                None
-            } else {
-                Some(selected_id)
-            };
-            Action::DoRun {
-                member,
-                resume_session,
             }
         }
         _ => Action::None,
@@ -804,40 +743,39 @@ async fn do_new_task(
     Ok(())
 }
 
+/// Start a member's agent (its last agent, else the default one) in the
+/// chosen session; the daemon resolves the member's current session.
 async fn do_run(
     client: &mut Client,
     app: &mut App,
     config: &Config,
     member: &str,
-    resume_session: Option<String>,
+    session: SessionChoice,
 ) -> Result<()> {
     let label = app
         .find_member(member)
         .map(|(t, m)| t.member_label(m))
         .unwrap_or_else(|| member.to_string());
-    let resp = client
-        .send(tam_proto::Request::Spawn {
-            provider: config.default_agent.clone(),
-            dir: PathBuf::new(),
-            id: None,
-            args: vec![],
-            resume_session,
-            prompt: None,
-            member: Some(member.into()),
-        })
-        .await?;
-
-    match resp {
-        tam_proto::Response::Spawned { .. } => {
+    let started = client
+        .run_agent(member, None, &config.default_agent, session, None, vec![])
+        .await;
+    match started {
+        Ok((_, Some(_))) => {
+            app.set_status(format!("Resumed '{label}'"), Duration::from_secs(3));
+        }
+        Ok((_, None)) => {
             app.set_status(
-                format!("Started agent in '{label}'"),
+                format!("Started a new session in '{label}'"),
                 Duration::from_secs(3),
             );
         }
-        tam_proto::Response::Error { message } => {
-            app.set_status(format!("Error: {message}"), Duration::from_secs(5));
+        // E.g. a session that can no longer be resumed: the whole hint.
+        Err(e) => {
+            app.mode = Mode::Notice {
+                title: "Run Failed".into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
         }
-        _ => {}
     }
     Ok(())
 }
@@ -1124,5 +1062,29 @@ mod tests {
         ));
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.status_message(), Some("Kept 'feat'"));
+    }
+
+    #[test]
+    fn r_resumes_and_shift_r_starts_a_new_session() {
+        let info: tam_proto::TaskInfo = serde_json::from_value(serde_json::json!({
+            "name": "feat",
+            "members": [{
+                "id": "m-1", "name": "app", "repo": "app",
+                "branch": "feat", "dir": "/w/app--feat",
+            }],
+            "created_at": 0,
+        }))
+        .unwrap();
+        let mut app = App::new();
+        app.set_tasks(vec![Task::from_info(info, &[])]);
+        let config = Config::default();
+
+        let action = handle_key_event(press('r'), &mut app, &config);
+        assert!(matches!(action, Action::RunAgent { ref member } if member == "m-1"));
+        let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        let action = handle_key_event(shift_r, &mut app, &config);
+        assert!(matches!(action, Action::RunNewSession { ref member } if member == "m-1"));
+        // No picker: still in the task list.
+        assert!(matches!(app.mode, Mode::Normal));
     }
 }

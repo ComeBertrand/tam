@@ -60,7 +60,7 @@ TAM persists task metadata across daemon restarts in a lightweight append-only l
 
 The ledger serves three purposes:
 
-1. **Session resume**: when `tam run feat` starts, the ledger knows which provider sessions were used previously for that task, enabling the session picker without filesystem scraping.
+1. **Session resume**: when `tam run feat` starts, the ledger knows the member's current session (the last one its agent had a turn in), so the agent resumes it without asking and without filesystem scraping.
 2. **History display**: `tam ps` shows run count, turn count, and last activity without querying providers.
 3. **Daemon independence**: the daemon is ephemeral (auto-starts, auto-shuts-down after 30s idle). The ledger survives daemon restarts, giving continuity.
 
@@ -198,8 +198,9 @@ tam new NAME                        # create task bound to cwd (borrowed)
 tam new NAME -w                     # create task with owned worktree
 tam new NAME -w -s REF              # worktree branched from specific ref
 
-tam run NAME                        # start/resume agent in existing task
-tam run NAME --new-session          # start a new session, ignoring history
+tam run NAME                        # start the agent, resuming its current session
+tam run NAME --new-session          # start a new session instead
+tam run NAME --session ID           # resume a given session (escape hatch)
 
 tam stop NAME                       # kill agent, task persists
 tam stop                            # resolve from cwd
@@ -262,21 +263,15 @@ tam hook-notify                     # hook callback from agent process
 
 ### Session resume flow
 
-When `tam run NAME` is invoked and the task has previous agent runs recorded in the ledger:
+A task member almost always has one conversation, so there is no session picker. Each member has a **current session** per agent, derived from the ledger: the session of the member's latest run of that agent that has one. A run's session is the one it resumed, or the last one its agent had a turn in. For Claude, the hooks report it: a session counts once a prompt or a turn shows in it (or it is resumed), because a session nobody typed in has no transcript and cannot be resumed. So a `/clear` followed by a prompt moves the current session; a new session left before any prompt does not.
 
-1. If stdin is not a terminal: always start a new session.
-2. If `--new-session` is passed: start a new session.
-3. Otherwise: show a session picker.
+`tam run NAME` (and `r` in the TUI) asks the daemon to start the member's agent (`RunAgent`); the daemon picks the session:
 
-The session picker presents:
+1. `--session ID`: resume that session, whatever the current one (refused by agents that cannot resume).
+2. `--new-session` (`R` in the TUI): start a new session. It becomes current once used.
+3. Otherwise: resume the current session of the agent, when there is one; else start a new session. If Claude deleted the session's transcript, the run is refused with a hint to start a new session, rather than starting an agent that exits at once.
 
-```
-  Resume: "fix the auth tests" (4 turns, 2h ago)
-  Resume: "refactor auth module" (12 turns, 1d ago)
-  New session
-```
-
-Session metadata (ID, first user message as summary, turn count, last modified) comes from the ledger cross-referenced with the provider's session files.
+Without `-a`, the agent is the member's last one, else the configured default. Agents without hooks report no sessions, so tam never knows which one they ended in: Codex starts a new session unless given one with `--session` (`codex resume ID`); generic agents have no sessions at all.
 
 ---
 
@@ -331,7 +326,8 @@ The header shows total task count and how many need attention (input or blocked 
 | `j` / `k` / `↑` / `↓` | Navigate task list | Always |
 | `enter` | Attach to agent | Agent is running |
 | `n` | New task flow | Always |
-| `r` | Run/resume agent flow | Task idle (no agent running) |
+| `r` | Run the agent, resuming its current session | Task idle (no agent running) |
+| `R` | Run the agent in a new session | Task idle (no agent running) |
 | `s` | Stop agent | Agent is running |
 | `d` | Drop task: `y` keeps the branch, `b` deletes it; asks again if work would be lost | Always |
 | `p` | Toggle peek panel | Always |
@@ -339,7 +335,7 @@ The header shows total task count and how many need attention (input or blocked 
 | `q` | Quit TUI | Always |
 | Config keys | Custom commands | Always |
 
-The footer only shows keys applicable to the currently selected task. If the selected task has a running agent: `enter:attach  s:stop  p:peek  d:drop  q:quit`. If idle: `r:run  d:drop  p:peek  q:quit`.
+The footer only shows keys applicable to the currently selected task. If the selected task has a running agent: `enter:attach  s:stop  p:peek  d:drop  q:quit`. If idle: `r:run  R:new session  d:drop  p:peek  q:quit`.
 
 ### Peek mode
 
@@ -401,21 +397,7 @@ After confirmation, TAM creates the task (and worktree if selected), optionally 
 
 ### Run/resume flow
 
-Pressing `r` on an idle task that has previous sessions triggers the session picker:
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  run agent in feat                                               │
-├──────────────────────────────────────────────────────────────────┤
-│▸   Resume: "fix the auth tests" (4 turns, 2h ago)               │
-│    Resume: "refactor auth module" (12 turns, 1d ago)             │
-│    New session                                                   │
-├──────────────────────────────────────────────────────────────────┤
-│  enter:select  esc:cancel                                        │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-If the task has no session history, `r` spawns a new agent directly.
+Pressing `r` on an idle task starts its agent in the member's current session, with no prompt; `R` starts it in a new session. The status line says which happened (`Resumed 'feat'`, `Started a new session in 'feat'`), or why the session could not be resumed. See the session resume flow above.
 
 ### Attached mode
 
@@ -457,8 +439,8 @@ The daemon-client architecture moves almost entirely intact:
 | `zinc-daemon/scrollback.rs` | `tam-daemon/scrollback.rs` | Unchanged. Ring buffer. |
 | `zinc-daemon/notify.rs` | `tam-daemon/notify.rs` | Template variables rename (`{id}` → `{task}`). |
 | `zinc-cli/client.rs` | `tam-cli/client.rs` | Unchanged. Socket connection, raw mode, attach relay, keyboard protocol filter, terminal reset. |
-| `zinc-cli/tui/` | `tam-cli/tui/` | Rework. Task-centric table instead of agent-centric. New modes: new-task flow, session picker, filter mode. Peek panel. |
-| `zinc-cli/sessions.rs` | `tam-cli/sessions.rs` | Refactor. Session discovery supplements ledger data rather than being the sole source. |
+| `zinc-cli/tui/` | `tam-cli/tui/` | Rework. Task-centric table instead of agent-centric. New modes: new-task flow, filter mode. Peek panel. No session picker (#19): `r` resumes the current session. |
+| `zinc-cli/sessions.rs` | dropped | Session discovery (transcript scanning) fed the session picker; the ledger's current session replaced both. |
 | `zinc-cli/config.rs` | `tam-cli/config.rs` | Merge with yawn config concerns. Single config file at `~/.config/tam/config.toml`. |
 | `zinc init --agent` | `tam init --agent` | Unchanged. Writes hooks to `~/.claude/settings.json` referencing `tam hook-notify`. |
 
@@ -485,12 +467,11 @@ The library modules move into `tam-worktree` with minimal changes:
 | Task ledger | `tam-cli/ledger.rs` | Append-only JSONL at `~/.local/share/tam/ledger.jsonl`. Records task creation, agent runs, session IDs. Read on startup, appended during operation. |
 | Task model | `tam-cli/task.rs` | In-memory representation of tasks. Computed status from ledger + daemon state + git state. |
 | `tam new` logic | `tam-cli/main.rs` | Bridges `tam-worktree::create()` and daemon spawn. Creates ledger entry. |
-| `tam run` logic | `tam-cli/main.rs` | Session picker using ledger history. Sends spawn request with resume session ID. |
+| `tam run` logic | `tam-cli/main.rs` | Sends `RunAgent`; the daemon resumes the member's current session (or a new / given one). |
 | `tam gc` logic | `tam-cli/main.rs` | Queries git merged status for all owned tasks, drops those that are merged. |
 | `tam pick` | `tam-cli/main.rs` | Uses `tam-worktree::discovery` + `tam-worktree::pretty`, pipes through configured finder, prints selected path. |
 | `tam ls` | `tam-cli/main.rs` | Uses `tam-worktree::discovery` + `tam-worktree::pretty` for project listing. Annotates with git and task status. |
 | TUI new-task flow | `tam-cli/tui/` | Multi-step modal: project picker → name input → confirmation. |
-| TUI session picker | `tam-cli/tui/` | Modal shown on `r` key for idle tasks with session history. |
 
 ### What can be published separately
 

@@ -319,6 +319,38 @@ pub enum Request {
     },
     /// Receive pushed `Event`s on this connection from now on. Replies `Ok`.
     Subscribe,
+    /// Start the agent of a task member, in the member's current session by
+    /// default. Replies `Running`; refused while the member has an agent.
+    RunAgent {
+        member: String,
+        /// Agent to run (e.g. `claude`). Unset: the agent of the member's
+        /// last run, else `default_provider`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Agent of a member that never ran one (the client's default).
+        default_provider: String,
+        #[serde(default)]
+        session: SessionChoice,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+}
+
+/// Which session a member's agent starts in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionChoice {
+    /// The member's current session for that agent: the last one the agent
+    /// had a turn in (or was resumed into). A new session when there is
+    /// none, or when the agent cannot report its sessions (no hooks).
+    #[default]
+    Current,
+    /// A new session. It becomes current once the agent has a turn in it.
+    New,
+    /// This session, whatever the member's current one.
+    Id(String),
 }
 
 /// Daemon -> Client response.
@@ -367,6 +399,13 @@ pub enum Response {
     /// The drop would lose work: nothing was done. Retry with `force`.
     DropRefused {
         worktrees: Vec<WorktreeReport>,
+    },
+    /// A member's agent started (`id` is the member id).
+    Running {
+        id: String,
+        /// The session it resumed; `None` for a new session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed: Option<String>,
     },
 }
 
@@ -1052,5 +1091,80 @@ mod tests {
         let info: AgentInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.id, "test");
         assert!(info.task.is_none());
+    }
+
+    #[test]
+    fn request_run_agent_serde() {
+        // Defaults: the current session, no args, no prompt.
+        let json = r#"{"type":"run_agent","member":"m-1","default_provider":"claude"}"#;
+        match serde_json::from_str::<Request>(json).unwrap() {
+            Request::RunAgent {
+                member,
+                provider,
+                default_provider,
+                session,
+                args,
+                prompt,
+            } => {
+                assert_eq!(member, "m-1");
+                assert_eq!(provider, None);
+                assert_eq!(default_provider, "claude");
+                assert_eq!(session, SessionChoice::Current);
+                assert!(args.is_empty());
+                assert_eq!(prompt, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        for (session, wire) in [
+            (SessionChoice::Current, r#""current""#),
+            (SessionChoice::New, r#""new""#),
+            (SessionChoice::Id("abc".into()), r#"{"id":"abc"}"#),
+        ] {
+            let req = Request::RunAgent {
+                member: "m-1".into(),
+                provider: Some("codex".into()),
+                default_provider: "claude".into(),
+                session: session.clone(),
+                args: vec![],
+                prompt: None,
+            };
+            let json = serde_json::to_string(&req).unwrap();
+            assert!(json.contains(&format!("\"session\":{wire}")), "{json}");
+            match serde_json::from_str::<Request>(&json).unwrap() {
+                Request::RunAgent {
+                    session: back,
+                    provider,
+                    ..
+                } => {
+                    assert_eq!(back, session);
+                    assert_eq!(provider.as_deref(), Some("codex"));
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn response_running_serde() {
+        let json = serde_json::to_string(&Response::Running {
+            id: "m-1".into(),
+            resumed: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"running","id":"m-1"}"#);
+
+        let resp = Response::Running {
+            id: "m-1".into(),
+            resumed: Some("s1".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::Running { id, resumed }) => {
+                assert_eq!(id, "m-1");
+                assert_eq!(resumed.as_deref(), Some("s1"));
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
     }
 }

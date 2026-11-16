@@ -68,6 +68,20 @@ and `tam-worktree` (dropping a task removes its worktree). `tam-cli` depends on 
   one); `ClaudeProvider::handle_hook` maps it to a state and per-agent
   `AgentDetail`. A working Claude agent silent for 10s falls back to input
   (interrupted turns fire no hook).
+- **One session per member, resumed by default** — clients start a member's
+  agent with `RunAgent { session: current | new | id }` (`handle_run_agent`):
+  the daemon picks the agent (requested, else the member's last, else the
+  client's default) and the session, then spawns as usual. The current session
+  of a member for an agent is derived, not stored: the session of its latest
+  run of that agent that has one (`Ledger::current_session`). A run's session
+  is the one it resumed, or the last one the agent's hooks showed a turn in
+  (`HookData::resumable_session` → `Ledger::session_reported`:
+  `AgentSessionIdentified`, then `AgentSessionChanged` on e.g. `/clear`). A
+  session nobody typed in has no transcript, so it never counts. `current`
+  resumes only for providers that `reports_sessions()` (Claude), and only if
+  `session_exists()` (Claude deletes old transcripts); codex resumes only an
+  explicit id, generic agents never. No session picker, no transcript scanning
+  in `tam-cli`.
 - **Testing hooks by hand** — run the dev daemon with temp `XDG_RUNTIME_DIR`
   (short path: Unix socket limit), `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
@@ -87,7 +101,8 @@ cargo test
 - Unit tests are inline in each module (~270 across all crates)
 - Integration tests in `crates/tam-daemon/tests/` (~38 async tests, real
   sockets/PTYs/git repos) and `crates/tam-cli/tests/` (`tam hook-notify`
-  against a daemon)
+  against a daemon, session resume with a fake `claude`; one test per file:
+  they set process environment)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

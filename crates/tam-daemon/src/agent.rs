@@ -207,6 +207,11 @@ impl Agent {
         self.provider.name()
     }
 
+    /// Whether the agent's hooks report its sessions.
+    pub fn reports_sessions(&self) -> bool {
+        self.provider.reports_sessions()
+    }
+
     /// Set the stored state directly (used by hook-based providers).
     pub fn set_state(&mut self, state: AgentState) {
         self.state = state;
@@ -236,6 +241,11 @@ impl Agent {
     /// Session id reported by the agent's hooks.
     pub fn session_id(&self) -> Option<&str> {
         self.hook_data.detail.session_id.as_deref()
+    }
+
+    /// Last session the agent's hooks showed a turn in (or a resume of).
+    pub fn resumable_session(&self) -> Option<&str> {
+        self.hook_data.resumable_session.as_deref()
     }
 
     /// Check for a state transition. Returns Some((old, new)) if state changed.

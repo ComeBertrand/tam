@@ -80,6 +80,14 @@ pub enum LedgerEvent {
         task: String,
         timestamp: u64,
     },
+    /// The agent of the member's current run moved to another session it
+    /// had a turn in (e.g. after `/clear`): the run's session, and so the
+    /// member's current one, is now that one.
+    AgentSessionChanged {
+        member: String,
+        session_id: String,
+        timestamp: u64,
+    },
 }
 
 /// Ledger lines written before tasks had members (tam <= 0.3.6): a task had
@@ -365,6 +373,26 @@ impl Ledger {
             .is_some_and(|r| r.ended_at.is_none())
     }
 
+    /// The member's current session for `provider`: the session of its
+    /// latest run of that agent that has one. A run's session is the one it
+    /// resumed, or the last one its agent reported having a turn in.
+    pub fn current_session(&self, member: &str, provider: &str) -> Option<String> {
+        self.state
+            .members
+            .get(member)?
+            .runs
+            .iter()
+            .rev()
+            .filter(|r| r.provider == provider)
+            .find_map(|r| r.session_id.clone())
+    }
+
+    /// The agent of the member's latest run.
+    pub fn last_provider(&self, member: &str) -> Option<String> {
+        let runs = &self.state.members.get(member)?.runs;
+        runs.last().map(|r| r.provider.clone())
+    }
+
     /// Find one member from what a user typed: a task name (its only
     /// member), `<task>/<member>` (short name) or a member id.
     ///
@@ -502,6 +530,36 @@ impl Ledger {
             session_id: session_id.into(),
             timestamp: now(),
         })?;
+        Ok(true)
+    }
+
+    /// Record a session the agent of the member's open run had a turn in:
+    /// it becomes the run's session (identified, or changed from another
+    /// one). Returns whether anything was recorded.
+    pub fn session_reported(&mut self, member: &str, session_id: &str) -> Result<bool> {
+        let Some(run) = self
+            .state
+            .members
+            .get(member)
+            .and_then(|m| m.runs.last())
+            .filter(|r| r.ended_at.is_none())
+        else {
+            return Ok(false);
+        };
+        let event = match run.session_id.as_deref() {
+            None => LedgerEvent::AgentSessionIdentified {
+                member: member.into(),
+                session_id: session_id.into(),
+                timestamp: now(),
+            },
+            Some(current) if current == session_id => return Ok(false),
+            Some(_) => LedgerEvent::AgentSessionChanged {
+                member: member.into(),
+                session_id: session_id.into(),
+                timestamp: now(),
+            },
+        };
+        self.append(event)?;
         Ok(true)
     }
 
@@ -670,6 +728,17 @@ impl State {
                         }
                     }
                     _ => unreachable!(),
+                }
+                record.events.push((seq, event));
+            }
+            LedgerEvent::AgentSessionChanged {
+                member, session_id, ..
+            } => {
+                let Some(record) = self.members.get_mut(member) else {
+                    return; // event for an unknown or dropped member
+                };
+                if let Some(run) = record.runs.last_mut() {
+                    run.session_id = Some(session_id.clone());
                 }
                 record.events.push((seq, event));
             }
@@ -1618,5 +1687,117 @@ mod tests {
             "elsewhere"
         );
         assert_eq!(legacy_repo_name(Path::new("/"), "feat"), "feat");
+    }
+
+    #[test]
+    fn reported_sessions_follow_the_open_run() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let m = create(&mut ledger, "feat", "/a");
+        assert_eq!(ledger.current_session(&m, "claude"), None);
+
+        ledger.run_started(&m, "claude", None).unwrap();
+        assert!(ledger.session_reported(&m, "s1").unwrap());
+        assert!(!ledger.session_reported(&m, "s1").unwrap());
+        assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s1"));
+        // e.g. `/clear`, then a turn in the new session
+        assert!(ledger.session_reported(&m, "s2").unwrap());
+        assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s2"));
+        ledger.run_ended(&m, 0).unwrap();
+        // No open run: nothing to record.
+        assert!(!ledger.session_reported(&m, "s3").unwrap());
+
+        let runs = ledger.member_runs(&m);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].session_id.as_deref(), Some("s2"));
+
+        // Kept as is when the ledger is opened again.
+        drop(ledger);
+        assert_eq!(
+            event_types(&path),
+            [
+                "task_created",
+                "member_added",
+                "agent_run_started",
+                "agent_session_identified",
+                "agent_session_changed",
+                "agent_run_ended",
+            ]
+        );
+        let (ledger, report) = Ledger::open(&path).unwrap();
+        assert_eq!(report.compacted, 0);
+        assert!(report.malformed.is_empty(), "{:?}", report.malformed);
+        assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn current_session_is_the_latest_one_of_the_agent() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = open(&tmp);
+        let m = create(&mut ledger, "feat", "/a");
+
+        ledger.run_started(&m, "claude", None).unwrap();
+        ledger.session_reported(&m, "s1").unwrap();
+        // A new session nobody had a turn in leaves the current one.
+        ledger.run_started(&m, "claude", None).unwrap();
+        ledger.run_ended(&m, 0).unwrap();
+        assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s1"));
+
+        // Another agent has its own.
+        ledger.run_started(&m, "codex", Some("x1".into())).unwrap();
+        ledger.run_ended(&m, 0).unwrap();
+        assert_eq!(ledger.last_provider(&m).as_deref(), Some("codex"));
+        assert_eq!(ledger.current_session(&m, "codex").as_deref(), Some("x1"));
+        assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s1"));
+
+        // A resumed session is the run's session from its start.
+        ledger.run_started(&m, "claude", Some("s0".into())).unwrap();
+        assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s0"));
+        assert_eq!(ledger.current_session("m-nope", "claude"), None);
+        assert_eq!(ledger.last_provider("m-nope"), None);
+    }
+
+    #[test]
+    fn ledgers_from_before_current_sessions_resume_the_last_one() {
+        // Written by a tam whose picker chose the session: a fresh run, then
+        // one resuming an older session.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let run = |provider: &str, session: Option<&str>, ts| LedgerEvent::AgentRunStarted {
+            member: "m-1".into(),
+            provider: provider.into(),
+            session_id: session.map(str::to_string),
+            timestamp: ts,
+        };
+        let ended = |ts| LedgerEvent::AgentRunEnded {
+            member: "m-1".into(),
+            exit_code: 0,
+            timestamp: ts,
+        };
+        write_lines(
+            &path,
+            &[
+                created("feat", 100),
+                member_added("feat", "m-1", "/a", 100),
+                run("claude", None, 200),
+                LedgerEvent::AgentSessionIdentified {
+                    member: "m-1".into(),
+                    session_id: "s1".into(),
+                    timestamp: 201,
+                },
+                ended(300),
+                run("claude", Some("s0"), 400),
+                ended(500),
+            ],
+            &[],
+        );
+        let (ledger, report) = Ledger::open(&path).unwrap();
+        assert_eq!(report.migrated, 0);
+        assert_eq!(report.compacted, 0);
+        assert_eq!(
+            ledger.current_session("m-1", "claude").as_deref(),
+            Some("s0")
+        );
     }
 }

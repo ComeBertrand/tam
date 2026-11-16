@@ -13,11 +13,6 @@ pub enum Mode {
         project_dir: PathBuf,
         name: String,
     },
-    RunPickSession {
-        /// Id of the member to run an agent in.
-        member: String,
-        picker: PickerState,
-    },
     SpawnEnterPath(String),
     ConfirmDropTask {
         name: String,

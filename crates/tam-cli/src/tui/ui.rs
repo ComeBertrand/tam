@@ -1,4 +1,6 @@
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use std::num::NonZeroU16;
+
+use ratatui::layout::{Constraint, HorizontalAlignment, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -97,13 +99,13 @@ fn render_tasks(frame: &mut Frame, area: Rect, app: &App) {
     if visible.is_empty() {
         if app.filter.is_empty() {
             let text = Paragraph::new("No tasks. Press n to create one.")
-                .alignment(Alignment::Center)
+                .alignment(HorizontalAlignment::Center)
                 .fg(Color::DarkGray);
             let y = area.y + area.height / 2;
             frame.render_widget(text, Rect::new(area.x, y, area.width, 1));
         } else {
             let text = Paragraph::new("No matching tasks.")
-                .alignment(Alignment::Center)
+                .alignment(HorizontalAlignment::Center)
                 .fg(Color::DarkGray);
             let y = area.y + area.height / 2;
             frame.render_widget(text, Rect::new(area.x, y, area.width, 1));
@@ -338,12 +340,12 @@ fn render_preview(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.width == 0 || inner.height == 0 {
+    let Some(cols) = NonZeroU16::new(inner.width).filter(|_| inner.height > 0) else {
         return;
-    }
+    };
 
-    let parse_rows = 500_u16;
-    let mut parser = vt100::Parser::new(parse_rows, inner.width, 0);
+    const PARSE_ROWS: NonZeroU16 = NonZeroU16::new(500).unwrap();
+    let mut parser = vt100::Parser::new(PARSE_ROWS, cols, 0);
     parser.process(raw_content.as_bytes());
 
     if parser.screen().alternate_screen() {
@@ -351,7 +353,7 @@ fn render_preview(
     }
     let screen = parser.screen();
 
-    let mut all_lines: Vec<Line> = (0..parse_rows)
+    let mut all_lines: Vec<Line> = (0..PARSE_ROWS.get())
         .map(|row| {
             let mut spans = Vec::new();
             for col in 0..inner.width {
@@ -416,7 +418,9 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
 }
 
 fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
-    let area = centered_rect(60, 60, frame.area());
+    let area = frame
+        .area()
+        .centered(Constraint::Percentage(60), Constraint::Percentage(60));
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -459,7 +463,9 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
 
 fn render_new_task_popup(frame: &mut Frame, name: &str) {
     // 1 content row + 2 border + 2 vertical padding = 5
-    let area = centered_fixed_rect(50, 5, frame.area());
+    let area = frame
+        .area()
+        .centered(Constraint::Length(50), Constraint::Length(5));
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -483,7 +489,9 @@ fn render_new_task_popup(frame: &mut Frame, name: &str) {
 
 fn render_enter_path_popup(frame: &mut Frame, path: &str) {
     // 1 content row + 2 border + 2 vertical padding = 5
-    let area = centered_fixed_rect(60, 5, frame.area());
+    let area = frame
+        .area()
+        .centered(Constraint::Length(60), Constraint::Length(5));
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -512,7 +520,9 @@ fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
     let content_width = ("Drop task ".len() + name.len() + 1).max(DROP_KEYS.chars().count());
     // +8 for padding + border, 2 content rows + 2 border + 2 vertical padding = 6
     let width = (content_width as u16 + 8).max(30);
-    let area = centered_fixed_rect(width, 6, frame.area());
+    let area = frame
+        .area()
+        .centered(Constraint::Length(width), Constraint::Length(6));
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -567,7 +577,9 @@ fn render_force_drop_popup(frame: &mut Frame, name: &str, report: &[String]) {
     let content_width = lines.iter().map(Line::width).max().unwrap_or(0);
     let width = (content_width as u16).saturating_add(8).max(30);
     let height = (lines.len() as u16).saturating_add(4);
-    let area = centered_fixed_rect(width, height, frame.area());
+    let area = frame
+        .area()
+        .centered(Constraint::Length(width), Constraint::Length(height));
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -594,7 +606,10 @@ fn render_notice_popup(frame: &mut Frame, title: &str, lines: &[String]) {
         .iter()
         .map(|l| l.chars().count().div_ceil(inner_width).max(1))
         .sum();
-    let area = centered_fixed_rect(width, rows as u16 + 5, frame.area());
+    let area = frame.area().centered(
+        Constraint::Length(width),
+        Constraint::Length(rows as u16 + 5),
+    );
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -609,30 +624,6 @@ fn render_notice_popup(frame: &mut Frame, title: &str, lines: &[String]) {
     frame.render_widget(block, area);
     let text: Vec<Line> = lines.iter().map(|l| Line::raw(l.as_str())).collect();
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let [_, center_v, _] = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .areas(area);
-    let [_, center, _] = Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .areas(center_v);
-    center
-}
-
-fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect::new(x, y, w, h)
 }
 
 fn status_display(status: &TaskStatus) -> (&'static str, Color) {

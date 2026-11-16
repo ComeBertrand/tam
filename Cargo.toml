@@ -24,14 +24,17 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-ratatui = "0.29"
+# Not 0.30.1: its Block shadows made Block-backed widgets non-Send.
+ratatui = "0.30.2"
 # use-dev-tty: level-triggered poll(2) source that never blocks on a tty
 # drained by the attach relay (the default mio source does).
-crossterm = { version = "0.28", features = ["use-dev-tty"] }
+# Same version as ratatui's backend (ratatui-crossterm always enables
+# crossterm 0.29), so the lockfile holds a single crossterm.
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 toml = "0.8"
 dirs = "6"
 colored = "3"
 globset = "0.4"
-vt100 = "0.15"
+vt100 = "0.18.1"
 clap_complete = "4"
 clap_mangen = "0.2"

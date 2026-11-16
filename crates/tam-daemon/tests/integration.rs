@@ -687,23 +687,20 @@ async fn spawn_emits_event() {
     let mut line = String::new();
     let mut got_spawn = false;
 
-    match tokio::time::timeout(
+    if let Ok(Ok(_)) = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         reader.read_line(&mut line),
     )
     .await
     {
-        Ok(Ok(_)) => {
-            if let Ok(ServerMessage::Event(tam_proto::Event::AgentSpawned { id, info })) =
-                serde_json::from_str::<ServerMessage>(line.trim())
-            {
-                assert_eq!(id, "spawn-evt");
-                assert_eq!(info.id, "spawn-evt");
-                assert_eq!(info.provider, "sleep");
-                got_spawn = true;
-            }
+        if let Ok(ServerMessage::Event(tam_proto::Event::AgentSpawned { id, info })) =
+            serde_json::from_str::<ServerMessage>(line.trim())
+        {
+            assert_eq!(id, "spawn-evt");
+            assert_eq!(info.id, "spawn-evt");
+            assert_eq!(info.provider, "sleep");
+            got_spawn = true;
         }
-        _ => {}
     }
 
     assert!(got_spawn, "expected AgentSpawned event for spawn-evt");
@@ -760,21 +757,18 @@ async fn kill_emits_event() {
     line.clear();
     let mut got_exit = false;
 
-    match tokio::time::timeout(
+    if let Ok(Ok(_)) = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         reader.read_line(&mut line),
     )
     .await
     {
-        Ok(Ok(_)) => {
-            if let Ok(ServerMessage::Event(tam_proto::Event::AgentExited { id, .. })) =
-                serde_json::from_str::<ServerMessage>(line.trim())
-            {
-                assert_eq!(id, "kill-evt");
-                got_exit = true;
-            }
+        if let Ok(ServerMessage::Event(tam_proto::Event::AgentExited { id, .. })) =
+            serde_json::from_str::<ServerMessage>(line.trim())
+        {
+            assert_eq!(id, "kill-evt");
+            got_exit = true;
         }
-        _ => {}
     }
 
     assert!(got_exit, "expected AgentExited event for kill-evt");
@@ -1215,4 +1209,82 @@ async fn second_daemon_on_same_ledger_refuses_to_start() {
     assert!(!other_sock.exists());
     // The first daemon is still serving.
     assert!(UnixStream::connect(&sock).await.is_ok());
+}
+
+/// A daemon that goes away without killing its agents (here: its runtime is
+/// dropped, as at the end of every test above) must not orphan them.
+#[test]
+fn dropped_daemon_leaves_no_agent_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pids: Vec<u32> = rt.block_on(async {
+        let sock = start_daemon(dir.path()).await;
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        // A shell with a child of its own: the whole tree must go
+        let resp = send(
+            &mut stream,
+            &Request::Spawn {
+                provider: "sh".into(),
+                dir: PathBuf::from("/tmp"),
+                id: Some("orphan-test".into()),
+                args: vec!["-c".into(), "sleep 3600 & wait".into()],
+                resume_session: None,
+                prompt: None,
+                task: None,
+            },
+        )
+        .await;
+        assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+        let pid = match send(&mut stream, &Request::List).await {
+            Response::Agents { agents } => agents[0].pid.unwrap(),
+            other => panic!("expected Agents, got {other:?}"),
+        };
+        // Wait for the shell's child to start
+        let mut children = Vec::new();
+        for _ in 0..50 {
+            children = child_pids(pid);
+            if !children.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!children.is_empty(), "sleep did not start");
+        children.push(pid);
+        children
+    });
+    drop(rt);
+
+    for pid in pids {
+        assert!(!alive(pid), "agent process {pid} survived its daemon");
+    }
+}
+
+/// Children of `pid`, from /proc.
+fn child_pids(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect()
+}
+
+/// Whether `pid` is a running (non-zombie) process.
+fn alive(pid: u32) -> bool {
+    // A killed orphan may linger briefly as a zombie until init reaps it
+    for _ in 0..50 {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return false,
+            Ok(stat) => {
+                let state = stat
+                    .rsplit(')')
+                    .next()
+                    .and_then(|r| r.split_whitespace().next());
+                if state == Some("Z") {
+                    return false;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
 }

@@ -1,5 +1,3 @@
-use std::num::NonZeroU16;
-
 use ratatui::layout::{Constraint, HorizontalAlignment, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -13,6 +11,7 @@ use tam_proto::{AgentDetail, AgentState};
 use crate::task::{Task, TaskStatus};
 
 use super::app::{App, Mode, PickerState};
+use super::peek::{Peek, ScreenView};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let show_filter = app.filter_active || !app.filter.is_empty();
@@ -35,12 +34,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_tasks(frame, table_area, app);
 
         let selected = app.selected_task();
-        let task_name = selected.map(|t| t.name.as_str()).unwrap_or("—");
+        let task_name = selected.map_or_else(|| "—".to_string(), |t| t.name.clone());
         let detail = selected
             .and_then(|t| t.agent_info())
             .and_then(|a| agent_detail_line(a.state, &a.detail));
-        let content = app.peek.as_deref().unwrap_or("");
-        render_preview(frame, preview_area, task_name, detail, content);
+        if let Some(peek) = app.peek.as_mut() {
+            render_preview(frame, preview_area, &task_name, detail, peek);
+        }
 
         render_footer(frame, footer_area, app);
     } else {
@@ -245,6 +245,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                     Span::styled("p", Style::new().bold()),
                     Span::raw(":peek  "),
                 ]);
+                if let Some(peek) = &app.peek {
+                    hints.extend([
+                        Span::styled("pgup/pgdn", Style::new().bold()),
+                        Span::raw(":scroll  "),
+                    ]);
+                    if peek.from.is_some() {
+                        hints.extend([
+                            Span::styled("end", Style::new().bold()),
+                            Span::raw(":live  "),
+                        ]);
+                    }
+                }
                 for cmd in &app.commands {
                     hints.push(Span::styled(cmd.key.clone(), Style::new().bold()));
                     hints.push(Span::raw(format!(":{} ", cmd.name)));
@@ -368,99 +380,46 @@ fn first_line(s: &str) -> &str {
         .unwrap_or("")
 }
 
+/// The selected task's agent screen, as the daemon's terminal emulator has
+/// it: its live screen (the content's bottom when the pane is shorter) or
+/// history, cut at the pane's right edge.
 fn render_preview(
     frame: &mut Frame,
     area: Rect,
     task_name: &str,
     detail: Option<(String, Color)>,
-    raw_content: &str,
+    peek: &mut Peek,
 ) {
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::DarkGray))
-        .title(format!(" {task_name} "));
+        .border_style(Style::new().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    peek.height = inner.height;
+    let title = match peek.scrolled_back() {
+        Some(0) => format!(" {task_name} · scrolled back "),
+        Some(n) => format!(" {task_name} · {n} lines into history "),
+        None => format!(" {task_name} "),
+    };
+    block = block.title(title);
     if let Some((text, color)) = detail {
         block = block.title_bottom(Line::styled(format!(" {text} "), Style::new().fg(color)));
     }
-
-    let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(cols) = NonZeroU16::new(inner.width).filter(|_| inner.height > 0) else {
-        return;
+    let message = match (&peek.agent, &peek.screen, &peek.error) {
+        (None, _, _) => "(no agent running)".to_string(),
+        (Some(_), Some(screen), _) => {
+            let view = ScreenView {
+                screen: screen.screen(),
+                first: screen.first_row(peek.from, inner.height),
+            };
+            frame.render_widget(view, inner);
+            return;
+        }
+        (Some(_), None, Some(error)) => format!("(error: {error})"),
+        (Some(_), None, None) => String::new(),
     };
-
-    const PARSE_ROWS: NonZeroU16 = NonZeroU16::new(500).unwrap();
-    let mut parser = vt100::Parser::new(PARSE_ROWS, cols, 0);
-    parser.process(raw_content.as_bytes());
-
-    if parser.screen().alternate_screen() {
-        parser.process(b"\x1b[?1049l");
-    }
-    let screen = parser.screen();
-
-    let mut all_lines: Vec<Line> = (0..PARSE_ROWS.get())
-        .map(|row| {
-            let mut spans = Vec::new();
-            for col in 0..inner.width {
-                let cell = screen.cell(row, col).unwrap();
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-                let contents = cell.contents();
-                let style = vt100_style_to_ratatui(cell);
-                if contents.is_empty() {
-                    spans.push(Span::styled(" ".to_string(), style));
-                } else {
-                    spans.push(Span::styled(contents.to_string(), style));
-                }
-            }
-            Line::from(spans)
-        })
-        .collect();
-
-    while all_lines.last().is_some_and(|l| line_is_blank(l)) {
-        all_lines.pop();
-    }
-
-    let display_lines: Vec<Line> = if all_lines.len() > inner.height as usize {
-        all_lines.split_off(all_lines.len() - inner.height as usize)
-    } else {
-        all_lines
-    };
-
-    frame.render_widget(Paragraph::new(display_lines), inner);
-}
-
-fn line_is_blank(line: &Line) -> bool {
-    line.spans.iter().all(|s| s.content.trim().is_empty())
-}
-
-fn vt100_style_to_ratatui(cell: &vt100::Cell) -> Style {
-    let mut style = Style::new();
-    style = style.fg(vt100_color_to_ratatui(cell.fgcolor()));
-    style = style.bg(vt100_color_to_ratatui(cell.bgcolor()));
-    if cell.bold() {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if cell.italic() {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if cell.underline() {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    if cell.inverse() {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    style
-}
-
-fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
-    match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-    }
+    frame.render_widget(Paragraph::new(message).fg(Color::DarkGray), inner);
 }
 
 fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
@@ -905,5 +864,45 @@ mod tests {
         let s = screen(&mut app, 50, 24);
         assert!(s.contains("Task 'feat5' kept"), "{s}");
         assert!(s.contains("│  first"), "{s}");
+    }
+
+    #[test]
+    fn preview_pane_shows_the_agent_screen() {
+        let mut app = App::new();
+        app.peek = Some(Peek::default());
+        let s = screen(&mut app, 60, 20);
+        assert!(s.contains("(no agent running)"), "{s}");
+        assert!(s.contains("pgup/pgdn:scroll"), "{s}");
+
+        // Lines 0-9 in history, the live screen (5 rows) shows 10-12.
+        let size = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut vt = vt100::Parser::new(size(5), size(80), 0);
+        vt.process(b"\x1b[?25lline 10\r\nline 11\r\nline 12");
+        let mut info = tam_proto::ScreenInfo {
+            cols: 80,
+            rows: 5,
+            contents: vt.screen().contents_formatted(),
+            top: 10,
+            oldest: 0,
+            live: 10,
+        };
+        let mut peek = Peek {
+            agent: Some("m-1".into()),
+            ..Default::default()
+        };
+        peek.set_screen(&info);
+        app.peek = Some(peek);
+        let s = screen(&mut app, 60, 20);
+        assert!(s.contains("│line 12"), "{s}");
+        assert!(!s.contains("history"), "{s}");
+
+        // Scrolled back to line 4.
+        let peek = app.peek.as_mut().unwrap();
+        peek.from = Some(4);
+        info.top = 4;
+        peek.set_screen(&info);
+        let s = screen(&mut app, 60, 20);
+        assert!(s.contains("— · 6 lines into history"), "{s}");
+        assert!(s.contains("end:live"), "{s}");
     }
 }

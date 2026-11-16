@@ -1,4 +1,5 @@
 mod app;
+mod peek;
 mod ui;
 
 use std::io::IsTerminal;
@@ -19,6 +20,7 @@ use crate::task::{self, Member, Task};
 use tam_proto::SessionChoice;
 
 use self::app::{App, Mode, PickerItem, PickerState};
+use self::peek::{Peek, Scroll};
 
 /// Actions returned from the event loop.
 enum Action {
@@ -65,6 +67,7 @@ enum Action {
     RepairTask {
         name: String,
     },
+    ScrollPeek(Scroll),
 }
 
 pub async fn run() -> Result<()> {
@@ -183,10 +186,13 @@ async fn run_loop(
     config: &Config,
 ) -> Result<()> {
     let mut input = InputReader::spawn();
-    let mut peek_timer = tokio::time::interval(Duration::from_secs(2));
-    peek_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        // Whatever moved the selection (a key, a re-sort, an agent starting
+        // or exiting), the preview follows.
+        if app.peek_stale() {
+            refresh_peek(client, app).await;
+        }
         terminal.draw(|frame| ui::render(frame, app))?;
 
         let action = tokio::select! {
@@ -200,12 +206,21 @@ async fn run_loop(
             }
             msg = client.read_message() => {
                 match msg? {
-                    ServerMessage::Event(event) => apply_event(app, event),
-                    ServerMessage::Response(_) => {}
+                    ServerMessage::Event(tam_proto::Event::ScreenUpdated { id }) => {
+                        let watched = app.peek.as_ref().and_then(|p| p.watching.as_ref());
+                        if watched == Some(&id) {
+                            Action::RefreshPeek
+                        } else {
+                            Action::None
+                        }
+                    }
+                    ServerMessage::Event(event) => {
+                        apply_event(app, event);
+                        Action::None
+                    }
+                    ServerMessage::Response(_) => Action::None,
                 }
-                Action::None
             }
-            _ = peek_timer.tick(), if app.peek.is_some() => Action::RefreshPeek,
         };
 
         match action {
@@ -219,6 +234,8 @@ async fn run_loop(
                 refresh_peek(client, app).await;
             }
             Action::Attach { id, label } => {
+                // The dashboard reads nothing while attached.
+                unwatch_screen(client, app).await;
                 input.pause().await;
                 let provider = app
                     .find_member(&id)
@@ -263,9 +280,10 @@ async fn run_loop(
             },
             Action::TogglePeek => {
                 if app.peek.is_some() {
+                    unwatch_screen(client, app).await;
                     app.peek = None;
                 } else {
-                    app.peek = Some(String::new());
+                    app.peek = Some(Peek::default());
                     refresh_peek(client, app).await;
                 }
             }
@@ -277,6 +295,12 @@ async fn run_loop(
             }
             Action::RepairTask { name } => {
                 repair_task(client, app, &name).await;
+            }
+            Action::ScrollPeek(scroll) => {
+                if let Some(peek) = app.peek.as_mut() {
+                    peek.scroll(scroll);
+                }
+                refresh_peek(client, app).await;
             }
             Action::None => {}
         }
@@ -381,6 +405,10 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
                 Action::None
             }
         }
+        (KeyCode::PageUp, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::PageUp),
+        (KeyCode::PageDown, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::PageDown),
+        (KeyCode::Home, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::Oldest),
+        (KeyCode::End, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::Live),
         _ => Action::None,
     }
 }
@@ -709,31 +737,46 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
 // Peek
 // ---------------------------------------------------------------------------
 
+/// Show the selected task's agent screen in the preview pane (live, or the
+/// lines scrolled back to), and have the daemon tell when it changes.
 async fn refresh_peek(client: &mut Client, app: &mut App) {
-    if app.peek.is_none() {
+    let wanted = app.peek_agent();
+    let Some(peek) = app.peek.as_mut() else {
         return;
+    };
+    if peek.agent != wanted {
+        // Another agent: from its live screen.
+        *peek = Peek {
+            agent: wanted.clone(),
+            watching: peek.watching.take(),
+            height: peek.height,
+            ..Peek::default()
+        };
     }
-    if let Some(task) = app.selected_task() {
-        if let Some(agent) = task.agent_info() {
-            let id = agent.id.clone();
-            match fetch_scrollback(client, &id).await {
-                Ok(data) => app.peek = Some(data),
-                Err(e) => app.peek = Some(format!("(error: {e})")),
-            }
-        } else {
-            app.peek = Some("(no agent running)".into());
+    if peek.watching != wanted {
+        // An error is an agent already gone: its exit event follows.
+        let _ = client.watch_screen(wanted.as_deref()).await;
+        peek.watching = wanted.clone();
+    }
+    let Some(id) = wanted else {
+        return;
+    };
+    match client.screen(&id, peek.from).await {
+        Ok(screen) => peek.set_screen(&screen),
+        Err(e) => {
+            peek.screen = None;
+            peek.error = Some(format!("{e:#}"));
         }
     }
 }
 
-async fn fetch_scrollback(client: &mut Client, id: &str) -> Result<String> {
-    let resp = client
-        .send(tam_proto::Request::Scrollback { id: id.into() })
-        .await?;
-    match resp {
-        tam_proto::Response::Scrollback { data } => Ok(data),
-        tam_proto::Response::Error { message } => anyhow::bail!("{message}"),
-        _ => anyhow::bail!("unexpected response to Scrollback"),
+/// Stop the daemon's screen updates (the pane is closed, or the dashboard
+/// stops reading for a while).
+async fn unwatch_screen(client: &mut Client, app: &mut App) {
+    if let Some(peek) = app.peek.as_mut() {
+        if peek.watching.take().is_some() {
+            let _ = client.watch_screen(None).await;
+        }
     }
 }
 
@@ -1029,6 +1072,8 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
         tam_proto::Event::TaskDropped { name } => {
             app.remove_task(&name);
         }
+        // Followed by the event loop (see `refresh_peek`).
+        tam_proto::Event::ScreenUpdated { .. } => {}
     }
 }
 
@@ -1328,6 +1373,29 @@ mod tests {
             let mut app = app_with(health);
             handle_normal_key(press('d'), &mut app, &config);
             assert!(matches!(app.mode, Mode::ConfirmDropTask { .. }));
+        }
+    }
+
+    #[test]
+    fn page_keys_scroll_the_preview_only_when_shown() {
+        let config = Config::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = App::new();
+        assert!(matches!(
+            handle_normal_key(key(KeyCode::PageUp), &mut app, &config),
+            Action::None
+        ));
+        app.peek = Some(Peek::default());
+        for (code, scroll) in [
+            (KeyCode::PageUp, Scroll::PageUp),
+            (KeyCode::PageDown, Scroll::PageDown),
+            (KeyCode::Home, Scroll::Oldest),
+            (KeyCode::End, Scroll::Live),
+        ] {
+            assert!(matches!(
+                handle_normal_key(key(code), &mut app, &config),
+                Action::ScrollPeek(s) if s == scroll
+            ));
         }
     }
 }

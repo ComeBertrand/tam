@@ -3,20 +3,21 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use nix::pty::openpty;
+use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use tam_proto::{AgentInfo, AgentState};
-use tokio::sync::broadcast;
+use tam_proto::{AgentInfo, AgentState, ScreenInfo};
+use tokio::sync::{broadcast, watch};
 use tracing::error;
 
 use crate::provider::{HookData, HookResult, Provider};
 use crate::scrollback::ScrollbackBuffer;
+use crate::terminal::{self, Terminal};
 
 /// Lightweight metadata for context refresh — collected under lock, IO done outside.
 pub struct ContextRefreshJob {
@@ -36,6 +37,11 @@ pub struct Agent {
     child: Child,
     pty_master: Arc<OwnedFd>,
     scrollback: Arc<Mutex<ScrollbackBuffer>>,
+    /// The screen of the PTY, at its size. Locked by the reader while it
+    /// takes in and relays a chunk of output.
+    terminal: Arc<Mutex<Terminal>>,
+    /// Bumped on every change of the screen.
+    screen_changed: watch::Sender<()>,
     output_tx: broadcast::Sender<Vec<u8>>,
     viewers: Arc<AtomicUsize>,
     started_at: Instant,
@@ -73,8 +79,15 @@ impl Agent {
             cmd.env(key, val);
         }
 
-        // Create PTY pair
-        let pty = openpty(None, None).context("failed to create PTY")?;
+        // Create PTY pair, at the terminal's size: a PTY without one
+        // reports 0×0 and each program falls back on its own default.
+        let size = Winsize {
+            ws_row: terminal::DEFAULT_ROWS,
+            ws_col: terminal::DEFAULT_COLS,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = openpty(&size, None).context("failed to create PTY")?;
         let master = pty.master;
         let slave = pty.slave;
 
@@ -108,20 +121,28 @@ impl Agent {
 
         let master = Arc::new(master);
         let scrollback = Arc::new(Mutex::new(ScrollbackBuffer::default()));
+        let terminal = Arc::new(Mutex::new(Terminal::new(
+            terminal::DEFAULT_COLS,
+            terminal::DEFAULT_ROWS,
+        )));
+        let (screen_changed, _) = watch::channel(());
         let (output_tx, _) = broadcast::channel(64);
         let last_output_at = Arc::new(Mutex::new(Instant::now()));
 
-        // Spawn a reader thread that drains PTY output into scrollback + broadcast
+        // Spawn a reader thread that drains PTY output into the terminal,
+        // scrollback + broadcast
         let reader_handle = {
+            let reader = PtyReader {
+                scrollback: scrollback.clone(),
+                terminal: terminal.clone(),
+                screen_changed: screen_changed.clone(),
+                output_tx: output_tx.clone(),
+                last_output_at: last_output_at.clone(),
+            };
             let master = master.clone();
-            let scrollback = scrollback.clone();
-            let output_tx = output_tx.clone();
-            let last_output_at = last_output_at.clone();
             std::thread::Builder::new()
                 .name("pty-reader".to_string())
-                .spawn(move || {
-                    pty_reader_loop(master.as_raw_fd(), scrollback, output_tx, last_output_at);
-                })
+                .spawn(move || reader.run(master.as_raw_fd()))
                 .context("failed to spawn PTY reader thread")?
         };
 
@@ -132,6 +153,8 @@ impl Agent {
             child,
             pty_master: master,
             scrollback,
+            terminal,
+            screen_changed,
             output_tx,
             viewers: Arc::new(AtomicUsize::new(0)),
             started_at: Instant::now(),
@@ -340,23 +363,42 @@ impl Agent {
         self.pty_master.clone()
     }
 
-    /// Resize the agent's PTY and notify the agent process.
+    /// Resize the agent's PTY (at least 1×1) and notify the agent process.
     pub fn resize(&self, cols: u16, rows: u16) {
+        let (cols, rows) = (cols.max(1), rows.max(1));
         let ws = libc::winsize {
             ws_col: cols,
             ws_row: rows,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        unsafe {
-            libc::ioctl(
-                self.pty_master.as_raw_fd(),
-                libc::TIOCSWINSZ as libc::c_ulong,
-                &ws,
-            );
+        {
+            // The terminal first, and no output in between: the agent's
+            // redraw must find it at the new size.
+            let mut terminal = lock(&self.terminal);
+            terminal.resize(cols, rows);
+            unsafe {
+                libc::ioctl(
+                    self.pty_master.as_raw_fd(),
+                    libc::TIOCSWINSZ as libc::c_ulong,
+                    &ws,
+                );
+            }
         }
+        self.screen_changed.send_replace(());
         // Notify the agent process of the resize
         let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGWINCH);
+    }
+
+    /// The agent's screen: live, or scrolled back to line `from`.
+    pub fn screen(&self, from: Option<u64>) -> ScreenInfo {
+        lock(&self.terminal).screen(from)
+    }
+
+    /// Notified on each change of the agent's screen. Closed once the agent
+    /// and its PTY are gone.
+    pub fn screen_changes(&self) -> watch::Receiver<()> {
+        self.screen_changed.subscribe()
     }
 }
 
@@ -397,35 +439,53 @@ fn silence_fallback(
     }
 }
 
-/// Blocking loop that reads PTY master output, stores it in the scrollback buffer,
-/// broadcasts it to any attached clients, and tracks when output last arrived.
-/// Exits when the PTY slave side is closed (agent exits).
-fn pty_reader_loop(
-    master_fd: i32,
+/// Lock a mutex, even one a panicking thread left poisoned: the PTY reader
+/// must go on relaying output.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Where the PTY reader takes the agent's output.
+struct PtyReader {
     scrollback: Arc<Mutex<ScrollbackBuffer>>,
+    terminal: Arc<Mutex<Terminal>>,
+    screen_changed: watch::Sender<()>,
     output_tx: broadcast::Sender<Vec<u8>>,
     last_output_at: Arc<Mutex<Instant>>,
-) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match nix::unistd::read(master_fd, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let data = buf[..n].to_vec();
-                if let Ok(mut sb) = scrollback.lock() {
-                    sb.write(&data);
+}
+
+impl PtyReader {
+    /// Blocking loop that reads PTY master output, tracks when output last
+    /// arrived, feeds the terminal and the scrollback buffer, and broadcasts
+    /// it to any attached clients. Exits when the PTY slave side is closed
+    /// (agent exits).
+    fn run(self, master_fd: i32) {
+        let mut buf = [0u8; 4096];
+        loop {
+            match nix::unistd::read(master_fd, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    if let Ok(mut ts) = self.last_output_at.lock() {
+                        *ts = Instant::now();
+                    }
+                    {
+                        let mut terminal = lock(&self.terminal);
+                        terminal.feed(&data);
+                        if let Ok(mut sb) = self.scrollback.lock() {
+                            sb.write(&data);
+                        }
+                        // Ignore send errors (no receivers is fine)
+                        let _ = self.output_tx.send(data);
+                    }
+                    self.screen_changed.send_replace(());
                 }
-                if let Ok(mut ts) = last_output_at.lock() {
-                    *ts = Instant::now();
+                Err(nix::errno::Errno::EIO) => break, // PTY closed
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => {
+                    error!("PTY read error: {}", e);
+                    break;
                 }
-                // Ignore send errors (no receivers is fine)
-                let _ = output_tx.send(data);
-            }
-            Err(nix::errno::Errno::EIO) => break, // PTY closed
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => {
-                error!("PTY read error: {}", e);
-                break;
             }
         }
     }

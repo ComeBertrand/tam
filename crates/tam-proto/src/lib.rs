@@ -267,6 +267,29 @@ pub struct WorktreeReport {
     pub problem: Option<String>,
 }
 
+/// An agent's terminal screen, from the daemon's emulator of its PTY: a
+/// window of `rows` lines, the live screen or history above it.
+///
+/// Lines are numbered in the order the agent wrote them: `live` is the
+/// first line of the live screen, `oldest..live` the history kept above it.
+/// A line keeps its number as output scrolls it into history, so a viewer
+/// scrolled back stays on the same lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenInfo {
+    /// Size of the agent's PTY.
+    pub cols: u16,
+    pub rows: u16,
+    /// Escape sequences that draw the window on a blank terminal of that
+    /// size (cursor and attributes included).
+    pub contents: String,
+    /// Line on the window's first row.
+    pub top: u64,
+    /// Oldest line kept in history.
+    pub oldest: u64,
+    /// First line of the live screen.
+    pub live: u64,
+}
+
 /// Client -> Daemon request.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -408,6 +431,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         join: Option<String>,
     },
+    /// An agent's terminal screen. Replies `Screen`.
+    Screen {
+        id: String,
+        /// Scroll back: the line to show first (see `ScreenInfo`), clamped
+        /// to the history kept. `None`: the live screen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+    },
+    /// Receive `ScreenUpdated` events on this connection when this agent's
+    /// screen changes, in place of the agent watched so far; `None` stops
+    /// them. They stop too when the agent exits. Replies `Ok`.
+    WatchScreen {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 /// Which session a member's agent starts in.
@@ -479,6 +517,9 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumed: Option<String>,
     },
+    Screen {
+        screen: ScreenInfo,
+    },
 }
 
 /// Daemon -> Client pushed event (unsolicited).
@@ -516,6 +557,11 @@ pub enum Event {
     },
     TaskDropped {
         name: String,
+    },
+    /// The screen of the agent watched on this connection changed (see
+    /// `Request::WatchScreen`); throttled, the last change always comes.
+    ScreenUpdated {
+        id: String,
     },
 }
 
@@ -1314,6 +1360,34 @@ mod tests {
     }
 
     #[test]
+    fn screen_requests_wire_format() {
+        let live = Request::Screen {
+            id: "m-1".into(),
+            from: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&live).unwrap(),
+            r#"{"type":"screen","id":"m-1"}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"type":"screen","id":"m-1","from":42}"#).unwrap()
+        {
+            Request::Screen { id, from } => {
+                assert_eq!(id, "m-1");
+                assert_eq!(from, Some(42));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(
+            serde_json::to_string(&Request::WatchScreen { id: None }).unwrap(),
+            r#"{"type":"watch_screen"}"#
+        );
+        match serde_json::from_str::<Request>(r#"{"type":"watch_screen","id":"m-1"}"#).unwrap() {
+            Request::WatchScreen { id } => assert_eq!(id.as_deref(), Some("m-1")),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn response_running_serde() {
         let json = serde_json::to_string(&Response::Running {
             id: "m-1".into(),
@@ -1334,5 +1408,31 @@ mod tests {
             }
             other => panic!("wrong message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn screen_reply_and_update_are_told_apart() {
+        let screen = ScreenInfo {
+            cols: 80,
+            rows: 24,
+            contents: "\x1b[H\x1b[Jhello".into(),
+            top: 10,
+            oldest: 0,
+            live: 10,
+        };
+        let json = serde_json::to_string(&Response::Screen {
+            screen: screen.clone(),
+        })
+        .unwrap();
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::Screen { screen: back }) => assert_eq!(back, screen),
+            other => panic!("wrong message: {other:?}"),
+        }
+        let json = serde_json::to_string(&Event::ScreenUpdated { id: "m-1".into() }).unwrap();
+        assert_eq!(json, r#"{"type":"screen_updated","id":"m-1"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            ServerMessage::Event(Event::ScreenUpdated { .. })
+        ));
     }
 }

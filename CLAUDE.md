@@ -8,7 +8,7 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 ## Crate structure
 
 - `tam-proto`    — wire protocol types (daemon <-> client)
-- `tam-daemon`   — daemon: PTY management, agent lifecycle, state detection, task ledger, task drop,
+- `tam-daemon`   — daemon: PTY management, agent screens, agent lifecycle, state detection, task ledger, task drop,
   worktree reconciliation (member health, repair, adopt)
 - `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init
 - `tam-cli`      — binary `tam`: CLI, TUI, bridges worktrees and agents
@@ -87,6 +87,20 @@ adopt). `tam-cli` depends on all three.
   checkout and a detached HEAD. The new task is named after the branch, or
   the worktree joins an existing task (`--join`, one `MemberAdded`). A lock
   (`DaemonState::worktrees`) serialises reconcile passes, repairs and drops.
+- **Agent screen is the daemon's** — `tam-daemon/src/terminal.rs`: a `vt100`
+  parser per agent at its PTY's size (80×24 until a viewer resizes it, both
+  resized together in `Agent::resize`), with 1000 rows of history. The PTY
+  reader feeds it under its lock, then relays the bytes to attach; it also
+  stamps `last_output_at` (silence fallback). `Screen { id, from }` returns
+  a window as escape sequences: the live screen, or history from a line
+  number (lines keep their number as they scroll into history, so a
+  scrolled-back viewer stays put). `WatchScreen { id }` makes one connection
+  receive `ScreenUpdated` for one agent, at most one per 100 ms (throttled in
+  the connection loop, last change always sent). The TUI preview
+  (`tui/peek.rs`) draws the cells itself (tui-term pins vt100 0.16), follows
+  `ScreenUpdated`, and unwatches while attached (it reads nothing then).
+  Line reads on both ends of the socket use `read_until`: `read_line` loses
+  a partly read line when `select!` cancels it.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
   daemon exits after 30s with no agents and no clients.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
@@ -126,8 +140,8 @@ cargo test
 
 ## Testing
 
-- Unit tests are inline in each module (~300 across all crates)
-- Integration tests in `crates/tam-daemon/tests/` (~46 async tests, real
+- Unit tests are inline in each module (~315 across all crates)
+- Integration tests in `crates/tam-daemon/tests/` (~50 async tests, real
   sockets/PTYs/git repos) and `crates/tam-cli/tests/` (`tam hook-notify`
   against a daemon, session resume with a fake `claude`; one test per file:
   they set process environment)

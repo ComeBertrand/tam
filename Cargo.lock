@@ -1724,6 +1724,7 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "tam-daemon",

@@ -300,6 +300,42 @@ adopt). `tam-cli` depends on all three.
   once (`start_new_task_flow`, with `App::projects` from last time);
   `discover_projects` runs on a thread, `App::set_projects` merges its
   result, keeping the filter, picks and highlighted item.
+- **Brief and task directory (#25)** — one brief per task: a reference the
+  user gave (URL, ticket id, path; tam never fetches or reads it), recorded
+  as `BriefSet` (kept with the task's events, latest only: a re-created
+  name starts without one), else the local `brief.md`. Each task has a
+  directory `tasks/<name>` next to the ledger (`tam-daemon/src/brief.rs`;
+  the name percent-encoded, a leading `.` too, so `tasks/.dropped` is no
+  task's) holding `brief.md` and `scratch/`. It is made when first needed
+  (`brief::ensure`: member spawn, `GetBrief`, `SetBrief`), so older tasks
+  get one; its `.task` marker holds the task's `created_at`, and a directory
+  an earlier task of that name left is moved to `.dropped/`. The template
+  has `## Shared` and `## <name> (<member id>)` per member (ids: short names
+  can change). `handle_drop_task` retires it once the ledger has the drop
+  (`brief::retire`): scratch goes, a `brief.md` with more than the template
+  (`is_written`) moves to `.dropped/<dir>-<date>.md`, said in `Dropped`
+  warnings. `GetBrief`/`SetBrief` take a task name, else a member target,
+  and reply `Brief { task, brief: TaskBrief }`; `TaskInfo` does not carry
+  it. The `SessionStart` note (`peers::session_note`) adds the brief, the
+  heading to write under, the scratch directory, and the peers' worktrees
+  the agent can read: those granted at its spawn (`Agent::readable`), not
+  later joiners. Claude agents get `provider::TaskAccess` in the
+  `--settings` JSON (`claude_access_settings`): `additionalDirectories` (the
+  task directory, the peers' existing worktrees) and `deny` of
+  `Edit(//<peer>/**)`. Not `--add-dir`: variadic, it would take the prompt
+  as a directory. Claude restores neither on `--resume`: every spawn passes
+  them. Codex and generic agents get nothing (`provider::grants_access`).
+  CLI (`tam-cli/src/brief.rs`): `tam new --brief REF` (set after
+  `CreateMembers`, before the agents start), `tam brief [NAME] [--set REF |
+  --local] [--json]`, and `tam peers` shows it. `[[brief.patterns]]`
+  (`match`, `reference`, `prompt`; `{0}`…`{9}`, `{brief}`), read by that
+  module only, expand a typed brief and give `tam new` its start prompt
+  unless `-p`; a typed path that exists is made absolute. Every member gets
+  the same start prompt: its own part comes from the note (its repo, its
+  peers) and the brief, or `tam msg`. Merging tasks (#27): the target keeps
+  its brief; the source's directory should move to the target's
+  `scratch/from-<source>/`, a differing reference written there and
+  reported, nothing deleted.
 
 ## Build & check
 
@@ -321,7 +357,10 @@ cargo test
   worktrees, with a fake `claude` and an `sh` agent running `tam peers`;
   `noninteractive.rs`:
   new/wait/result/ps --json with no terminal and a fake `claude`;
-  `exit_status.rs`: exit statuses and a closed stdout)
+  `exit_status.rs`: exit statuses and a closed stdout; `brief.rs`: `tam new
+  --brief` with a pattern, `tam brief`, a written brief kept on drop). The
+  daemon's `tests/brief.rs` checks the settings a fake `claude` gets and
+  the start note.
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

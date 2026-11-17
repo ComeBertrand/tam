@@ -89,6 +89,7 @@ tam new NAME -p TEXT           Start its agent on a prompt
 tam new NAME -d                Don't attach to the agent (--json: print a receipt)
 tam new NAME -r REPO -r REPO   ... in each of these repositories instead (one member each)
 tam new NAME -r REPO --join    Add a worktree in another repository to the task NAME
+tam new NAME --brief REF       Give the task a brief: a URL, a ticket id or a path (see Brief)
 
 tam run NAME                   Start the task's agent, resuming its current session
 tam run NAME --new-session     Start a new session instead
@@ -149,7 +150,21 @@ tam peers --all                ...of every task (--json: machine-readable)
 
 A Claude agent gets a message right away: when idle it wakes up, when busy it reads it at its next step (after a pending permission prompt is answered). Other agents get it typed in once idle. A member with no running agent gets it when its next agent starts. Sent from inside an agent TAM started, a message comes from that agent, which the recipient can answer with `tam msg`; otherwise it comes from you. The reply `--wait` prints is the recipient's next message back, or its response at the end of the turn that got the message. Two agents answering each other are stopped after 6 messages, until you prompt one of them; an agent sends at most 20 messages per 10 minutes.
 
-An agent TAM starts knows its task. A Claude agent is told when its session starts (again on resume, `/clear` and compaction): its task, its name, and the other members with their repositories and worktrees, so a backend and a frontend session can agree on an API without you relaying. Other agents have their member id in `$TAM_AGENT_ID` and can run `tam peers`. From an agent, `tam msg`, `tam run`, `tam stop` and `tam attach` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
+An agent TAM starts knows its task. A Claude agent is told when its session starts (again on resume, `/clear` and compaction): its task, its name, the other members with their repositories and worktrees, and the task's brief and scratch directory (see Brief), so a backend and a frontend session can agree on an API without you relaying. Other agents have their member id in `$TAM_AGENT_ID` and can run `tam peers`. From an agent, `tam msg`, `tam run`, `tam stop` and `tam attach` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
+
+### Brief
+
+```
+tam brief [NAME]               The task's brief and scratch directory
+tam brief NAME --set REF       Make REF the brief: a URL, a ticket id, a path
+tam brief NAME --local         Make the local file brief.md the brief again
+```
+
+The members of a task work from one brief: the reference you give with `tam new --brief REF` or `tam brief --set REF` (a URL, a ticket id, a path; TAM neither fetches nor reads it), else the file `brief.md` in the task's directory (`~/.local/share/tam/tasks/NAME/`), which TAM starts with a heading per member. Next to it, `scratch/` is a directory the members share for transient notes. A Claude agent is told both when its session starts, and how to write in the brief: under its own heading, and what the members agree on (an API shape, a name) under `Shared`, so that two agents do not overwrite each other's part. A changed brief reaches running agents at their next session start (resume, `/clear`, compaction); `tam peers` shows the current one. A pattern in the configuration can turn a ticket id into its URL and into the agents' start prompt (see Configuration). Dropping the task removes its directory: a `brief.md` the members wrote in is kept in `~/.local/share/tam/tasks/.dropped/`, and `tam drop` says where.
+
+A Claude agent can also read the other members' worktrees without asking, but not edit them: TAM adds them to the session's directories with a rule denying edits there, which covers Claude's file tools and the file commands it recognises in shell commands, not every program a command may run. A member that joined after the agent started is readable from the agent's next start. The task's directory is open to the agent as its worktree is: edits there follow its permission mode.
+
+With several repositories, every agent starts on the same prompt (`-p`, or the pattern's): each one is told its own repository and its peers, and takes its part of the brief. To tell one member more, `tam msg TASK/MEMBER`.
 
 ### Scripting
 
@@ -257,6 +272,18 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
 }
 ```
 
+`tam brief --json`: `file` is the local brief while there is no `reference`. `tam peers --json` has the same document, without `schema_version`, under `brief` (`null` outside a task).
+
+```json
+{
+  "schema_version": 1,
+  "task": "feat",
+  "reference": "https://tickets.example.com/CS-42",
+  "file": null,
+  "scratch": "/home/me/.local/share/tam/tasks/feat/scratch"
+}
+```
+
 `tam wait --json` and `tam result --json`: `state` is the agent's, or `exit` when none runs; `exit_code` then tells how its last run ended. `response` is the full text that ended the last turn, `response_at` when.
 
 ```json
@@ -350,7 +377,14 @@ finder = "fzf"
 name = "open in editor"
 key = "o"
 command = "code {dir}"
+
+[[brief.patterns]]                      # tam new --brief CS-42, tam brief --set CS-42
+match = '^CS-(\d+)$'                    # a regular expression: the first one that matches applies
+reference = "https://tickets.example.com/CS-{1}"
+prompt = "/implement-task {brief}"      # the agents' start prompt for tam new without -p
 ```
+
+A brief pattern turns what you type into the task's brief (`reference`: `{0}` is the match, `{1}`… its groups, `{brief}` what you typed; without `reference`, the brief stays as typed), and gives the agents of `tam new` their start prompt (`prompt`, where `{brief}` is the brief). A brief that matches no pattern and names an existing file is recorded as its absolute path.
 
 The notify command runs with `sh -c` on state changes, except while you are attached to the agent. Placeholders are escaped for the quoting they sit in:
 

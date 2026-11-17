@@ -281,7 +281,9 @@ adopt). `tam-cli` depends on all three.
   before cutting task names. `ui::split`: the pane beside the list from
   136 columns (pane >= 82: an agent's 80-column screen), else below it,
   the list as tall as its rows up to 2/5. The footer keeps the hints that
-  fit (`ui::fit_hints`, by priority).
+  fit (`ui::fit_hints`, by priority). `tam ps` (`ps.rs`) prints the same
+  rows as text: a row per task, most urgent first, and below a task with
+  several members a row per member (status, agent, worktree, context).
 - **Dashboard input** — prompts (the filter, the picker's filter, the task
   name, the path) are `tui/input.rs` `TextInput`: cursor movement and
   editing, drawn with the terminal's cursor. `tui/fuzzy.rs` matches the

@@ -219,7 +219,8 @@ tam gc --dry-run                    # show what would be dropped
 ### Observing
 
 ```
-tam ps                              # task table with computed status
+tam ps                              # task table with computed status (a row per
+                                    # member of a task with several)
 tam ps --json                       # machine-readable output
 
 tam ls                              # discover projects and worktrees

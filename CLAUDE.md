@@ -237,8 +237,8 @@ adopt). `tam-cli` depends on all three.
   that started it, maybe long ago: git runs in the client's instead
   (`CreateMembers.env` from `repos::git_env`, without repo-local `GIT_*`
   variables; `git::with_env` scopes it to the thread running that git, so
-  hooks and filters such as git-lfs see the caller's `PATH`). Never recorded
-  or logged. The daemon never fetches: the client does first. `tam new NAME [-r REPO]...
+  hooks and filters such as git-lfs see the caller's `PATH`; `RepairMember`
+  too). Never recorded or logged. The daemon never fetches: the client does first. `tam new NAME [-r REPO]...
   [--join]` resolves each REPO in `tam-cli/src/repos.rs`: an existing path
   (any directory in the repository), else a project name exactly as `tam ls
   --porcelain` prints it (discovery under `$HOME`, only then, once). Worktree
@@ -258,7 +258,8 @@ adopt). `tam-cli` depends on all three.
   task is claimed in `dropping` meanwhile), then `Ledger::drop_member`
   (`MemberDropped`: the member leaves the folded state, so compaction drops
   its history; remaining members' short names are derived again). A task's
-  last member takes the task (a warning says so).
+  last member takes the task (a warning says so), also when another drop took
+  the others meanwhile (counted again under the claim).
 
 ## Build & check
 

@@ -1790,6 +1790,7 @@ impl Conn {
     async fn repair(&mut self, member: &str) -> Response {
         self.request(&Request::RepairMember {
             member: member.into(),
+            env: Default::default(),
         })
         .await
     }

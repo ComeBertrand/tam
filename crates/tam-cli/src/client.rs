@@ -319,10 +319,12 @@ impl Client {
     }
 
     /// Recreate a gone member's worktree (`member`: what `ResolveMember`
-    /// takes). Returns the member, with its task.
+    /// takes), git running in our environment. Returns the member, with its
+    /// task.
     pub async fn repair_member(&mut self, member: &str) -> Result<(TaskInfo, MemberInfo)> {
         let request = Request::RepairMember {
             member: member.into(),
+            env: crate::repos::git_env(),
         };
         match self.send(request).await? {
             Response::Member { task, member, .. } => Ok((task, *member)),

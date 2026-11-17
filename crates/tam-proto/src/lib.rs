@@ -466,6 +466,10 @@ pub enum Request {
         /// What `ResolveMember` takes as a target: a member id, a task name
         /// (its only member) or `<task>/<member>`.
         member: String,
+        /// The client's environment, for git (see `CreateMembers`). Empty:
+        /// the daemon's.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
     },
     /// Turn an existing linked worktree, the one containing `dir`, into a
     /// task member on the branch it has checked out: a new task named `name`
@@ -1506,7 +1510,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&Request::RepairMember {
-                member: "feat/api".into()
+                member: "feat/api".into(),
+                env: BTreeMap::new(),
             })
             .unwrap(),
             r#"{"type":"repair_member","member":"feat/api"}"#

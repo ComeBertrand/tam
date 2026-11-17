@@ -854,7 +854,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                 tasks: state.lock().await.ledger.tasks(),
             }
         }
-        Request::RepairMember { member } => handle_repair_member(state, &member).await,
+        Request::RepairMember { member, env } => handle_repair_member(state, &member, env).await,
         Request::AdoptWorktree { dir, name, join } => {
             handle_adopt_worktree(state, dir, name, join).await
         }
@@ -1405,16 +1405,28 @@ async fn handle_drop(
         Some((task, member)) if task.members.len() > 1 => {
             handle_drop_member(state, &task, member, force, delete_branch).await
         }
-        Some((task, _)) => match handle_drop_task(state, &task.name, force, delete_branch).await {
-            Response::Dropped { mut warnings } => {
-                warnings.push(format!(
-                    "'{name}' was the last member of task '{}': the task is dropped",
-                    task.name
-                ));
-                Response::Dropped { warnings }
-            }
-            other => other,
-        },
+        Some((task, _)) => {
+            drop_with_last_member(state, name, &task.name, force, delete_branch).await
+        }
+    }
+}
+
+/// Drop the task whose last member is `member`, saying so.
+async fn drop_with_last_member(
+    state: &Arc<Mutex<DaemonState>>,
+    member: &str,
+    task: &str,
+    force: bool,
+    delete_branch: bool,
+) -> Response {
+    match handle_drop_task(state, task, force, delete_branch).await {
+        Response::Dropped { mut warnings } => {
+            warnings.push(format!(
+                "'{member}' was the last member of task '{task}': the task is dropped"
+            ));
+            Response::Dropped { warnings }
+        }
+        other => other,
     }
 }
 
@@ -1430,10 +1442,31 @@ async fn handle_drop_member(
     delete_branch: bool,
 ) -> Response {
     let label = task.member_label(&member);
-    if !state.lock().await.dropping.insert(task.name.clone()) {
-        return Response::Error {
-            message: format!("task '{}' is already being dropped", task.name),
+    let is_last = {
+        let mut guard = state.lock().await;
+        if !guard.dropping.insert(task.name.clone()) {
+            return Response::Error {
+                message: format!("task '{}' is already being dropped", task.name),
+            };
+        }
+        // Again, under the claim: another drop may have taken the other
+        // members since.
+        let is_last = match guard.ledger.member(&member.id) {
+            Some((now, _)) => now.members.len() < 2,
+            None => {
+                guard.dropping.remove(&task.name);
+                return Response::Error {
+                    message: format!("'{label}' is no longer a member of task '{}'", task.name),
+                };
+            }
         };
+        if is_last {
+            guard.dropping.remove(&task.name);
+        }
+        is_last
+    };
+    if is_last {
+        return drop_with_last_member(state, &label, &task.name, force, delete_branch).await;
     }
     let worktrees = state.lock().await.worktrees.clone();
     let held = worktrees.lock().await;
@@ -1668,8 +1701,13 @@ impl DaemonState {
 
 /// Recreate a gone member's worktree on its branch (`Request::RepairMember`).
 /// Holds the worktree lock, so no reconcile pass or drop runs meanwhile;
-/// [`worktree::recreate`] checks again right before acting.
-async fn handle_repair_member(state: &Arc<Mutex<DaemonState>>, target: &str) -> Response {
+/// [`worktree::recreate`] checks again right before acting. Git runs in the
+/// client's environment `env` (the daemon's when empty).
+async fn handle_repair_member(
+    state: &Arc<Mutex<DaemonState>>,
+    target: &str,
+    env: std::collections::BTreeMap<String, String>,
+) -> Response {
     let error = |message: String| Response::Error { message };
     let worktrees = state.lock().await.worktrees.clone();
     let _held = worktrees.lock().await;
@@ -1697,7 +1735,11 @@ async fn handle_repair_member(state: &Arc<Mutex<DaemonState>>, target: &str) -> 
     };
 
     let (dir, branch, at) = (member.dir.clone(), member.branch.clone(), repo.clone());
-    if let Err(e) = run_git(move || worktree::recreate(&at, &dir, &branch)).await {
+    let env = (!env.is_empty()).then_some(env);
+    let recreated = run_git(move || {
+        tam_worktree::git::with_env(env, || worktree::recreate(&at, &dir, &branch))
+    });
+    if let Err(e) = recreated.await {
         return error(format!("cannot recreate the worktree of '{label}': {e:#}"));
     }
     info!(member = %member.id, dir = %member.dir.display(), "worktree recreated");

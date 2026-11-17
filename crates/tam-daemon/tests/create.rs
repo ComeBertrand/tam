@@ -304,6 +304,19 @@ async fn git_runs_in_the_environment_of_the_request() {
             .await,
     );
     assert_eq!(std::fs::read_to_string(&mark).unwrap(), "unset\n");
+
+    // Recreating a worktree deleted by hand checks it out the same way.
+    std::fs::remove_dir_all(fx.worktree(&api, "feat")).unwrap();
+    let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    env.insert("TAM_TEST_MARK".into(), "repaired".into());
+    let resp = cmd
+        .request(&Request::RepairMember {
+            member: "feat".into(),
+            env,
+        })
+        .await;
+    assert!(matches!(resp, Response::Member { .. }), "{resp:?}");
+    assert_eq!(std::fs::read_to_string(&mark).unwrap(), "repaired\n");
 }
 
 #[tokio::test]

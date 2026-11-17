@@ -644,18 +644,7 @@ async fn new_members(
     let cwd = std::fs::canonicalize(".")?;
     let wt_config = tam_worktree::config::load_config()?;
     let roots = repos::resolve(repos, &cwd, || repos::discover(&wt_config))?;
-    let members: Vec<tam_proto::NewMember> = roots
-        .iter()
-        .map(|root| tam_proto::NewMember {
-            repo_root: root.clone(),
-            branch: name.to_string(),
-            dir: tam_worktree::worktree::target_dir(&wt_config, root, name),
-        })
-        .collect();
-    // The daemon does not fetch: the latest remote branches, from here.
-    for root in &roots {
-        tam_worktree::git::fetch(root)?;
-    }
+    let members = repos::new_members(&roots, name, &wt_config)?;
     let task = client.create_members(name, members, source, join).await?;
     // They joined last, in order.
     let new = task.members[task.members.len().saturating_sub(roots.len())..].to_vec();

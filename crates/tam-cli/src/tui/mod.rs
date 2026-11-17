@@ -5,7 +5,7 @@ mod triage;
 mod ui;
 
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,7 +18,8 @@ use tam_proto::ServerMessage;
 
 use crate::client::{self, Client, DropOutcome};
 use crate::config::{self, Config};
-use crate::task::{self, Member, Task};
+use crate::repos;
+use crate::task::{Member, Task};
 use tam_proto::SessionChoice;
 
 use self::app::{App, Mode, PaneTab, PickerItem, PickerState, TaskDetail};
@@ -48,9 +49,12 @@ enum Action {
     RunAgent {
         member: String,
     },
+    /// Worktrees on branch `name` in the repositories `dirs` (main
+    /// checkouts): a new task, or more members of the task `name` if it
+    /// exists.
     DoNewTask {
         name: String,
-        dir: PathBuf,
+        dirs: Vec<PathBuf>,
     },
     CustomCommand {
         name: String,
@@ -289,8 +293,8 @@ async fn run_loop(
             Action::RunAgent { member } => {
                 do_run(client, app, config, &member, SessionChoice::Current).await?;
             }
-            Action::DoNewTask { name, dir } => {
-                do_new_task(client, app, &name, &dir, config).await?;
+            Action::DoNewTask { name, dirs } => {
+                do_new_task(client, app, &name, &dirs, config).await?;
             }
             Action::CustomCommand {
                 name,
@@ -501,6 +505,10 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             Action::None
         }
         (KeyCode::Enter, _) => handle_picker_enter(app, config),
+        (KeyCode::Tab, _) => {
+            picker_mut(app, PickerState::toggle_mark);
+            Action::None
+        }
         (KeyCode::Backspace, _) => {
             picker_mut(app, PickerState::backspace);
             Action::None
@@ -520,15 +528,17 @@ fn handle_new_task_name_key(key: KeyEvent, app: &mut App) -> Action {
             Action::None
         }
         (KeyCode::Enter, _) => {
-            let (name, dir) = match &app.mode {
-                Mode::NewTaskEnterName { name, project_dir } => (name.clone(), project_dir.clone()),
+            let (name, dirs) = match &app.mode {
+                Mode::NewTaskEnterName { name, project_dirs } => {
+                    (name.clone(), project_dirs.clone())
+                }
                 _ => return Action::None,
             };
             if name.is_empty() {
                 return Action::None;
             }
             app.mode = Mode::Normal;
-            Action::DoNewTask { name, dir }
+            Action::DoNewTask { name, dirs }
         }
         (KeyCode::Backspace, _) => {
             if let Mode::NewTaskEnterName { ref mut name, .. } = app.mode {
@@ -563,9 +573,16 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
                 app.mode = Mode::Normal;
                 return Action::None;
             }
-            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            let root = match repository(&dir) {
+                Ok(root) => root,
+                Err(e) => {
+                    app.set_status(e, Duration::from_secs(5));
+                    app.mode = Mode::Normal;
+                    return Action::None;
+                }
+            };
             app.mode = Mode::NewTaskEnterName {
-                project_dir: dir,
+                project_dirs: vec![root],
                 name: String::new(),
             };
             Action::None
@@ -729,50 +746,56 @@ fn start_new_task_flow(app: &mut App, _config: &Config) {
     app.mode = Mode::NewTaskPickProject(PickerState::new("Pick project", items));
 }
 
+/// Enter in the project picker: the projects picked with tab, else the
+/// highlighted one (or the path entry).
 fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
-    let selected_id = match &app.mode {
-        Mode::NewTaskPickProject(p) => p.selected_item().map(|item| item.id.clone()),
-        _ => return Action::None,
-    };
-
-    let Some(selected_id) = selected_id else {
+    let Mode::NewTaskPickProject(picker) = &app.mode else {
         return Action::None;
     };
+    let ids = if picker.marked.is_empty() {
+        match picker.selected_item() {
+            Some(item) => vec![item.id.clone()],
+            None => return Action::None,
+        }
+    } else {
+        picker.marked.clone()
+    };
+    app.mode = Mode::Normal;
+    if ids == ["__enter_path__"] {
+        app.mode = Mode::SpawnEnterPath(String::new());
+        return Action::None;
+    }
 
-    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
-
-    match mode {
-        Mode::NewTaskPickProject(_) => {
-            if selected_id == "__enter_path__" {
-                app.mode = Mode::SpawnEnterPath(String::new());
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for id in ids {
+        let dir = if id == "__cwd__" {
+            std::env::current_dir().unwrap_or_default()
+        } else {
+            PathBuf::from(&id)
+        };
+        match repository(&dir) {
+            // A repository and one of its worktrees: one member.
+            Ok(root) if roots.contains(&root) => {}
+            Ok(root) => roots.push(root),
+            Err(e) => {
+                app.set_status(e, Duration::from_secs(5));
                 return Action::None;
             }
-
-            let dir = if selected_id == "__cwd__" {
-                std::env::current_dir().unwrap_or_default()
-            } else {
-                PathBuf::from(&selected_id)
-            };
-
-            match std::fs::canonicalize(&dir) {
-                Ok(dir) => {
-                    app.mode = Mode::NewTaskEnterName {
-                        project_dir: dir,
-                        name: String::new(),
-                    };
-                    Action::None
-                }
-                Err(_) => {
-                    app.set_status(
-                        format!("Directory not found: {}", dir.display()),
-                        Duration::from_secs(5),
-                    );
-                    Action::None
-                }
-            }
         }
-        _ => Action::None,
     }
+    app.mode = Mode::NewTaskEnterName {
+        project_dirs: roots,
+        name: String::new(),
+    };
+    Action::None
+}
+
+/// The main checkout of the repository a picked directory is in (a worktree
+/// stands for its repository); `Err` says why there is none.
+fn repository(dir: &std::path::Path) -> Result<PathBuf, String> {
+    let dir = std::fs::canonicalize(dir)
+        .map_err(|_| format!("Directory not found: {}", dir.display()))?;
+    repos::main_checkout(&dir).map_err(|_| format!("Not in a git repository: {}", dir.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -855,66 +878,76 @@ async fn unwatch_screen(client: &mut Client, app: &mut App) {
 // Task actions
 // ---------------------------------------------------------------------------
 
+/// Create worktrees on branch `name` in the repositories `dirs` (main
+/// checkouts; the daemon does it, all or nothing): a new task, or more members of the task
+/// `name` if it exists. Then start an agent in each new member.
 async fn do_new_task(
     client: &mut Client,
     app: &mut App,
     name: &str,
-    dir: &Path,
+    dirs: &[PathBuf],
     config: &Config,
 ) -> Result<()> {
-    if app.tasks.iter().any(|t| t.name == name) {
-        app.set_status(
-            format!("Task '{}' already exists", name),
-            Duration::from_secs(3),
-        );
-        return Ok(());
-    }
+    let join = app.tasks.iter().any(|t| t.name == name);
+    // The picker gave main checkouts, each once.
+    let roots = dirs;
 
-    // A task owns its worktree: branch NAME of the picked repository.
+    // The task shows up (or changes) through the daemon's events.
     let wt_config = tam_worktree::config::load_config()?;
-    let member = match task::create_worktree(name, None, &wt_config, dir) {
-        Ok(member) => {
-            if wt_config.auto_init {
-                let _ = tam_worktree::init::run(&member.dir);
-            }
-            member
-        }
+    let created = match repos::new_members(roots, name, &wt_config) {
+        Ok(members) => client.create_members(name, members, None, join).await,
+        Err(e) => Err(e),
+    };
+    let task = match created {
+        Ok(task) => task,
+        // E.g. what a failed worktree left behind: the whole message.
         Err(e) => {
-            app.set_status(format!("Worktree failed: {e}"), Duration::from_secs(5));
+            app.mode = Mode::Notice {
+                title: if join { "Add Failed" } else { "Create Failed" }.into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
             return Ok(());
         }
     };
-
-    // The task shows up through the daemon's TaskCreated event.
-    let member = match client.create_task(name, vec![member]).await {
-        Ok(task) => task.members[0].id.clone(),
-        Err(e) => {
-            app.set_status(format!("Create failed: {e}"), Duration::from_secs(5));
-            return Ok(());
+    let new = &task.members[task.members.len().saturating_sub(roots.len())..];
+    if wt_config.auto_init {
+        for member in new {
+            let _ = tam_worktree::init::run(&member.dir);
         }
-    };
-
-    let resp = client
-        .send(tam_proto::Request::Spawn {
-            provider: config.default_agent.clone(),
-            dir: PathBuf::new(),
-            id: None,
-            args: vec![],
-            resume_session: None,
-            prompt: None,
-            member: Some(member),
-        })
-        .await?;
-    match resp {
-        tam_proto::Response::Spawned { .. } => {
-            app.set_status(format!("Created+started '{name}'"), Duration::from_secs(3));
-        }
-        tam_proto::Response::Error { message } => {
-            app.set_status(format!("Spawn error: {message}"), Duration::from_secs(5));
-        }
-        _ => {}
     }
 
+    let mut failed = Vec::new();
+    for member in new {
+        let started = client
+            .run_agent(
+                &member.id,
+                None,
+                &config.default_agent,
+                SessionChoice::New,
+                None,
+                vec![],
+            )
+            .await;
+        if let Err(e) = started {
+            failed.push(format!("{}: {e:#}", task.member_label(member)));
+        }
+    }
+    let what = match (join, new) {
+        (false, [_]) => format!("Created+started '{name}'"),
+        (false, _) => format!("Created+started '{name}' in {} repositories", new.len()),
+        (true, _) => {
+            let labels: Vec<String> = new.iter().map(|m| task.member_label(m)).collect();
+            format!("Added+started {}", labels.join(", "))
+        }
+    };
+    if failed.is_empty() {
+        app.set_status(what, Duration::from_secs(3));
+    } else {
+        app.set_status(
+            format!("{what}; spawn error: {}", failed.join("; ")),
+            Duration::from_secs(5),
+        );
+    }
     Ok(())
 }
 
@@ -1212,6 +1245,7 @@ async fn repair_task(client: &mut Client, app: &mut App, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task;
 
     fn press(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -1695,5 +1729,100 @@ mod tests {
         app.detail.as_mut().unwrap().stale = false;
         app.selected = 1 - app.selected;
         assert!(app.detail_stale());
+    }
+
+    #[test]
+    fn tab_picks_several_projects_in_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let (api, web) = (tmp.path().join("api"), tmp.path().join("web"));
+        for repo in [&api, &web] {
+            std::fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "i",
+                ],
+            );
+        }
+        // A worktree of web stands for web.
+        let web_wt = tmp.path().join("web--x");
+        git(
+            &web,
+            &["worktree", "add", "-q", "-b", "x", web_wt.to_str().unwrap()],
+        );
+        let item = |display: &str, id: &str| PickerItem {
+            display: display.into(),
+            id: id.into(),
+        };
+        let picker = PickerState::new(
+            "Pick project",
+            vec![
+                item("enter path...", "__enter_path__"),
+                item("api", api.to_str().unwrap()),
+                item("web", web.to_str().unwrap()),
+                item("x @web", web_wt.to_str().unwrap()),
+            ],
+        );
+        let mut app = App::new();
+        app.mode = Mode::NewTaskPickProject(picker);
+        let config = Config::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // The path entry is an action, not a project: tab skips it.
+        handle_picker_key(key(KeyCode::Tab), &mut app, &config);
+        let Mode::NewTaskPickProject(p) = &app.mode else {
+            panic!("still picking");
+        };
+        assert!(p.marked.is_empty());
+        // Items: enter path (0), api (1), web (2), x @web (3). Tab picks
+        // and moves down. web, then api: picked in that order.
+        let keys = |app: &mut App, codes: &[KeyCode]| {
+            for code in codes {
+                handle_picker_key(key(*code), app, &config);
+            }
+        };
+        keys(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Tab]);
+        keys(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Tab]);
+        // Tab again unpicks.
+        keys(&mut app, &[KeyCode::Up, KeyCode::Tab]);
+        let Mode::NewTaskPickProject(p) = &app.mode else {
+            panic!("still picking");
+        };
+        assert_eq!(p.marked, [web.to_str().unwrap()]);
+        keys(&mut app, &[KeyCode::Up, KeyCode::Tab]);
+        // web's worktree too: web once.
+        keys(&mut app, &[KeyCode::Down, KeyCode::Tab]);
+        handle_picker_key(key(KeyCode::Enter), &mut app, &config);
+        let Mode::NewTaskEnterName { project_dirs, .. } = &app.mode else {
+            panic!("expected the name input");
+        };
+        let expected = [web.canonicalize().unwrap(), api.canonicalize().unwrap()];
+        assert_eq!(project_dirs, &expected);
+
+        // Typed, then entered: one action with both.
+        for c in "feat".chars() {
+            handle_new_task_name_key(press(c), &mut app);
+        }
+        let action = handle_new_task_name_key(key(KeyCode::Enter), &mut app);
+        assert!(
+            matches!(action, Action::DoNewTask { ref name, ref dirs } if name == "feat" && *dirs == expected)
+        );
     }
 }

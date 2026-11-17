@@ -96,8 +96,30 @@ fn without_local_git_vars(
     vars.filter(|(k, _)| !LOCAL.contains(&k.as_str())).collect()
 }
 
+/// The members to create for task `name` (`CreateMembers`): a worktree on
+/// branch `name` in each repository (main checkouts), where the worktree
+/// config puts it. Each repository is fetched first: the daemon does not
+/// fetch.
+pub fn new_members(
+    roots: &[PathBuf],
+    name: &str,
+    config: &tam_worktree::config::Config,
+) -> Result<Vec<tam_proto::NewMember>> {
+    for root in roots {
+        tam_worktree::git::fetch(root)?;
+    }
+    Ok(roots
+        .iter()
+        .map(|root| tam_proto::NewMember {
+            repo_root: root.clone(),
+            branch: name.to_string(),
+            dir: tam_worktree::worktree::target_dir(config, root, name),
+        })
+        .collect())
+}
+
 /// The main checkout of the repository containing `dir`, resolved.
-fn main_checkout(dir: &Path) -> Result<PathBuf> {
+pub fn main_checkout(dir: &Path) -> Result<PathBuf> {
     let root = tam_worktree::git::repo_root(dir)
         .with_context(|| format!("{} is not in a git repository", dir.display()))?;
     root.canonicalize()

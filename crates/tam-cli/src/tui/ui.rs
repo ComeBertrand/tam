@@ -65,8 +65,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::NewTaskPickProject(picker) => {
             render_picker_popup(frame, picker);
         }
-        Mode::NewTaskEnterName { name, .. } => {
-            render_new_task_popup(frame, name);
+        Mode::NewTaskEnterName { name, project_dirs } => {
+            let joins = app.tasks.iter().any(|t| t.name == *name);
+            render_new_task_popup(frame, name, project_dirs, joins);
         }
         Mode::SpawnEnterPath(path) => {
             render_enter_path_popup(frame, path);
@@ -290,6 +291,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
             Mode::NewTaskEnterName { .. } => vec![
                 Span::styled(" enter", Style::new().bold()),
                 Span::raw(":create  "),
+                Span::styled("esc", Style::new().bold()),
+                Span::raw(":cancel"),
+            ],
+            Mode::NewTaskPickProject(_) => vec![
+                Span::styled(" enter", Style::new().bold()),
+                Span::raw(":select  "),
+                Span::styled("tab", Style::new().bold()),
+                Span::raw(":pick several  "),
                 Span::styled("esc", Style::new().bold()),
                 Span::raw(":cancel"),
             ],
@@ -533,18 +542,39 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
             } else {
                 Style::new()
             };
-            ListItem::new(item.display.as_str()).style(style)
+            // Picked with tab: a mark, and the order they were picked in.
+            let mark = match picker.marked.iter().position(|m| *m == item.id) {
+                Some(n) => Span::styled(format!("{} ", n + 1), Style::new().fg(Color::Cyan).bold()),
+                None if picker.marked.is_empty() => Span::raw(""),
+                None => Span::raw("  "),
+            };
+            ListItem::new(Line::from(vec![mark, Span::raw(item.display.as_str())])).style(style)
         })
         .collect();
 
     frame.render_widget(List::new(items), list_area);
 }
 
-fn render_new_task_popup(frame: &mut Frame, name: &str) {
-    // 1 content row + 2 border + 2 vertical padding = 5
+/// The repositories of `dirs`, as the popup names them.
+fn repo_names(dirs: &[std::path::PathBuf]) -> String {
+    let names: Vec<String> = dirs
+        .iter()
+        .map(|d| {
+            d.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| d.display().to_string())
+        })
+        .collect();
+    names.join(", ")
+}
+
+/// The task name input, with where its worktrees go: a new task, or more
+/// members of the existing task of that name (`joins`).
+fn render_new_task_popup(frame: &mut Frame, name: &str, dirs: &[std::path::PathBuf], joins: bool) {
+    // 2 content rows + 2 border + 2 vertical padding = 6
     let area = frame
         .area()
-        .centered(Constraint::Length(50), Constraint::Length(5));
+        .centered(Constraint::Length(60), Constraint::Length(6));
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -563,7 +593,17 @@ fn render_new_task_popup(frame: &mut Frame, name: &str) {
         Span::styled(name, Style::new().bold()),
         Span::styled("█", Style::new().fg(Color::DarkGray)),
     ]);
-    frame.render_widget(name_line, inner);
+    let repos = repo_names(dirs);
+    let where_line = if joins {
+        Line::from(vec![
+            Span::styled("adds ", Style::new().fg(Color::Yellow)),
+            Span::raw(repos),
+            Span::styled(" to this existing task", Style::new().fg(Color::Yellow)),
+        ])
+    } else {
+        Line::from(vec![Span::raw("in "), Span::raw(repos)]).fg(Color::DarkGray)
+    };
+    frame.render_widget(Paragraph::new(vec![name_line, where_line]), inner);
 }
 
 fn render_enter_path_popup(frame: &mut Frame, path: &str) {
@@ -1353,5 +1393,61 @@ mod tests {
         assert!(s.contains("┌ feat/app ─"), "{s}");
         assert!(s.contains("│▸ ● app  working 30s"), "{s}");
         assert!(s.contains("│● working for 30s  (claude)"), "{s}");
+    }
+
+    #[test]
+    fn new_task_popup_says_where_the_worktrees_go() {
+        let info: TaskInfo = serde_json::from_value(serde_json::json!({
+            "name": "feat",
+            "members": [{
+                "id": "m-1", "name": "api", "repo": "api",
+                "branch": "feat", "dir": "/w/api--feat",
+            }],
+            "created_at": 0,
+        }))
+        .unwrap();
+        let mut app = App::new();
+        app.set_tasks(vec![Task::from_info(info, &[])]);
+        let dirs = vec![
+            std::path::PathBuf::from("/src/web"),
+            std::path::PathBuf::from("/src/docs"),
+        ];
+        app.mode = Mode::NewTaskEnterName {
+            project_dirs: dirs.clone(),
+            name: "other".into(),
+        };
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("Task name: other"), "{s}");
+        assert!(s.contains("in web, docs"), "{s}");
+
+        // An existing task's name: they join it.
+        app.mode = Mode::NewTaskEnterName {
+            project_dirs: dirs,
+            name: "feat".into(),
+        };
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("adds web, docs to this existing task"), "{s}");
+    }
+
+    #[test]
+    fn picked_projects_show_in_the_order_picked() {
+        use super::super::app::PickerItem;
+        let item = |name: &str| PickerItem {
+            display: name.into(),
+            id: format!("/src/{name}"),
+        };
+        let mut picker =
+            PickerState::new("Pick project", vec![item("api"), item("web"), item("docs")]);
+        picker.marked = vec!["/src/web".into(), "/src/api".into()];
+        let mut app = App::new();
+        app.mode = Mode::NewTaskPickProject(picker);
+        let s = screen(&mut app, 80, 24);
+        if std::env::var_os("TAM_SHOW_SCREEN").is_some() {
+            println!("{s}");
+        }
+        assert!(s.contains("│ 2 api"), "{s}");
+        assert!(s.contains("│ 1 web"), "{s}");
+        assert!(s.contains("│   docs"), "{s}");
+        assert!(s.contains("tab:pick several"), "{s}");
     }
 }

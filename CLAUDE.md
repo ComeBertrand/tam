@@ -194,6 +194,10 @@ adopt). `tam-cli` depends on all three.
   selection landed on the task, pinned while the task stays selected (a key
   never acts on a member the pane did not show), and `←`/`→` move it. The
   dashboard redraws every second (times in state).
+- **Printing** — every `tam-cli` module prints through `println!`/`eprintln!`
+  redefined at the crate root (`output.rs`, #38): a closed stdout (`tam ps |
+  head -1`) exits 0 quietly instead of panicking. Not `SIGPIPE`'s default: it
+  would kill a client on a closed daemon socket, silently.
 
 ## Build & check
 
@@ -212,7 +216,8 @@ cargo test
   they set process environment; `tam msg`/`inbox-wait`/`history` against a
   daemon, child processes with temp XDG dirs and no
   `TAM_AGENT_ID`/`TAM_SOCKET`; `tam peers` and the start note on real git
-  worktrees, with a fake `claude` and an `sh` agent running `tam peers`)
+  worktrees, with a fake `claude` and an `sh` agent running `tam peers`;
+  `exit_status.rs`: a closed stdout)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

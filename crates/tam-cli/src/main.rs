@@ -3,6 +3,26 @@ use std::io::IsTerminal;
 use anyhow::Result;
 use clap::Parser;
 
+// Every module prints through these (`output.rs`, #38): defined before the
+// modules, they take the place of std's macros in all of them.
+macro_rules! println {
+    () => {
+        $crate::output::stdout_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::stdout_line(format_args!($($arg)*))
+    };
+}
+
+macro_rules! eprintln {
+    () => {
+        $crate::output::stderr_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::stderr_line(format_args!($($arg)*))
+    };
+}
+
 mod cli;
 mod client;
 mod config;
@@ -13,6 +33,8 @@ mod msg;
 mod peers;
 mod task;
 mod tui;
+
+mod output;
 
 use cli::{Cli, Commands};
 use tam_proto::{MemberInfo, RunInfo, SessionChoice, TaskInfo};

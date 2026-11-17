@@ -360,6 +360,30 @@ impl Client {
         }
     }
 
+    /// Have the daemon create worktrees as the members of a new task `task`,
+    /// or with `join` new members of the existing task `task`: all or
+    /// nothing, git running in our environment. Returns the task.
+    pub async fn create_members(
+        &mut self,
+        task: &str,
+        members: Vec<NewMember>,
+        source: Option<&str>,
+        join: bool,
+    ) -> Result<TaskInfo> {
+        let request = Request::CreateMembers {
+            task: task.into(),
+            members,
+            source: source.map(str::to_string),
+            join,
+            // Git runs with ours: hooks and filters see our PATH.
+            env: crate::repos::git_env(),
+        };
+        match self.send(request).await? {
+            Response::Task { task, .. } => Ok(task),
+            other => Err(unexpected("CreateMembers", other)),
+        }
+    }
+
     /// An agent's terminal screen: live, or scrolled back to line `from`.
     pub async fn screen(&mut self, id: &str, from: Option<u64>) -> Result<ScreenInfo> {
         let request = Request::Screen {
@@ -540,6 +564,14 @@ impl Client {
 /// Turn a daemon error (or an unexpected reply) into an error.
 fn unexpected(request: &str, response: Response) -> anyhow::Error {
     match response {
+        // A request newer than the daemon (the protocol is unreleased: no
+        // version bump for new requests).
+        Response::Error { message } if message.starts_with("invalid request: unknown variant") => {
+            anyhow::anyhow!(
+                "{message}\nThe running tam daemon is older than this tam: restart it \
+                 (tam shutdown, which stops its agents)"
+            )
+        }
         Response::Error { message } => anyhow::anyhow!("{message}"),
         other => script::error(
             ErrorKind::Daemon,
@@ -748,6 +780,23 @@ pub(crate) fn reset_terminal_state() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_the_daemon_does_not_know_says_to_restart_it() {
+        let old = Response::Error {
+            message: "invalid request: unknown variant `create_members`, expected one of `spawn`"
+                .into(),
+        };
+        let err = unexpected("CreateMembers", old).to_string();
+        assert!(err.contains("older than this tam"), "{err}");
+        let other = Response::Error {
+            message: "task 'x' not found".into(),
+        };
+        assert_eq!(
+            unexpected("GetTask", other).to_string(),
+            "task 'x' not found"
+        );
+    }
 
     fn filtered(input: &[u8]) -> Vec<u8> {
         let mut f = KbdProtoFilter::new();

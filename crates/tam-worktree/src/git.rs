@@ -1,10 +1,45 @@
 use anyhow::{bail, Context, Result};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+thread_local! {
+    /// The environment git runs with on this thread, set by [`with_env`].
+    static ENV: RefCell<Option<BTreeMap<String, String>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with every git command it runs on this thread given exactly
+/// `env` as its environment, instead of this process's: e.g. a daemon running
+/// git for a client, so that hooks and filters (git-lfs) see the client's
+/// `PATH` and credentials. `None`: this process's environment.
+pub fn with_env<T>(env: Option<BTreeMap<String, String>>, f: impl FnOnce() -> T) -> T {
+    /// Puts the previous environment back, also when `f` panics.
+    struct Restore(Option<BTreeMap<String, String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            ENV.with(|e| *e.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(ENV.with(|e| e.replace(env)));
+    f()
+}
+
+/// A `git` command, in the environment [`with_env`] set, if any.
+fn command() -> Command {
+    let mut cmd = Command::new("git");
+    ENV.with(|e| {
+        if let Some(env) = &*e.borrow() {
+            cmd.env_clear().envs(env);
+        }
+    });
+    cmd
+}
+
 /// Check that git is available.
 pub fn check_git_available() -> Result<()> {
-    Command::new("git")
+    command()
         .arg("--version")
         .output()
         .context("git is not installed or not in PATH")?;
@@ -13,7 +48,7 @@ pub fn check_git_available() -> Result<()> {
 
 /// Run a git command in the given directory and return stdout.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = command()
         .args(args)
         .current_dir(dir)
         .output()
@@ -30,7 +65,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 /// Run a git command and return its non-empty stdout lines, untrimmed
 /// (porcelain formats carry meaning in leading spaces).
 fn git_lines(dir: &Path, args: &[&str]) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = command()
         .args(args)
         .current_dir(dir)
         .output()
@@ -228,7 +263,7 @@ pub fn common_dir(dir: &Path) -> Result<PathBuf> {
 /// staged changes (differs from its HEAD). Needs no working tree: it also
 /// reads the index of a worktree whose directory is gone.
 pub fn has_staged_changes(git_dir: &Path) -> Result<bool> {
-    let output = Command::new("git")
+    let output = command()
         .arg("--git-dir")
         .arg(git_dir)
         .args(["diff", "--cached", "--quiet"])
@@ -294,6 +329,42 @@ pub fn worktree_entries(dir: &Path) -> Result<Vec<WorktreeEntry>> {
     Ok(entries)
 }
 
+/// Commits (`<short sha> <subject>`, newest first) of the local branch
+/// `branch` that no other branch, tag or remote-tracking branch holds: what
+/// deleting it loses. Needs no worktree.
+pub fn branch_commits_only_on(dir: &Path, branch: &str) -> Result<Vec<String>> {
+    let tip = format!("refs/heads/{branch}");
+    // Relative to refs/heads/, as `--branches` takes it.
+    let exclude = format!("--exclude={branch}");
+    git_lines(
+        dir,
+        &[
+            "log",
+            "--format=%h %s",
+            &tip,
+            "--not",
+            &exclude,
+            "--branches",
+            "--tags",
+            "--remotes",
+        ],
+    )
+}
+
+/// Whether `rev` names a commit in the repository containing `dir`.
+pub fn resolves(dir: &Path, rev: &str) -> bool {
+    git(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +381,24 @@ mod tests {
         fs::write(path.join("README.md"), "# test").unwrap();
         git(path, &["add", "."]).unwrap();
         git(path, &["commit", "-m", "init"]).unwrap();
+    }
+
+    #[test]
+    fn test_with_env_is_the_whole_environment_of_git_on_this_thread() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let mut env: BTreeMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        env.insert("GIT_AUTHOR_NAME".into(), "From Env".into());
+
+        let ident = with_env(Some(env), || {
+            git(tmp.path(), &["var", "GIT_AUTHOR_IDENT"]).unwrap()
+        });
+        assert!(ident.starts_with("From Env <"), "{ident}");
+        // Only within: then this process's environment again.
+        let ident = git(tmp.path(), &["var", "GIT_AUTHOR_IDENT"]).unwrap();
+        assert!(ident.starts_with("Test <"), "{ident}");
     }
 
     #[test]

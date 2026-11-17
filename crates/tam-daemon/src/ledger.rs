@@ -525,6 +525,20 @@ impl Ledger {
             name: name.into(),
             timestamp,
         }];
+        events.extend(self.member_events(name, members, timestamp)?);
+        self.append_all(events)?;
+        Ok(self.task(name).expect("task just created"))
+    }
+
+    /// `MemberAdded` events for new members of `task`, in order. Refused for
+    /// a directory that is already a member's, or given twice.
+    fn member_events(
+        &self,
+        task: &str,
+        members: &[NewMember],
+        timestamp: u64,
+    ) -> Result<Vec<LedgerEvent>> {
+        let mut events = Vec::with_capacity(members.len());
         let mut ids: Vec<String> = Vec::new();
         for (i, m) in members.iter().enumerate() {
             if let Some(existing) = self.state.members.values().find(|e| e.dir == m.dir) {
@@ -545,7 +559,7 @@ impl Ledger {
             });
             ids.push(id.clone());
             events.push(LedgerEvent::MemberAdded {
-                task: name.into(),
+                task: task.into(),
                 member: id,
                 repo: repo.to_string_lossy().into_owned(),
                 repo_root: Some(m.repo_root.clone()),
@@ -554,8 +568,7 @@ impl Ledger {
                 timestamp,
             });
         }
-        self.append_all(events)?;
-        Ok(self.task(name).expect("task just created"))
+        Ok(events)
     }
 
     /// Record the start of a member's agent run. Closes a still-open
@@ -1109,27 +1122,18 @@ impl Ledger {
     /// Add a worktree to an existing task as a new member (it joins last).
     /// Returns the updated task.
     pub fn add_member(&mut self, task: &str, member: &NewMember) -> Result<TaskInfo> {
+        self.add_members(task, std::slice::from_ref(member))
+    }
+
+    /// Add worktrees to an existing task as new members (they join last, in
+    /// order), all or none. Returns the updated task.
+    pub fn add_members(&mut self, task: &str, members: &[NewMember]) -> Result<TaskInfo> {
         self.require(task)?;
-        if let Some(existing) = self.state.members.values().find(|e| e.dir == member.dir) {
-            bail!(
-                "directory {} already has an active task: '{}'",
-                member.dir.display(),
-                existing.task
-            );
+        if members.is_empty() {
+            bail!("no member to add to task '{}'", task);
         }
-        let Some(repo) = member.repo_root.file_name() else {
-            bail!("invalid repository root {}", member.repo_root.display());
-        };
-        let id = new_member_id(|id| self.state.members.contains_key(id));
-        self.append(LedgerEvent::MemberAdded {
-            task: task.into(),
-            member: id,
-            repo: repo.to_string_lossy().into_owned(),
-            repo_root: Some(member.repo_root.clone()),
-            branch: member.branch.clone(),
-            dir: member.dir.clone(),
-            timestamp: now(),
-        })?;
+        let events = self.member_events(task, members, now())?;
+        self.append_all(events)?;
         Ok(self.task(task).expect("task exists"))
     }
 }
@@ -2247,6 +2251,48 @@ mod tests {
         );
         let ledger = Ledger::open(&path).unwrap().0;
         assert_eq!(ledger.task("feat").unwrap().members[1].id, web.id);
+    }
+
+    #[test]
+    fn add_members_adds_all_or_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        create(&mut ledger, "feat", "/w/app--feat");
+
+        // One directory already a member's: none is added.
+        let err = ledger.add_members(
+            "feat",
+            &[
+                new_member("web", "feat", "/w/web--feat"),
+                new_member("app", "feat", "/w/app--feat"),
+            ],
+        );
+        assert!(err.unwrap_err().to_string().contains("already has"));
+        assert_eq!(ledger.task("feat").unwrap().members.len(), 1);
+        assert!(ledger.add_members("feat", &[]).is_err());
+
+        let task = ledger
+            .add_members(
+                "feat",
+                &[
+                    new_member("web", "feat", "/w/web--feat"),
+                    new_member("docs", "feat", "/w/docs--feat"),
+                ],
+            )
+            .unwrap();
+        let names: Vec<&str> = task.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["app", "web", "docs"]);
+        drop(ledger);
+        assert_eq!(
+            event_types(&path),
+            [
+                "task_created",
+                "member_added",
+                "member_added",
+                "member_added"
+            ]
+        );
     }
 
     #[test]

@@ -288,6 +288,125 @@ pub(crate) fn adoptable(dir: &Path) -> Result<NewMember> {
     })
 }
 
+/// Check the worktrees to create for new task members, before creating
+/// any: each repository is the main checkout of a repository, each
+/// directory is free and given once, each branch can be checked out (see
+/// [`worktree::check_add`]). Read-only.
+pub(crate) fn check_new(members: &[NewMember], source: Option<&str>) -> Result<()> {
+    for (i, m) in members.iter().enumerate() {
+        let repo = &m.repo_root;
+        let at = || repo.display().to_string();
+        if !repo.is_dir() {
+            bail!("{}: no such directory", repo.display());
+        }
+        let main = git::toplevel(repo)
+            .and_then(|top| Ok((top, git::repo_root(repo)?)))
+            .with_context(at)?;
+        if !worktree::same_path(&main.0, repo) || !worktree::same_path(&main.1, repo) {
+            bail!(
+                "{} is not the main checkout of a repository",
+                repo.display()
+            );
+        }
+        if let Some(other) = members[..i]
+            .iter()
+            .find(|o| worktree::same_path(&o.dir, &m.dir))
+        {
+            bail!(
+                "{} and {} would both have their worktree at {}",
+                other.repo_root.display(),
+                repo.display(),
+                m.dir.display()
+            );
+        }
+        if members[..i]
+            .iter()
+            .any(|o| worktree::same_path(&o.repo_root, repo) && o.branch == m.branch)
+        {
+            bail!("{} is given twice on branch '{}'", repo.display(), m.branch);
+        }
+        worktree::check_add(repo, &m.dir, &m.branch, source).with_context(at)?;
+    }
+    Ok(())
+}
+
+/// A worktree [`create_all`] created, in its repository.
+pub(crate) struct Created {
+    pub repo: PathBuf,
+    pub added: worktree::Added,
+}
+
+/// Create the worktrees of new task members, in order (see
+/// [`worktree::add`]). All or nothing: when one fails, the ones created
+/// before it (and that one, if git left it) are undone; `Err` says what
+/// failed, then what [`undo_all`] reported.
+pub(crate) fn create_all(
+    members: &[NewMember],
+    source: Option<&str>,
+) -> Result<Vec<Created>, String> {
+    let mut created = Vec::new();
+    for m in members {
+        match worktree::add(&m.repo_root, &m.dir, &m.branch, source) {
+            Ok(added) => created.push(Created {
+                repo: m.repo_root.clone(),
+                added,
+            }),
+            Err(e) => {
+                let failed = format!("{}: {:#}", m.repo_root.display(), e.error);
+                created.extend(e.created.map(|added| Created {
+                    repo: m.repo_root.clone(),
+                    added,
+                }));
+                return Err(format!("{failed}\n{}", undo_all(created)));
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// Undo worktrees [`create_all`] created, last first (see
+/// [`worktree::undo_add`]). Says what was undone, and what is left behind.
+pub(crate) fn undo_all(created: Vec<Created>) -> String {
+    if created.is_empty() {
+        return "Nothing was created.".into();
+    }
+    let mut removed = Vec::new();
+    let mut left = Vec::new();
+    for c in created.iter().rev() {
+        let what = match (c.added.dir.exists(), c.added.branch_created) {
+            (true, true) => format!(
+                "{} (and its new branch '{}')",
+                c.added.dir.display(),
+                c.added.branch
+            ),
+            (true, false) => c.added.dir.display().to_string(),
+            // Git created the branch, not the worktree.
+            (false, _) => format!("branch '{}' of {}", c.added.branch, c.repo.display()),
+        };
+        match worktree::undo_add(&c.repo, &c.added) {
+            Ok(()) => removed.push(what),
+            Err(e) => left.push(format!("{what}: {e:#}")),
+        }
+    }
+    let mut report = Vec::new();
+    if !removed.is_empty() {
+        report.push(format!(
+            "Removed what was created meanwhile: {}.",
+            removed.join(", ")
+        ));
+    }
+    if !left.is_empty() {
+        report.push(format!(
+            "Left behind, in no task:\n  {}\nRemove them (git worktree remove, git branch -D) \
+             or make them tasks (tam adopt).",
+            left.join("\n  ")
+        ));
+    } else {
+        report.push("Nothing was left behind.".into());
+    }
+    report.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

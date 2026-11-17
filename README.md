@@ -50,7 +50,7 @@ tam
 
 **Task** — a named unit of work. TAM creates a git worktree for it, on a branch named after the task, and `tam drop` cleans it up.
 
-**Member** — a task's worktree, with at most one agent session. A task is built to hold several members (one per repository, for work spanning e.g. a backend and a frontend); for now `tam new` creates one. Members have a stable id, which is also their agent's id (`$TAM_AGENT_ID`), and a short name within the task: the repository name. Name one as `TASK/MEMBER`; a bare task name means its only member.
+**Member** — a task's worktree, with at most one agent session. A task can hold several members, one per repository, for work spanning e.g. a backend and a frontend: `tam new feat -r api -r web` creates both worktrees, on branch `feat`, and starts an agent in each. Members have a stable id, which is also their agent's id (`$TAM_AGENT_ID`), and a short name within the task: the repository name. Name one as `TASK/MEMBER`; a bare task name means its only member.
 
 **Status is always derived**, never stored. TAM checks the daemon (is an agent running?), the filesystem (does the worktree exist?), git (does the branch exist?), and activity timestamps (is the task stale?) every time you look.
 
@@ -87,6 +87,8 @@ tam new NAME                   Create task: branch NAME and its worktree, in the
 tam new NAME -s REF            Branch from a specific ref
 tam new NAME -p TEXT           Start its agent on a prompt
 tam new NAME -d                Don't attach to the agent (--json: print a receipt)
+tam new NAME -r REPO -r REPO   ... in each of these repositories instead (one member each)
+tam new NAME -r REPO --join    Add a worktree in another repository to the task NAME
 
 tam run NAME                   Start the task's agent, resuming its current session
 tam run NAME --new-session     Start a new session instead
@@ -114,6 +116,8 @@ NAME is a task name, or TASK/MEMBER for one member of the task.
 `tam drop` checks first: it refuses when uncommitted changes would be lost, or, with `-b`, commits that no other branch, tag or remote branch holds. It lists them and, on a terminal, asks before going on. If a worktree cannot be removed, the task is kept.
 
 The daemon checks every task's worktree against git (`git worktree list`) when it starts and every 10 seconds. A worktree deleted outside tam (`rm -rf`, `git worktree remove`) shows as `gone` in `tam ps` and the dashboard, with what can be done. `tam repair` recreates it on its branch: only if the branch still exists, is checked out nowhere else, and git's leftover registration of the directory (if any) has no staged changes. `tam drop` forgets the task. A worktree switched to another branch is not gone; `tam ps` notes the switch. TAM only looks: nothing is recreated or removed unless you ask.
+
+`tam new` names a repository by a path to it (or to any directory in it), or by its project name as `tam ls` and `tam pick` show it (e.g. `api`, or `mnemo (work)` when two projects share a name). It is all or nothing: every repository is checked first (branch free, worktree directory free, `-s REF` present), and if a worktree still cannot be created, the ones created before it are removed again, with the branches created for them. What cannot be removed without losing work is kept, and the error says where. With several repositories, `tam new` attaches to the first one's agent; `tam run`, `tam attach` and the preview act on one member (`NAME/REPO`), `tam stop` and `tam drop` on the whole task.
 
 `tam adopt` takes over a worktree made by hand (`git worktree add`), from the worktree or any directory in it: it must be a linked worktree (not the main checkout) on a branch. From then on it is a task like any other: `tam drop` removes it.
 

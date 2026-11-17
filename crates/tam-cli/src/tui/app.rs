@@ -13,8 +13,10 @@ use super::peek::Peek;
 pub enum Mode {
     Normal,
     NewTaskPickProject(PickerState),
+    /// The task's name, for worktrees in these repositories (main
+    /// checkouts). The name of an existing task adds them to it.
     NewTaskEnterName {
-        project_dir: PathBuf,
+        project_dirs: Vec<PathBuf>,
         name: String,
     },
     SpawnEnterPath(String),
@@ -87,6 +89,8 @@ pub struct PickerState {
     pub items: Vec<PickerItem>,
     pub filter: String,
     pub selected: usize,
+    /// Ids of the items picked with tab, in the order picked.
+    pub marked: Vec<String>,
 }
 
 impl PickerState {
@@ -96,7 +100,26 @@ impl PickerState {
             items,
             filter: String::new(),
             selected: 0,
+            marked: Vec::new(),
         }
+    }
+
+    /// Pick the highlighted item (or unpick it), then move down. Items whose
+    /// id starts with `__` other than `__cwd__` are actions: not picked.
+    pub fn toggle_mark(&mut self) {
+        let Some(id) = self.selected_item().map(|item| item.id.clone()) else {
+            return;
+        };
+        if id.starts_with("__") && id != "__cwd__" {
+            return;
+        }
+        match self.marked.iter().position(|m| *m == id) {
+            Some(pos) => {
+                self.marked.remove(pos);
+            }
+            None => self.marked.push(id),
+        }
+        self.select_next();
     }
 
     pub fn filtered_items(&self) -> Vec<&PickerItem> {

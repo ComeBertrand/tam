@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tam_proto::{AgentInfo, AgentState, MemberHealth, MemberInfo, NewMember, TaskInfo};
+use tam_proto::{AgentInfo, AgentState, MemberHealth, MemberInfo, TaskInfo};
 
 /// How long (in seconds) without activity before a task is considered stale.
 const STALE_THRESHOLD_SECS: u64 = 30 * 24 * 3600; // 30 days
@@ -247,24 +247,6 @@ pub fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Create the worktree of a new task member: branch `name` (checked out if
-/// it exists, else created from `source` or the default branch) of the
-/// repository containing `cwd`.
-pub fn create_worktree(
-    name: &str,
-    source: Option<&str>,
-    config: &tam_worktree::config::Config,
-    cwd: &Path,
-) -> anyhow::Result<NewMember> {
-    let dir = tam_worktree::worktree::create(name, source, config, cwd)?;
-    let repo_root = tam_worktree::git::repo_root(&dir)?;
-    Ok(NewMember {
-        repo_root,
-        branch: name.into(),
-        dir,
-    })
 }
 
 #[cfg(test)]

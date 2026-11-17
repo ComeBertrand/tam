@@ -364,7 +364,7 @@ Pressing `/` enters filter mode. The header shows the filter text. Typing filter
 
 Pressing `n` in the TUI starts a multi-step flow:
 
-**Step 1 — Select project**: a picker showing discovered projects (via `tam-worktree` discovery). "Current directory" is always an option. The user navigates and selects.
+**Step 1 — Select project**: a picker showing discovered projects (via `tam-worktree` discovery). "Current directory" is always an option. The user navigates and selects; `tab` picks several projects (one worktree, one member each), numbered in the order picked. In step 2, the name of an existing task adds the picked projects to it, and the popup says so.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐

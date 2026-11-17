@@ -245,9 +245,12 @@ adopt). `tam-cli` depends on all three.
   directories come from `worktree::target_dir` (`<root>/<repo>--<name>`);
   `.tam.toml` init runs after the task is recorded. With several members `tam
   new` starts one agent each and attaches to the first; `tam run`/`attach` of a
-  multi-member task name refuse and list `TASK/MEMBER` names. `CreateTask`
-  (record worktrees the client made) stays for tests and the TUI's new-task
-  flow. Tests: `crates/tam-daemon/tests/create.rs`, `crates/tam-cli/tests/new_task.rs`.
+  multi-member task name refuse and list `TASK/MEMBER` names. The TUI's `n`
+  flow does the same (`do_new_task`): `tab` picks several projects
+  (`PickerState::marked`, in order), and the name of an existing task adds
+  them to it (the name popup says so). `CreateTask` (record worktrees made
+  otherwise) is only for tests now. Tests: `crates/tam-daemon/tests/create.rs`,
+  `crates/tam-cli/tests/new_task.rs`.
 - **Dropping one member** — `DropTask` of `<task>/<member>` or a member id
   (`handle_drop` routes; plain `Ledger::resolve`, never a peer's short name)
   drops that member alone as a task drop does for all (`handle_drop_member`,

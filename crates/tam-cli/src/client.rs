@@ -239,17 +239,6 @@ impl Client {
         }
     }
 
-    pub async fn create_task(&mut self, name: &str, members: Vec<NewMember>) -> Result<TaskInfo> {
-        let request = Request::CreateTask {
-            name: name.into(),
-            members,
-        };
-        match self.send(request).await? {
-            Response::Task { task, .. } => Ok(task),
-            other => Err(unexpected("CreateTask", other)),
-        }
-    }
-
     /// Find one task member: from a task name, `<task>/<member>` or a member
     /// id, else from the member whose worktree contains `dir`. Run from an
     /// agent tam started (`$TAM_AGENT_ID`), also from the short name of a

@@ -116,9 +116,10 @@ pub enum Commands {
     /// Stop a task's agents, remove its worktrees and forget it
     ///
     /// Refuses when uncommitted changes would be lost, or with -b commits no
-    /// other branch holds, unless confirmed or forced.
+    /// other branch holds, unless confirmed or forced. TASK/MEMBER drops one
+    /// member alone (its agent, its worktree); the last one takes the task.
     Drop {
-        /// Task name
+        /// Task name, or TASK/MEMBER
         name: String,
 
         /// Also delete the worktrees' git branches

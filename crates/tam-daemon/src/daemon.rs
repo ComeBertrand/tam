@@ -808,7 +808,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             name,
             force,
             delete_branch,
-        } => handle_drop_task(state, &name, force, delete_branch).await,
+        } => handle_drop(state, &name, force, delete_branch).await,
         Request::Subscribe => Response::Error {
             message: "subscribe should be handled by connection handler".into(),
         },
@@ -1374,6 +1374,147 @@ async fn stop_and_remove(
                 message: format!("Task '{name}' kept{agent}: {e}"),
             }
         })
+}
+
+/// `DropTask`: a task, or one member of a task (`<task>/<member>`, a member
+/// id). A task's last member takes the task with it.
+async fn handle_drop(
+    state: &Arc<Mutex<DaemonState>>,
+    name: &str,
+    force: bool,
+    delete_branch: bool,
+) -> Response {
+    let target = {
+        let state = state.lock().await;
+        if state.ledger.task(name).is_some() {
+            None
+        } else {
+            // Not `resolve_from`: no short name reaches a peer from here.
+            match state.ledger.resolve(name) {
+                Ok((task, member)) => Some((task, member)),
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("{e:#}"),
+                    }
+                }
+            }
+        }
+    };
+    match target {
+        None => handle_drop_task(state, name, force, delete_branch).await,
+        Some((task, member)) if task.members.len() > 1 => {
+            handle_drop_member(state, &task, member, force, delete_branch).await
+        }
+        Some((task, _)) => match handle_drop_task(state, &task.name, force, delete_branch).await {
+            Response::Dropped { mut warnings } => {
+                warnings.push(format!(
+                    "'{name}' was the last member of task '{}': the task is dropped",
+                    task.name
+                ));
+                Response::Dropped { warnings }
+            }
+            other => other,
+        },
+    }
+}
+
+/// Drop one member of a task that has others, as `handle_drop_task` drops
+/// all of a task's: check its worktree, stop its agent and wait for it,
+/// check again, remove the worktree (and branch), then forget the member.
+/// The task is claimed meanwhile: no agent starts in it, no member joins it.
+async fn handle_drop_member(
+    state: &Arc<Mutex<DaemonState>>,
+    task: &TaskInfo,
+    member: tam_proto::MemberInfo,
+    force: bool,
+    delete_branch: bool,
+) -> Response {
+    let label = task.member_label(&member);
+    if !state.lock().await.dropping.insert(task.name.clone()) {
+        return Response::Error {
+            message: format!("task '{}' is already being dropped", task.name),
+        };
+    }
+    let worktrees = state.lock().await.worktrees.clone();
+    let held = worktrees.lock().await;
+    let removal = stop_and_remove_member(state, &label, &member, force, delete_branch).await;
+    drop(held);
+
+    let mut state = state.lock().await;
+    state.dropping.remove(&task.name);
+    let removal = match removal {
+        Ok(removal) => removal,
+        Err(response) => return response,
+    };
+    let info = match state.ledger.drop_member(&member.id) {
+        Ok(info) => info,
+        Err(e) => {
+            return Response::Error {
+                message: format!(
+                    "cannot record the drop of '{label}': {e:#}; drop it again to finish"
+                ),
+            }
+        }
+    };
+    for warning in &removal.warnings {
+        warn!(member = %member.id, "{warning}");
+    }
+    info!(task = %task.name, member = %member.id, "member dropped");
+    state.broadcast(Event::TaskUpdated { task: info });
+    Response::Dropped {
+        warnings: removal.warnings,
+    }
+}
+
+/// [`stop_and_remove`] for one member: check its worktree (`Err` with
+/// `DropRefused` if work would be lost), stop its agent and wait for it,
+/// check again, remove the worktree.
+async fn stop_and_remove_member(
+    state: &Arc<Mutex<DaemonState>>,
+    label: &str,
+    member: &tam_proto::MemberInfo,
+    force: bool,
+    delete_branch: bool,
+) -> Result<Removal, Response> {
+    let check = |dir: PathBuf| blocking(move || vec![worktrees::check(dir)]);
+    let mut checked = check(member.dir.clone()).await?;
+    if !force {
+        refuse_lossy_drop(&checked, delete_branch)?;
+    }
+    let agent = state.lock().await.take_member_agent(&member.id);
+    let stopped = agent.is_some();
+    if let Some(agent) = agent {
+        info!(member = %member.id, "stopping agent of dropped member");
+        blocking(move || agent.kill_and_drop()).await?;
+        if !force {
+            checked = check(member.dir.clone()).await?;
+            refuse_lossy_drop(&checked, delete_branch)?;
+        }
+    }
+    let label = label.to_string();
+    blocking(move || worktrees::remove_all(&checked, delete_branch))
+        .await?
+        .map_err(|e| {
+            let agent = if stopped {
+                " (its agent was stopped)"
+            } else {
+                ""
+            };
+            Response::Error {
+                message: format!("'{label}' kept{agent}: {e}"),
+            }
+        })
+}
+
+impl DaemonState {
+    /// Take a member's agent out of the table, telling clients and recording
+    /// the end of its run. The caller kills it.
+    fn take_member_agent(&mut self, member: &str) -> Option<Agent> {
+        // A member's agent runs under the member id.
+        let agent = self.agents.remove(member)?;
+        self.agent_gone(member, &agent, -1);
+        Some(agent)
+    }
 }
 
 /// Refuse a drop that would lose work, or whose worktree cannot be checked.

@@ -419,6 +419,11 @@ pub enum Request {
     /// `DropRefused`, changing nothing, when the drop would lose work and
     /// `force` is unset; or replies `Error` when a worktree cannot be
     /// removed (the agents are stopped then, the task kept).
+    ///
+    /// `name` may also name one member of a task (`<task>/<member>` or a
+    /// member id, not a bare short name): that member alone goes the same
+    /// way, and `TaskUpdated` is pushed. A task's last member takes the task
+    /// with it.
     DropTask {
         name: String,
         /// Drop even if uncommitted changes or unmerged commits are lost.

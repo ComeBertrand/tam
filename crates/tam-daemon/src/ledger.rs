@@ -121,6 +121,13 @@ pub enum LedgerEvent {
         to: String,
         timestamp: u64,
     },
+    /// A member left its task, which keeps its other members (`tam drop
+    /// TASK/MEMBER`): its worktree is gone, or forgotten. Its history goes
+    /// with it.
+    MemberDropped {
+        member: String,
+        timestamp: u64,
+    },
 }
 
 /// Ledger lines written before tasks had members (tam <= 0.3.6): a task had
@@ -1019,6 +1026,15 @@ impl State {
                 message.delivered_at = Some(*timestamp);
                 record.events.push((seq, event));
             }
+            LedgerEvent::MemberDropped { member, .. } => {
+                // Kept nowhere: compaction drops the member's events with it.
+                if let Some(record) = self.members.remove(member) {
+                    if let Some(task) = self.tasks.get_mut(&record.task) {
+                        task.members.retain(|m| m != member);
+                    }
+                    self.observed.remove(member);
+                }
+            }
         }
     }
 
@@ -1123,6 +1139,25 @@ impl Ledger {
     /// Returns the updated task.
     pub fn add_member(&mut self, task: &str, member: &NewMember) -> Result<TaskInfo> {
         self.add_members(task, std::slice::from_ref(member))
+    }
+
+    /// Forget one member of a task that has others (its worktree is gone),
+    /// ending its open run. Returns the task without it.
+    pub fn drop_member(&mut self, member: &str) -> Result<TaskInfo> {
+        let task = self.require_member(member)?;
+        if self.member_ids(&task).len() < 2 {
+            bail!(
+                "'{}' is the only member of task '{}': drop the task",
+                member,
+                task
+            );
+        }
+        self.run_ended(member, -1)?;
+        self.append(LedgerEvent::MemberDropped {
+            member: member.into(),
+            timestamp: now(),
+        })?;
+        Ok(self.task(&task).expect("the task keeps its other members"))
     }
 
     /// Add worktrees to an existing task as new members (they join last, in
@@ -2251,6 +2286,47 @@ mod tests {
         );
         let ledger = Ledger::open(&path).unwrap().0;
         assert_eq!(ledger.task("feat").unwrap().members[1].id, web.id);
+    }
+
+    #[test]
+    fn drop_member_keeps_the_others() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let app = create(&mut ledger, "feat", "/w/app--feat");
+        let task = ledger
+            .add_members("feat", &[new_member("web", "feat", "/w/web--feat")])
+            .unwrap();
+        let web = task.members[1].id.clone();
+        ledger.run_started(&web, "claude", None).unwrap();
+
+        // The only member left cannot go alone: the task goes.
+        let task = ledger.drop_member(&web).unwrap();
+        assert_eq!(task.members.len(), 1);
+        assert_eq!(task.members[0].id, app);
+        assert!(ledger.member(&web).is_none());
+        assert!(ledger.member_at(Path::new("/w/web--feat")).is_none());
+        let err = ledger.drop_member(&app).unwrap_err().to_string();
+        assert!(err.contains("only member"), "{err}");
+        assert!(ledger.drop_member("m-nope").is_err());
+        // Its run was ended before it went.
+        assert_eq!(
+            event_types(&path),
+            [
+                "task_created",
+                "member_added",
+                "member_added",
+                "agent_run_started",
+                "agent_run_ended",
+                "member_dropped"
+            ]
+        );
+
+        // Reopened (compacted): the dropped member's history is gone.
+        drop(ledger);
+        let ledger = Ledger::open(&path).unwrap().0;
+        assert_eq!(ledger.task("feat").unwrap().members.len(), 1);
+        assert_eq!(event_types(&path), ["task_created", "member_added"]);
     }
 
     #[test]

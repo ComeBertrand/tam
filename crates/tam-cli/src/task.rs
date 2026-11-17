@@ -314,6 +314,7 @@ mod tests {
             context_percent: None,
             task: Some("feat".into()),
             detail: Default::default(),
+            state_since: None,
         }
     }
 

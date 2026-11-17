@@ -5,7 +5,7 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use nix::pty::{openpty, Winsize};
@@ -47,6 +47,8 @@ pub struct Agent {
     last_output_at: Arc<Mutex<Instant>>,
     /// Last state reported via events. Used to detect transitions.
     reported_state: AgentState,
+    /// When the agent entered `reported_state`.
+    reported_since: SystemTime,
     /// Cached context usage percentage, updated periodically.
     context_percent: Option<u8>,
     /// Id of the task member this agent runs for, if any (its runs are
@@ -155,6 +157,7 @@ impl Agent {
             started_at: Instant::now(),
             last_output_at,
             reported_state: AgentState::Working,
+            reported_since: SystemTime::now(),
             context_percent: None,
             member: None,
             hook_data: HookData::default(),
@@ -278,6 +281,7 @@ impl Agent {
         if current != self.reported_state {
             let old = self.reported_state;
             self.reported_state = current;
+            self.reported_since = SystemTime::now();
             Some((old, current))
         } else {
             None
@@ -301,17 +305,30 @@ impl Agent {
     /// Build an AgentInfo snapshot for reporting to clients. Its `task` is
     /// left for the caller, who knows the member's task.
     pub fn info(&self, id: &str) -> AgentInfo {
+        let state = self.current_state();
+        // A change not reported yet (e.g. by the hook being handled) is now.
+        let since = if state == self.reported_state {
+            self.reported_since
+        } else {
+            SystemTime::now()
+        };
         AgentInfo {
             id: id.to_string(),
             provider: self.provider.name().to_string(),
             dir: self.dir.clone(),
-            state: self.current_state(),
+            state,
             pid: Some(self.child.id()),
             uptime_secs: self.started_at.elapsed().as_secs(),
             viewers: self.viewers.load(Ordering::Relaxed),
             context_percent: self.context_percent,
             task: None,
             detail: Box::new(self.hook_data.detail.clone()),
+            state_since: Some(
+                since
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
         }
     }
 

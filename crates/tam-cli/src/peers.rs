@@ -302,6 +302,7 @@ mod tests {
             context_percent: None,
             task: None,
             detail: Box::new(detail),
+            state_since: None,
         }
     }
 

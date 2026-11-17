@@ -58,6 +58,9 @@ pub struct AgentInfo {
     /// without hooks).
     #[serde(default, skip_serializing_if = "AgentDetail::is_empty")]
     pub detail: Box<AgentDetail>,
+    /// Unix timestamp (seconds) of when the agent entered `state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_since: Option<u64>,
 }
 
 /// Details an agent reports through its hooks, kept by the daemon per agent.
@@ -860,6 +863,7 @@ mod tests {
             context_percent: None,
             task: None,
             detail: Default::default(),
+            state_since: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("detail"), "{json}");
@@ -901,6 +905,7 @@ mod tests {
                 context_percent: None,
                 task: None,
                 detail: Default::default(),
+                state_since: None,
             }],
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -1395,6 +1400,7 @@ mod tests {
             context_percent: None,
             task: None,
             detail: Default::default(),
+            state_since: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("\"task\""));

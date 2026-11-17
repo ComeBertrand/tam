@@ -190,7 +190,8 @@ pub enum Commands {
     /// from an agent tam started, it comes from that agent's member; else
     /// from the user.
     Msg {
-        /// Recipient: task name, TASK/MEMBER or member id
+        /// Recipient: task name, TASK/MEMBER or member id; from an agent,
+        /// also the short name of another member of its task (see tam peers)
         target: String,
 
         /// Message text (read from stdin when omitted)
@@ -231,5 +232,24 @@ pub enum Commands {
         /// Daemon socket (defaults to $TAM_SOCKET)
         #[arg(long, env = "TAM_SOCKET")]
         socket: Option<PathBuf>,
+    },
+
+    /// List the other members of your task, with what their agents are doing
+    ///
+    /// Each member of a task is a worktree of one repository with its own
+    /// agent. Run from an agent tam started, or from a task's worktree. NAME
+    /// is how to name a member to tam msg from there.
+    Peers {
+        /// List the members of every task
+        #[arg(short, long)]
+        all: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Agent id of the caller (set by tam in the agents it starts)
+        #[arg(long, env = "TAM_AGENT_ID", hide = true)]
+        from: Option<String>,
     },
 }

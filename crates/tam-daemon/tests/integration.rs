@@ -976,6 +976,7 @@ impl Conn {
         self.request(&Request::ResolveMember {
             target: target.map(str::to_string),
             dir: dir.map(PathBuf::from),
+            from: None,
         })
         .await
     }

@@ -1097,6 +1097,54 @@ impl Ledger {
     }
 }
 
+/// Names as a member's agent uses them: the short names of its task's
+/// members, besides what `resolve` takes.
+impl Ledger {
+    /// Like [`Ledger::resolve`], for a caller that is member `caller` (its
+    /// agent): a target naming no task and no member id may also be the
+    /// short name of a member of the caller's task. Task names come first,
+    /// so every name `resolve` takes keeps its meaning (the reply hints of
+    /// messages use labels).
+    pub fn resolve_from(
+        &self,
+        caller: Option<&str>,
+        target: &str,
+    ) -> Result<(TaskInfo, MemberInfo)> {
+        let found = self.resolve(target);
+        // Short names never contain '/'.
+        if found.is_ok() || target.contains('/') || self.task(target).is_some() {
+            return found;
+        }
+        let Some((task, _)) = caller.and_then(|c| self.member(c)) else {
+            return found;
+        };
+        match task.members.iter().find(|m| m.name == target) {
+            Some(member) => {
+                let member = member.clone();
+                Ok((task, member))
+            }
+            None => {
+                let names: Vec<&str> = task.members.iter().map(|m| m.name.as_str()).collect();
+                bail!(
+                    "'{}' is neither a task nor a member of task '{}' ({})",
+                    target,
+                    task.name,
+                    names.join(", ")
+                )
+            }
+        }
+    }
+
+    /// How member `caller`'s agent can name `member` (of `task`): its short
+    /// name when that resolves to it from the caller, else its label.
+    pub fn address(&self, caller: &str, task: &TaskInfo, member: &MemberInfo) -> String {
+        match self.resolve_from(Some(caller), &member.name) {
+            Ok((_, found)) if found.id == member.id => member.name.clone(),
+            _ => task.member_label(member),
+        }
+    }
+}
+
 /// Short names of a task's members, given in join order: the repository
 /// name, or `<repo>-<branch>` when an earlier member has it (then a numeric
 /// suffix). A member joining never renames the members before it.
@@ -1581,6 +1629,67 @@ mod tests {
         assert!(err.contains("no member 'db'"), "{err}");
         let err = ledger.resolve("nope").unwrap_err().to_string();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn short_names_resolve_from_a_member_of_the_task() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = open(&tmp);
+        let feat = ledger
+            .create_task(
+                "feat",
+                &[
+                    new_member("api", "feat", "/w/api--feat"),
+                    new_member("web", "feat", "/w/web--feat"),
+                ],
+            )
+            .unwrap();
+        let (api, web) = (&feat.members[0], &feat.members[1]);
+        let other = create(&mut ledger, "other", "/w/app--other");
+
+        // From api, its peer's short name.
+        let (task, found) = ledger.resolve_from(Some(&api.id), "web").unwrap();
+        assert_eq!(
+            (task.name.as_str(), found.id.as_str()),
+            ("feat", web.id.as_str())
+        );
+        assert_eq!(ledger.address(&api.id, &feat, web), "web");
+        // Not from outside the task, nor for anyone else.
+        assert!(ledger.resolve_from(None, "web").is_err());
+        assert!(ledger.resolve_from(Some(&other), "web").is_err());
+        assert!(ledger.resolve_from(Some("m-nobody"), "web").is_err());
+        // What `resolve` takes keeps its meaning.
+        assert_eq!(
+            ledger.resolve_from(Some(&api.id), "other").unwrap().1.id,
+            other
+        );
+        assert_eq!(
+            ledger.resolve_from(Some(&api.id), "feat/web").unwrap().1.id,
+            web.id
+        );
+        assert_eq!(
+            ledger.resolve_from(Some(&api.id), &web.id).unwrap().1.id,
+            web.id
+        );
+        let err = ledger
+            .resolve_from(Some(&api.id), "db")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("neither a task nor a member of task 'feat' (api, web)"),
+            "{err}"
+        );
+
+        // A task named like a peer takes the name: the peer's address is
+        // its label then.
+        let web_task = create(&mut ledger, "web", "/w/app--web");
+        assert_eq!(
+            ledger.resolve_from(Some(&api.id), "web").unwrap().1.id,
+            web_task
+        );
+        assert_eq!(ledger.address(&api.id, &feat, web), "feat/web");
+        let task = ledger.task("web").unwrap();
+        assert_eq!(ledger.address(&api.id, &task, &task.members[0]), "web");
     }
 
     #[test]

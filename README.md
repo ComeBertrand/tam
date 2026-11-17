@@ -75,6 +75,7 @@ tam
 - **Per-repo init** — `.tam.toml` copies untracked files and runs setup commands in new worktrees
 - **Desktop notifications** — configurable alerts when agents need input or hit permission prompts
 - **Messages** — `tam msg` sends a message to a running session without attaching, from you or from another agent, and can wait for the reply
+- **Peers** — an agent knows the other members of its task (their names, repositories and worktrees) and reaches them with `tam msg`; `tam peers` shows what their agents are doing
 - **Custom TUI commands** — bind keys to shell commands (open editor, run tests, etc.)
 
 ## Commands
@@ -133,9 +134,13 @@ tam msg NAME TEXT              Send a message to the member's agent (TEXT or std
 tam msg NAME TEXT --wait       ...and print its reply (--timeout SECS, default 90)
 
 tam history NAME               The task's agent runs and messages
+tam peers                      The other members of your task, and what their agents do
+tam peers --all                ...of every task (--json: machine-readable)
 ```
 
 A Claude agent gets a message right away: when idle it wakes up, when busy it reads it at its next step (after a pending permission prompt is answered). Other agents get it typed in once idle. A member with no running agent gets it when its next agent starts. Sent from inside an agent TAM started, a message comes from that agent, which the recipient can answer with `tam msg`; otherwise it comes from you. The reply `--wait` prints is the recipient's next message back, or its response at the end of the turn that got the message. Two agents answering each other are stopped after 6 messages, until you prompt one of them; an agent sends at most 20 messages per 10 minutes.
+
+An agent TAM starts knows its task. A Claude agent is told when its session starts (again on resume, `/clear` and compaction): its task, its name, and the other members with their repositories and worktrees, so a backend and a frontend session can agree on an API without you relaying. Other agents have their member id in `$TAM_AGENT_ID` and can run `tam peers`. From an agent, `tam msg`, `tam run`, `tam stop` and `tam attach` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
 
 ### TUI
 

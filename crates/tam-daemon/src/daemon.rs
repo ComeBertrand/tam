@@ -776,10 +776,11 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                 },
             }
         }
-        Request::ResolveMember { target, dir } => {
+        Request::ResolveMember { target, dir, from } => {
             let state = state.lock().await;
+            let caller = state.sender_member(from.as_deref());
             let found = match (target, dir) {
-                (Some(target), _) => state.ledger.resolve(&target),
+                (Some(target), _) => state.ledger.resolve_from(caller.as_deref(), &target),
                 (None, Some(dir)) => state
                     .ledger
                     .member_at(&dir)
@@ -1193,6 +1194,18 @@ async fn handle_hook_event(
     }
     if let Some((member, session_id)) = session {
         state.record_hook_session(&member, &session_id);
+    }
+    // Whenever a session starts (resumed, cleared, compacted too): what its
+    // task is now, and its peers.
+    if event == "SessionStart" {
+        let note = state
+            .agents
+            .get(agent_id)
+            .and_then(Agent::member)
+            .and_then(|member| crate::peers::session_note(&state.ledger, member));
+        if let Some(context) = note {
+            return Response::HookContext { context };
+        }
     }
     Response::Ok
 }
@@ -1786,11 +1799,14 @@ fn send_message(
             inbox::MAX_TEXT
         ));
     }
-    let (task, recipient) = state.ledger.resolve(to).map_err(|e| format!("{e:#}"))?;
+    let sender = state.sender_member(from);
+    let (task, recipient) = state
+        .ledger
+        .resolve_from(sender.as_deref(), to)
+        .map_err(|e| format!("{e:#}"))?;
     if state.dropping.contains(&task.name) {
         return Err(format!("task '{}' is being dropped", task.name));
     }
-    let sender = state.sender_member(from);
     let (hop, reply_to) = match sender.as_deref() {
         None => (0, None),
         Some(sender) if sender == recipient.id => {

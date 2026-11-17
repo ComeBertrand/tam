@@ -31,6 +31,7 @@ mod health;
 mod hook;
 mod msg;
 mod peers;
+mod repos;
 mod task;
 mod tui;
 
@@ -73,25 +74,13 @@ async fn run(cli: Cli) -> Result<()> {
             prompt,
             detach,
             json,
+            repo,
+            join,
         } => {
             let mut client = client::Client::connect().await?;
-            if client.list_tasks().await?.iter().any(|t| t.name == name) {
-                anyhow::bail!("task '{}' already exists", name);
-            }
-
-            // A task owns its worktree: branch NAME of the current repository.
-            let cwd = std::fs::canonicalize(".")?;
-            let wt_config = tam_worktree::config::load_config()?;
-            let member = task::create_worktree(&name, source.as_deref(), &wt_config, &cwd)?;
-            if wt_config.auto_init {
-                tam_worktree::init::run(&member.dir)?;
-            }
-
-            let task = client.create_task(&name, vec![member]).await?;
-            let member = task.members[0].clone();
-            if !json {
-                println!("Created task '{}' at {}", name, member.dir.display());
-            }
+            // A task owns its worktrees: branch NAME of each repository.
+            let (task, members) =
+                new_members(&mut client, &name, source.as_deref(), &repo, join, json).await?;
 
             let start = (!no_start).then_some(Start {
                 agent: None,
@@ -101,11 +90,10 @@ async fn run(cli: Cli) -> Result<()> {
             });
             match start {
                 Some(start) if script::attaching(detach || json) => {
-                    run_and_attach(&mut client, &task, &member, &config, start).await?
+                    start_members(&mut client, &task, &members, &config, start).await?
                 }
                 start => {
-                    let members = &task.members;
-                    script::start_detached(&mut client, &task, members, &config, start, json)
+                    script::start_detached(&mut client, &task, &members, &config, start, json)
                         .await?
                 }
             }
@@ -533,6 +521,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// How to start a member's agent.
+#[derive(Clone)]
 struct Start {
     /// Unset: the member's last agent, else the configured default.
     agent: Option<String>,
@@ -622,6 +611,122 @@ fn shorten_home(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// `tam new`: have the daemon create worktrees on branch `name` in the
+/// repositories `repos` name (default: the current one), as a new task or
+/// with `join` as new members of the existing task. All or nothing. Returns
+/// the task and its new members.
+async fn new_members(
+    client: &mut client::Client,
+    name: &str,
+    source: Option<&str>,
+    repos: &[String],
+    join: bool,
+    json: bool,
+) -> Result<(TaskInfo, Vec<MemberInfo>)> {
+    use anyhow::Context;
+
+    // Before fetching anything (the daemon checks again).
+    let exists = client.list_tasks().await?.iter().any(|t| t.name == name);
+    if exists && !join {
+        anyhow::bail!("task '{name}' already exists (add repositories to it with --join)");
+    }
+    if join && !exists {
+        anyhow::bail!("task '{name}' not found");
+    }
+
+    let cwd = std::fs::canonicalize(".")?;
+    let wt_config = tam_worktree::config::load_config()?;
+    let roots = repos::resolve(repos, &cwd, || repos::discover(&wt_config))?;
+    let members: Vec<tam_proto::NewMember> = roots
+        .iter()
+        .map(|root| tam_proto::NewMember {
+            repo_root: root.clone(),
+            branch: name.to_string(),
+            dir: tam_worktree::worktree::target_dir(&wt_config, root, name),
+        })
+        .collect();
+    // The daemon does not fetch: the latest remote branches, from here.
+    for root in &roots {
+        tam_worktree::git::fetch(root)?;
+    }
+    let task = client.create_members(name, members, source, join).await?;
+    // They joined last, in order.
+    let new = task.members[task.members.len().saturating_sub(roots.len())..].to_vec();
+
+    // With --json, the receipt says it all.
+    if !json {
+        if let (false, [member]) = (join, new.as_slice()) {
+            println!("Created task '{name}' at {}", member.dir.display());
+        } else {
+            let verb = if join { "Added to" } else { "Created" };
+            println!("{verb} task '{name}':");
+            let labels: Vec<String> = new.iter().map(|m| task.member_label(m)).collect();
+            let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+            for (label, member) in labels.iter().zip(&new) {
+                println!("  {label:<width$}  {}", member.dir.display());
+            }
+        }
+    }
+    if wt_config.auto_init {
+        for member in &new {
+            tam_worktree::init::run(&member.dir).with_context(|| {
+                format!(
+                    "cannot initialize {} (task '{name}' was created)",
+                    member.dir.display()
+                )
+            })?;
+        }
+    }
+    Ok((task, new))
+}
+
+/// Start an agent in each of a task's new members, as `start` says, then
+/// attach to the first one.
+async fn start_members(
+    client: &mut client::Client,
+    task: &TaskInfo,
+    members: &[MemberInfo],
+    config: &config::Config,
+    start: Start,
+) -> Result<()> {
+    if let [member] = members {
+        return run_and_attach(client, task, member, config, start).await;
+    }
+    let mut started: Vec<(String, String)> = Vec::new();
+    for member in members {
+        let label = task.member_label(member);
+        let start = start.clone();
+        let run = client
+            .run_agent(
+                &member.id,
+                start.agent,
+                &config.default_agent,
+                start.session,
+                start.prompt,
+                start.args,
+            )
+            .await;
+        match run {
+            Ok((id, _)) => started.push((id, label)),
+            Err(e) => eprintln!("Error: cannot start an agent in '{label}': {e:#}"),
+        }
+    }
+    let Some((id, label)) = started.first() else {
+        anyhow::bail!("no agent started in task '{}'", task.name);
+    };
+    let client = client::Client::connect().await?;
+    let attached = client.attach(id, label).await;
+    // After: detaching clears the screen.
+    let others: Vec<String> = started[1..]
+        .iter()
+        .map(|(_, label)| format!("tam attach {label}"))
+        .collect();
+    if !others.is_empty() {
+        println!("The other agents: {}", others.join(", "));
+    }
+    attached
 }
 
 #[cfg(test)]

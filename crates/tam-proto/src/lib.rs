@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Protocol version. Increment on any breaking wire format change.
@@ -221,7 +222,8 @@ impl MemberHealth {
     }
 }
 
-/// A member to create a task with: a worktree the client created.
+/// A new task member's worktree: one the client created (`CreateTask`), or
+/// one for the daemon to create (`CreateMembers`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewMember {
     /// The repository's main checkout. Its directory name is the repo name.
@@ -384,7 +386,8 @@ pub enum Request {
         protocol_version: u32,
     },
     /// Record a new task with its members (worktrees the client created).
-    /// Replies `Task`; pushes `TaskCreated`.
+    /// Replies `Task`; pushes `TaskCreated`. Clients create tasks with
+    /// `CreateMembers`; this records worktrees made otherwise (tests).
     CreateTask {
         name: String,
         members: Vec<NewMember>,
@@ -542,6 +545,34 @@ pub enum Request {
         /// `None`: no limit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
+    },
+    /// Create a worktree for each of `members` (in its repository, at its
+    /// `dir`, which must not exist, on its `branch`) and make them the
+    /// members of a new task `task`, or with `join` new members of the
+    /// existing task `task`. A branch is checked out if it exists, locally
+    /// or on `origin`, else created from `source` (default: the
+    /// repository's default branch). The daemon does not fetch: the client
+    /// does, beforehand.
+    ///
+    /// All or nothing: every worktree is checked before the first is
+    /// created; when one cannot be created after all, those created before
+    /// it are removed again, with the branches created with them (unless
+    /// that would lose work), and nothing is recorded. The error says what
+    /// failed and what is left behind. Replies `Task`; pushes `TaskCreated`
+    /// (new task) or `TaskUpdated`.
+    CreateMembers {
+        task: String,
+        members: Vec<NewMember>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default)]
+        join: bool,
+        /// The client's environment: git runs with it rather than the
+        /// daemon's (started from another shell, maybe long ago), so hooks
+        /// and filters such as git-lfs see the caller's `PATH` and
+        /// credentials. Empty: the daemon's. Never recorded or logged.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
     },
 }
 
@@ -1918,5 +1949,39 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"outcomes","members":[],"timed_out":true}"#);
+    }
+
+    #[test]
+    fn create_members_wire_format() {
+        let json = serde_json::to_string(&Request::CreateMembers {
+            task: "feat".into(),
+            members: vec![NewMember {
+                repo_root: PathBuf::from("/src/api"),
+                branch: "feat".into(),
+                dir: PathBuf::from("/wt/api--feat"),
+            }],
+            source: None,
+            join: false,
+            env: BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"create_members","task":"feat","members":[{"repo_root":"/src/api","branch":"feat","dir":"/wt/api--feat"}],"join":false}"#
+        );
+        let req: Request = serde_json::from_str(
+            r#"{"type":"create_members","task":"feat","members":[],"source":"dev","join":true,"env":{"PATH":"/bin"}}"#,
+        )
+        .unwrap();
+        match req {
+            Request::CreateMembers {
+                source, join, env, ..
+            } => {
+                assert_eq!(source.as_deref(), Some("dev"));
+                assert!(join);
+                assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

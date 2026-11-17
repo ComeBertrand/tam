@@ -11,48 +11,180 @@ use crate::git;
 pub fn create(name: &str, source: Option<&str>, config: &Config, cwd: &Path) -> Result<PathBuf> {
     let main_root = git::repo_root(cwd)
         .context("not inside a git repository — run this from within a project")?;
-    let project_name = main_root
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let target = config
-        .worktree_root
-        .join(format!("{}--{}", project_name, name));
+    let target = target_dir(config, &main_root, name);
 
     if target.exists() {
         bail!("worktree directory already exists: {}", target.display());
     }
 
-    // Auto-create worktree root if it doesn't exist
-    if !config.worktree_root.exists() {
-        fs::create_dir_all(&config.worktree_root).with_context(|| {
-            format!(
-                "failed to create worktree root: {}",
-                config.worktree_root.display()
-            )
-        })?;
-    }
-
     git::fetch(cwd)?;
-
-    // Branch resolution
-    if git::local_branch_exists(cwd, name)? {
-        // a. Local branch exists — check it out
-        git::worktree_add(cwd, &target, name)?;
-    } else if git::remote_branch_exists(cwd, name)? {
-        // b. Remote branch exists — track it
-        git::worktree_add(cwd, &target, name)?;
-    } else if let Some(base) = source {
-        // c. --source provided — create new branch from base
-        git::worktree_add_new_branch(cwd, &target, name, base)?;
-    } else {
-        // d. Create new branch from default branch
-        let default = git::default_branch(cwd)?;
-        git::worktree_add_new_branch(cwd, &target, name, &default)?;
-    }
-
+    add(cwd, &target, name, source).map_err(|e| e.error)?;
     Ok(target)
+}
+
+/// Where a task's worktree on branch `name` of the repository whose main
+/// checkout is `repo_root` goes: `<worktree root>/<repo>--<name>`.
+pub fn target_dir(config: &Config, repo_root: &Path, name: &str) -> PathBuf {
+    let project_name = repo_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    config
+        .worktree_root
+        .join(format!("{}--{}", project_name, name))
+}
+
+/// A worktree [`add`] created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Added {
+    pub dir: PathBuf,
+    pub branch: String,
+    /// The local branch did not exist before: it was created with the
+    /// worktree (from a remote branch, or a start point).
+    pub branch_created: bool,
+}
+
+/// Why [`add`] failed.
+#[derive(Debug)]
+pub struct AddError {
+    pub error: anyhow::Error,
+    /// The worktree, when git created it before failing (e.g. a failing
+    /// `post-checkout` hook): undo it with [`undo_add`].
+    pub created: Option<Added>,
+}
+
+/// How [`add`] gets its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Checkout {
+    /// The local branch exists: check it out.
+    Local,
+    /// `origin/<branch>` exists: a local branch tracking it.
+    Remote,
+    /// A new branch from this start point.
+    New(String),
+}
+
+/// Whether [`add`] can add a worktree at `dir` on `branch` (see there);
+/// `Err` says why not. Read-only.
+pub fn check_add(repo: &Path, dir: &Path, branch: &str, source: Option<&str>) -> Result<()> {
+    plan_add(repo, dir, branch, source).map(|_| ())
+}
+
+fn plan_add(repo: &Path, dir: &Path, branch: &str, source: Option<&str>) -> Result<Checkout> {
+    if dir.symlink_metadata().is_ok() {
+        bail!("worktree directory already exists: {}", dir.display());
+    }
+    for entry in git::worktree_entries(repo)? {
+        if entry.branch.as_deref() == Some(branch) {
+            bail!(
+                "branch '{branch}' is checked out at {}",
+                entry.path.display()
+            );
+        }
+    }
+    if git::local_branch_exists(repo, branch)? {
+        return Ok(Checkout::Local);
+    }
+    if git::remote_branch_exists(repo, branch)? {
+        return Ok(Checkout::Remote);
+    }
+    let base = match source {
+        Some(source) => source.to_string(),
+        None => git::default_branch(repo)?,
+    };
+    if !git::resolves(repo, &base) {
+        bail!("'{base}' is not a commit of this repository: cannot branch '{branch}' from it");
+    }
+    Ok(Checkout::New(base))
+}
+
+/// Add a worktree of the repository containing `repo` (its main checkout,
+/// or any of its worktrees) at `dir`, which must not exist, on `branch`:
+/// the local branch if it exists, else one tracking `origin/<branch>`, else
+/// a new branch from `source` (default: the repository's default branch).
+/// Refused when the branch is checked out elsewhere. Does not fetch: run
+/// [`git::fetch`] first to see the latest remote branches.
+pub fn add(repo: &Path, dir: &Path, branch: &str, source: Option<&str>) -> Result<Added, AddError> {
+    let failed = |error| AddError {
+        error,
+        created: None,
+    };
+    let checkout = plan_add(repo, dir, branch, source).map_err(failed)?;
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))
+            .map_err(failed)?;
+    }
+    let added = Added {
+        dir: dir.to_path_buf(),
+        branch: branch.to_string(),
+        branch_created: checkout != Checkout::Local,
+    };
+    let result = match &checkout {
+        Checkout::Local | Checkout::Remote => git::worktree_add(repo, dir, branch),
+        Checkout::New(base) => git::worktree_add_new_branch(repo, dir, branch, base),
+    };
+    let Err(error) = result else {
+        return Ok(added);
+    };
+    // Git may fail after doing part of the work: after creating the
+    // worktree (a failing hook), or after creating the branch only (the
+    // directory cannot be created).
+    let left = dir.exists()
+        || (added.branch_created && git::local_branch_exists(repo, branch).unwrap_or(true));
+    Err(AddError {
+        error,
+        created: left.then_some(added),
+    })
+}
+
+/// Undo [`add`]: remove the worktree, and its branch if it was created with
+/// it, unless that would lose work. `repo` is the repository's main
+/// checkout. `Err` says what was kept, and why: the worktree when it has
+/// uncommitted changes (or cannot be checked), the branch when it holds
+/// commits no other branch, tag or remote branch has.
+///
+/// Without its directory (git failed before creating it), only the branch.
+pub fn undo_add(repo: &Path, added: &Added) -> Result<()> {
+    if added.dir.symlink_metadata().is_err() {
+        if !added.branch_created || !git::local_branch_exists(repo, &added.branch)? {
+            return Ok(());
+        }
+        if !git::branch_commits_only_on(repo, &added.branch)?.is_empty() {
+            bail!(
+                "kept branch '{}': it holds commits no other branch has",
+                added.branch
+            );
+        }
+        return delete_branch(repo, &added.branch)
+            .with_context(|| format!("kept branch '{}'", added.branch));
+    }
+    let check = check(repo, &added.dir).context("kept the worktree")?;
+    if !check.uncommitted.is_empty() {
+        bail!(
+            "kept the worktree: it has uncommitted changes ({})",
+            check.uncommitted.join(", ")
+        );
+    }
+    // Forced: git refuses clean worktrees with submodules otherwise.
+    remove(repo, &added.dir, true).context("kept the worktree")?;
+    if !added.branch_created {
+        return Ok(());
+    }
+    if check.branch.as_deref() != Some(added.branch.as_str()) {
+        bail!(
+            "removed the worktree, kept branch '{}': the worktree was on another branch",
+            added.branch
+        );
+    }
+    if !check.unmerged.is_empty() {
+        bail!(
+            "removed the worktree, kept branch '{}': it holds commits no other branch has",
+            added.branch
+        );
+    }
+    delete_branch(repo, &added.branch)
+        .with_context(|| format!("removed the worktree, kept branch '{}'", added.branch))
 }
 
 /// What removing a worktree, and possibly its branch, would lose.
@@ -671,5 +803,163 @@ mod tests {
             resolve_path(&link.join("gone")),
             real.canonicalize().unwrap().join("gone")
         );
+    }
+
+    // --- add / undo_add ---
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        git::local_branch_exists(repo, branch).unwrap()
+    }
+
+    #[test]
+    fn test_target_dir_is_named_after_the_repository() {
+        let config = test_config(PathBuf::from("/wt"));
+        assert_eq!(
+            target_dir(&config, Path::new("/src/api"), "feat"),
+            PathBuf::from("/wt/api--feat")
+        );
+    }
+
+    #[test]
+    fn test_add_tells_whether_it_created_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        git_cmd(&repo, &["branch", "old"]);
+        // A clone, whose origin has a branch it lacks locally.
+        git_cmd(&repo, &["branch", "remote-only"]);
+        let clone = tmp.path().join("clone");
+        git_cmd(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                repo.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+
+        let new = add(&repo, &tmp.path().join("wt/new"), "new", None).unwrap();
+        assert!(new.branch_created);
+        assert!(new.dir.join("README.md").exists());
+        let old = add(&repo, &tmp.path().join("wt/old"), "old", None).unwrap();
+        assert!(!old.branch_created);
+        let from = add(&repo, &tmp.path().join("wt/from"), "from", Some("old")).unwrap();
+        assert!(from.branch_created);
+        let tracking = add(&clone, &tmp.path().join("wt/r"), "remote-only", None).unwrap();
+        assert!(tracking.branch_created);
+        assert!(branch_exists(&clone, "remote-only"));
+    }
+
+    #[test]
+    fn test_add_refusals_create_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let taken = tmp.path().join("taken");
+        fs::create_dir_all(&taken).unwrap();
+        add(&repo, &tmp.path().join("a"), "feat", None).unwrap();
+
+        let err = |dir: &str, branch: &str, source: Option<&str>| {
+            let dir = tmp.path().join(dir);
+            assert!(check_add(&repo, &dir, branch, source).is_err());
+            let e = add(&repo, &dir, branch, source).unwrap_err();
+            assert!(e.created.is_none());
+            format!("{:#}", e.error)
+        };
+        assert!(err("taken", "x", None).contains("already exists"));
+        assert!(err("b", "feat", None).contains("is checked out at"));
+        assert!(err("c", "y", Some("nope")).contains("'nope' is not a commit"));
+        assert!(!tmp.path().join("b").exists() && !tmp.path().join("c").exists());
+        assert!(!branch_exists(&repo, "y"));
+        assert!(check_add(&repo, &tmp.path().join("d"), "z", Some("main")).is_ok());
+    }
+
+    #[test]
+    fn test_add_reports_the_worktree_git_left_when_it_failed() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let hooks = repo.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        git_cmd(
+            &repo,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        let hook = hooks.join("post-checkout");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let e = add(&repo, &tmp.path().join("wt"), "feat", None).unwrap_err();
+        let created = e.created.expect("git created the worktree");
+        assert!(created.dir.exists() && created.branch_created);
+        fs::remove_file(&hook).unwrap();
+        undo_add(&repo, &created).unwrap();
+        assert!(!created.dir.exists());
+        assert!(!branch_exists(&repo, "feat"));
+    }
+
+    #[test]
+    fn test_add_reports_the_branch_git_left_without_a_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        git_cmd(&repo, &["branch", "remote-only"]);
+        let clone = tmp.path().join("clone");
+        git_cmd(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                repo.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        // Git creates the branch, then cannot create the directory.
+        let ro = tmp.path().join("ro");
+        fs::create_dir_all(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+
+        for (repo, branch) in [(&repo, "new"), (&clone, "remote-only")] {
+            let e = add(repo, &ro.join(branch), branch, None).unwrap_err();
+            let created = e.created.expect("git created the branch");
+            assert!(!created.dir.exists() && created.branch_created);
+            assert!(branch_exists(repo, branch));
+            undo_add(repo, &created).unwrap();
+            assert!(!branch_exists(repo, branch), "{branch}");
+        }
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn test_undo_add_keeps_what_would_be_lost() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        git_cmd(&repo, &["branch", "old"]);
+        let wt = |name: &str| tmp.path().join(name);
+
+        // A new branch goes with its worktree; an existing one stays.
+        let new = add(&repo, &wt("new"), "new", None).unwrap();
+        undo_add(&repo, &new).unwrap();
+        assert!(!wt("new").exists() && !branch_exists(&repo, "new"));
+        let old = add(&repo, &wt("old"), "old", None).unwrap();
+        undo_add(&repo, &old).unwrap();
+        assert!(!wt("old").exists() && branch_exists(&repo, "old"));
+
+        // Uncommitted changes: nothing removed.
+        let dirty = add(&repo, &wt("dirty"), "dirty", None).unwrap();
+        fs::write(wt("dirty").join("notes.txt"), "x").unwrap();
+        let err = format!("{:#}", undo_add(&repo, &dirty).unwrap_err());
+        assert!(err.contains("uncommitted changes"), "{err}");
+        assert!(wt("dirty").exists() && branch_exists(&repo, "dirty"));
+
+        // Commits only the new branch has: the branch stays.
+        let ahead = add(&repo, &wt("ahead"), "ahead", None).unwrap();
+        commit(&wt("ahead"), "f.txt", "work");
+        let err = format!("{:#}", undo_add(&repo, &ahead).unwrap_err());
+        assert!(err.contains("kept branch 'ahead'"), "{err}");
+        assert!(!wt("ahead").exists() && branch_exists(&repo, "ahead"));
     }
 }

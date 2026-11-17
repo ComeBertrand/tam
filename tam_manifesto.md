@@ -194,6 +194,8 @@ The file is named `.worktree-init.toml`, not `.tam.toml` or `.yawn.toml`, becaus
 tam new NAME                        # create task bound to cwd (borrowed)
 tam new NAME -w                     # create task with owned worktree
 tam new NAME -w -s REF              # worktree branched from specific ref
+tam new NAME -r REPO -r REPO        # one worktree (member) per repository, all or nothing
+tam new NAME -r REPO --join         # add a repository's worktree to the existing task NAME
 
 tam run NAME                        # start the agent, resuming its current session
 tam run NAME --new-session          # start a new session instead
@@ -251,6 +253,7 @@ tam hook-notify                     # hook callback from agent process
 - `tam run NAME` errors if the task already has a running agent.
 - `tam stop` and `tam attach` without a name resolve from cwd: find the task bound to the current directory. Error if zero or multiple matches.
 - `tam new NAME -w`: name must be a valid git branch name.
+- `tam new NAME -r REPO`: REPO is a path to (a directory in) the repository, else its project name as `tam ls` shows it. The daemon checks every repository before creating anything, and removes what it created if one worktree still fails. With several members, `tam new` attaches to the first; `tam run`/`tam attach NAME` refuse and list `NAME/MEMBER` names.
 - `tam drop NAME` on a borrowed task: kills agent, removes from ledger. Does not touch directory.
 - `tam drop NAME` on an owned task: kills agent, deletes worktree, removes from ledger. The daemon does all of it, for the CLI and the TUI alike.
 - `tam drop NAME -b`: also deletes the local git branch (`git branch -D`). Only valid for owned tasks.

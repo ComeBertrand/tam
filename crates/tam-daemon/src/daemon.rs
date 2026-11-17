@@ -895,6 +895,13 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             until,
             timeout_secs,
         } => handle_wait_agents(state, &members, until, timeout_secs).await,
+        Request::CreateMembers {
+            task,
+            members,
+            source,
+            join,
+            env,
+        } => handle_create_members(state, &task, members, source, join, env).await,
     }
 }
 
@@ -1650,6 +1657,123 @@ async fn handle_adopt_worktree(
     }
     let runs = state.ledger.runs(&task.name);
     Response::Task { task, runs }
+}
+
+/// Create worktrees as the members of a new task, or with `join` as new
+/// members of an existing one (`Request::CreateMembers`): check them all,
+/// create them, record them. All or nothing: the worktrees are undone when
+/// one fails or the task cannot be recorded.
+///
+/// Holds the worktree lock throughout (git runs outside the state lock), so
+/// no reconcile pass, repair or drop runs meanwhile. A drop may still claim
+/// the task while it waits for that lock: checked again before recording.
+///
+/// Git runs in the client's environment `env` (the daemon's when empty), as
+/// it would have run in the client.
+async fn handle_create_members(
+    state: &Arc<Mutex<DaemonState>>,
+    task: &str,
+    members: Vec<NewMember>,
+    source: Option<String>,
+    join: bool,
+    env: std::collections::BTreeMap<String, String>,
+) -> Response {
+    let error = |why: String| Response::Error {
+        message: match join {
+            true => format!("cannot add to task '{task}': {why}"),
+            false => format!("cannot create task '{task}': {why}"),
+        },
+    };
+    if members.is_empty() {
+        return error("no repository given".into());
+    }
+    let worktrees = state.lock().await.worktrees.clone();
+    let _held = worktrees.lock().await;
+    if let Err(why) = state.lock().await.can_create_members(task, join) {
+        return error(why);
+    }
+
+    let env = (!env.is_empty()).then_some(env);
+    let (check, from, in_env) = (members.clone(), source.clone(), env.clone());
+    let checked = run_git(move || {
+        tam_worktree::git::with_env(in_env, || worktrees::check_new(&check, from.as_deref()))
+    });
+    if let Err(e) = checked.await {
+        return error(format!("{e:#}\nNothing was created."));
+    }
+    let (create, in_env) = (members.clone(), env.clone());
+    let created = run_git(move || {
+        Ok(tam_worktree::git::with_env(in_env, || {
+            worktrees::create_all(&create, source.as_deref())
+        }))
+    });
+    let created = match created.await {
+        Ok(Ok(created)) => created,
+        Ok(Err(report)) => return error(report),
+        Err(e) => return error(format!("{e:#} (worktrees may be left behind)")),
+    };
+    let observed = observe(members.iter().map(Recorded::from).collect()).await;
+
+    let mut state = state.lock().await;
+    let recorded = match state.can_create_members(task, join) {
+        Err(why) => Err(anyhow::anyhow!(why)),
+        Ok(()) if join => state.ledger.add_members(task, &members),
+        Ok(()) => state.ledger.create_task(task, &members),
+    };
+    let info = match recorded {
+        Ok(info) => info,
+        Err(e) => {
+            drop(state);
+            let undone = run_git(move || {
+                Ok(tam_worktree::git::with_env(env, || {
+                    worktrees::undo_all(created)
+                }))
+            })
+            .await
+            .unwrap_or_else(|e| format!("{e:#} (worktrees may be left behind)"));
+            return error(format!("{e:#}\n{undone}"));
+        }
+    };
+
+    // The new members joined last, in order.
+    let ids: Vec<String> = info.members[info.members.len() - members.len()..]
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    for (id, o) in ids.iter().zip(observed) {
+        state.ledger.observe(id, o.health, o.repo);
+    }
+    let info = state.ledger.task(task).unwrap_or(info);
+    for (id, m) in ids.iter().zip(&members) {
+        info!(task = %task, member = %id, dir = %m.dir.display(), "worktree created");
+    }
+    if join {
+        state.broadcast(Event::TaskUpdated { task: info.clone() });
+    } else {
+        info!(task = %task, "task created");
+        state.broadcast(Event::TaskCreated { task: info.clone() });
+    }
+    Response::Task {
+        runs: state.ledger.runs(task),
+        task: info,
+    }
+}
+
+impl DaemonState {
+    /// Why members cannot be created for `task` (see `CreateMembers`): a new
+    /// task needs a free name, `join` a task that exists and is not being
+    /// dropped.
+    fn can_create_members(&self, task: &str, join: bool) -> Result<(), String> {
+        if task.trim().is_empty() {
+            return Err("a task needs a name".into());
+        }
+        match (self.ledger.task(task).is_some(), join) {
+            (true, false) => Err("it already exists (add repositories to it with --join)".into()),
+            (false, true) => Err("it does not exist".into()),
+            (true, true) if self.dropping.contains(task) => Err("it is being dropped".into()),
+            _ => Ok(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

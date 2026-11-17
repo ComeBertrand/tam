@@ -218,6 +218,36 @@ adopt). `tam-cli` depends on all three.
   redefined at the crate root (`output.rs`, #38): a closed stdout (`tam ps |
   head -1`) exits 0 quietly instead of panicking. Not `SIGPIPE`'s default: it
   would kill a client on a closed daemon socket, silently.
+- **Creation is the daemon's, all or nothing** — `CreateMembers { task, members,
+  source, join }` (`handle_create_members`, git side in `worktrees.rs`:
+  `check_new`, `create_all`, `undo_all`) creates one worktree per member and
+  records them as a new task, or with `join` as new members of an existing one
+  (`Ledger::add_members`, one append). Under the worktree lock: check every
+  member first (main checkout, directory free and not shared, branch not checked
+  out elsewhere, start point present: `worktree::check_add`), then create them
+  in order (`worktree::add`: local branch, else `origin/<branch>`, else a new
+  branch from `source` or the default one; it reports whether it created the
+  branch, and what git leaves when it fails: the worktree on a failing
+  `post-checkout` hook, the branch alone when the directory cannot be
+  created). A failure, or a ledger write that fails (a drop may
+  claim a joined task meanwhile: checked again), undoes what was created
+  (`worktree::undo_add`): the worktree unless it has uncommitted changes, the
+  branch only if this request created it and no other ref holds its commits.
+  The error names what is left behind. The daemon's environment is the shell
+  that started it, maybe long ago: git runs in the client's instead
+  (`CreateMembers.env` from `repos::git_env`, without repo-local `GIT_*`
+  variables; `git::with_env` scopes it to the thread running that git, so
+  hooks and filters such as git-lfs see the caller's `PATH`). Never recorded
+  or logged. The daemon never fetches: the client does first. `tam new NAME [-r REPO]...
+  [--join]` resolves each REPO in `tam-cli/src/repos.rs`: an existing path
+  (any directory in the repository), else a project name exactly as `tam ls
+  --porcelain` prints it (discovery under `$HOME`, only then, once). Worktree
+  directories come from `worktree::target_dir` (`<root>/<repo>--<name>`);
+  `.tam.toml` init runs after the task is recorded. With several members `tam
+  new` starts one agent each and attaches to the first; `tam run`/`attach` of a
+  multi-member task name refuse and list `TASK/MEMBER` names. `CreateTask`
+  (record worktrees the client made) stays for tests and the TUI's new-task
+  flow. Tests: `crates/tam-daemon/tests/create.rs`, `crates/tam-cli/tests/new_task.rs`.
 
 ## Build & check
 

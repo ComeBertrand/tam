@@ -14,8 +14,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Create a new task in the current repository (a worktree on branch NAME)
-    /// and start an agent
+    /// Create a new task: a worktree on branch NAME in the current repository,
+    /// or in each --repo, and start an agent in each
+    ///
+    /// All or nothing: if one worktree cannot be created, those created
+    /// before it are removed again. With several repositories, the agent of
+    /// the first one is attached; name the others as NAME/<repo>.
     New {
         /// Task name, also the name of its branch
         name: String,
@@ -39,6 +43,15 @@ pub enum Commands {
         /// Print a JSON receipt instead of attaching (see README, Scripting)
         #[arg(long)]
         json: bool,
+
+        /// Repository to create a worktree in (repeatable; default: the
+        /// current one): a path to it, or its name as `tam ls` shows it
+        #[arg(short, long = "repo", value_name = "REPO")]
+        repo: Vec<String>,
+
+        /// Add the worktrees to the existing task NAME instead
+        #[arg(long)]
+        join: bool,
     },
 
     /// Start an agent in a task, resuming its current session

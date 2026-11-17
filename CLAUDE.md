@@ -244,7 +244,10 @@ adopt). `tam-cli` depends on all three.
   --porcelain` prints it (discovery under `$HOME`, only then, once). Worktree
   directories come from `worktree::target_dir` (`<root>/<repo>--<name>`);
   `.tam.toml` init runs after the task is recorded. With several members `tam
-  new` starts one agent each and attaches to the first; `tam run`/`attach` of a
+  new` starts one agent each (`-p`: the same prompt) and, when attaching
+  (`script::attaching`), attaches to the first (`start_members`); else
+  `script::start_detached` gets the new members only (`--json`: no text from
+  `new_members`, the receipt lists them). `tam run`/`attach` of a
   multi-member task name refuse and list `TASK/MEMBER` names. The TUI's `n`
   flow does the same (`do_new_task`): `tab` picks several projects
   (`PickerState::marked`, in order), and the name of an existing task adds

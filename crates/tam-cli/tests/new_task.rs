@@ -117,14 +117,10 @@ async fn new_task_across_repositories() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let wt = root.join("wt");
-    std::fs::create_dir_all(root.join("config/tam")).unwrap();
-    std::fs::write(
-        root.join("config/tam/config.toml"),
-        format!("[worktree]\nroot = \"{}\"\n", wt.display()),
-    )
-    .unwrap();
     let home = root.join("home");
+    // The default worktree root (no config: macOS reads it from
+    // ~/Library/Application Support, not $XDG_CONFIG_HOME).
+    let wt = home.join("worktrees");
     let src = home.join("src");
     let (api, web, docs) = (
         repo(&src.join("api")),

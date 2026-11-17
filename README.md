@@ -162,6 +162,8 @@ Running `tam` with no arguments opens the dashboard:
 
 Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task, `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), `p` toggles peek (the agent's screen, kept by the daemon at the agent's terminal size; `PgUp`/`PgDn` scroll through its history, `Home` goes to the oldest line, `End` back to live), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
 
+The pane `p` opens tells what the selected task needs from you, without attaching: its agent's state and since when, the permission it waits on (the tool and its input), its question, its last message, why its turn failed, what auto mode refused, its branch against the default branch with its diff stat, its latest messages, and the agent's screen below. `tab` shows the screen on the whole pane. In a task with several members it shows the one that needs you; `←`/`→` show another, and the member keys (`enter`, `s`, `r`, `R`) act on the member shown.
+
 Tasks are sorted by repository name, then by status priority (blocked/question → error → input → running → idle → stale → gone), then by task name.
 
 ### Setup

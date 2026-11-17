@@ -175,6 +175,25 @@ adopt). `tam-cli` depends on all three.
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
   `CLAUDE*` variables, or nested Claude sessions write no transcript.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
+- **Triage pane** — the TUI's detail pane (`p`; `tui/triage.rs`,
+  `ui::render_pane`) tells, for the focused member of the selected task,
+  what it needs from the user without attaching: its state and since when
+  (`AgentInfo.state_since`, stamped by the daemon when it reports the change,
+  "now" while a hook's change is not reported yet; the TUI stamps a
+  `StateChange` itself), the permission it waits on (tool and one-line
+  input: `Pending.summary`) or its question, its last message, why its turn
+  failed, what auto mode refused; without an agent, how its last run ended
+  (`GetTask` runs) or what is wrong with its worktree; its branch against
+  the default branch and its diff stat (`tui/branch.rs`: read-only git with
+  `GIT_OPTIONAL_LOCKS=0`, off the UI thread, for the focused member only,
+  every 10s while shown and after its state changes); its latest messages
+  (`ListMessages`, then `MessageSent`/`MessageDelivered`); its screen below.
+  `tab` shows the screen on the whole pane. Member actions (enter, `s`, `r`,
+  `R`, custom commands) apply to the focused member (`App::focused_member`):
+  the most urgent one; while the pane is open, the one it showed when the
+  selection landed on the task, pinned while the task stays selected (a key
+  never acts on a member the pane did not show), and `←`/`→` move it. The
+  dashboard redraws every second (times in state).
 
 ## Build & check
 

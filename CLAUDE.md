@@ -282,6 +282,22 @@ adopt). `tam-cli` depends on all three.
   136 columns (pane >= 82: an agent's 80-column screen), else below it,
   the list as tall as its rows up to 2/5. The footer keeps the hints that
   fit (`ui::fit_hints`, by priority).
+- **Dashboard input** — prompts (the filter, the picker's filter, the task
+  name, the path) are `tui/input.rs` `TextInput`: cursor movement and
+  editing, drawn with the terminal's cursor. `tui/fuzzy.rs` matches the
+  filter (task, member names, repositories, branches; the list's order
+  kept) and ranks the picker, with positions to highlight. `?` is
+  `Mode::Help` (custom commands included; any key or click closes). The
+  mouse: `mouse_capture` turns on click and wheel reports only (`?1000`,
+  SGR `?1006`: no motion), off before attaching (before the input reader
+  pauses: a report must never reach the agent) and back after.
+  `handle_mouse` uses `App::hits`, where the last draw put the list's rows
+  (task index, member), the pane and the picker's items. Input events are
+  handled in batches (all those queued, then one draw); the screen is
+  fetched again once per batch (`screen_moved`). `n` opens the picker at
+  once (`start_new_task_flow`, with `App::projects` from last time);
+  `discover_projects` runs on a thread, `App::set_projects` merges its
+  result, keeping the filter, picks and highlighted item.
 
 ## Build & check
 

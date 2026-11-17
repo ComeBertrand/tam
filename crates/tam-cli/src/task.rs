@@ -188,12 +188,6 @@ impl Task {
         self.primary().map(|m| m.info.dir.as_path())
     }
 
-    /// Repository names of the members.
-    pub fn repo_name(&self) -> String {
-        let repos: Vec<&str> = self.members.iter().map(|m| m.info.repo.as_str()).collect();
-        repos.join(",")
-    }
-
     pub fn member(&self, id: &str) -> Option<&Member> {
         self.members.iter().find(|m| m.id() == id)
     }
@@ -399,7 +393,6 @@ mod tests {
             ],
         );
         assert_eq!(task.status(), TaskStatus::Block);
-        assert_eq!(task.repo_name(), "app,web");
         assert_eq!(task.member_label(&task.members[1]), "feat/web");
         let task = Task::from_info(snapshot, &[agent("m-2", AgentState::Input)]);
         assert_eq!(task.status(), TaskStatus::Input);

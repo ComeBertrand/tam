@@ -32,6 +32,10 @@ pub struct Peek {
 pub enum Scroll {
     PageUp,
     PageDown,
+    /// Lines up (the mouse wheel).
+    Up(u16),
+    /// Lines down.
+    Down(u16),
     Oldest,
     Live,
 }
@@ -82,19 +86,24 @@ impl Peek {
         // Live again once the pane would reach the live screen's bottom.
         let bottom = screen.live + u64::from(screen.size().0);
         let height = u64::from(self.height);
-        self.from = match scroll {
-            Scroll::PageUp => {
-                let line = shown.saturating_sub(page).max(screen.oldest);
-                if line == shown {
-                    self.from
-                } else {
-                    Some(line)
-                }
+        let up = |lines: u64| {
+            let line = shown.saturating_sub(lines).max(screen.oldest);
+            if line == shown {
+                self.from
+            } else {
+                Some(line)
             }
-            Scroll::PageDown => self
-                .from
-                .map(|_| shown + page)
-                .filter(|line| line + height < bottom),
+        };
+        let down = |lines: u64| {
+            self.from
+                .map(|_| shown + lines)
+                .filter(|line| line + height < bottom)
+        };
+        self.from = match scroll {
+            Scroll::PageUp => up(page),
+            Scroll::PageDown => down(page),
+            Scroll::Up(lines) => up(u64::from(lines)),
+            Scroll::Down(lines) => down(u64::from(lines)),
             Scroll::Oldest if screen.oldest < shown => Some(screen.oldest),
             Scroll::Oldest => self.from,
             Scroll::Live => None,
@@ -363,6 +372,21 @@ mod tests {
         // The next page reaches the live screen's bottom: live again.
         p.scroll(Scroll::PageDown);
         assert_eq!(p.from, None);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_by_lines() {
+        let mut p = peek(&info(20, 4, &lines(21..=23), 20, 10, 20), 3);
+        p.scroll(Scroll::Up(3));
+        assert_eq!(p.from, Some(18));
+        p.scroll(Scroll::Up(20));
+        assert_eq!(p.from, Some(10), "stops at the oldest line");
+        p.scroll(Scroll::Down(3));
+        assert_eq!(p.from, Some(13));
+        for _ in 0..3 {
+            p.scroll(Scroll::Down(3));
+        }
+        assert_eq!(p.from, None, "live again at the bottom");
     }
 
     #[test]

@@ -2,12 +2,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crossterm::event::KeyEvent;
+
 use tam_proto::{AgentInfo, MessageInfo, RunInfo, TaskInfo};
 
 use crate::config::CustomCommand;
 use crate::task::{Member, Task};
 
+use ratatui::layout::Rect;
+
 use super::branch::{self, BranchState, Observation};
+use super::fuzzy::fuzzy;
+use super::input::TextInput;
 use super::peek::Peek;
 
 pub enum Mode {
@@ -17,9 +23,9 @@ pub enum Mode {
     /// checkouts). The name of an existing task adds them to it.
     NewTaskEnterName {
         project_dirs: Vec<PathBuf>,
-        name: String,
+        name: TextInput,
     },
-    SpawnEnterPath(String),
+    SpawnEnterPath(TextInput),
     ConfirmDropTask {
         name: String,
         /// The focused member, when the task has others: it can be dropped
@@ -54,6 +60,8 @@ pub enum Mode {
         /// alone.
         member: Option<MemberChoice>,
     },
+    /// The keys, custom commands included; any key closes it.
+    Help,
 }
 
 /// How the task list is ordered.
@@ -123,6 +131,7 @@ pub struct TaskDetail {
     pub stale: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct PickerItem {
     pub display: String,
     pub id: String,
@@ -131,10 +140,15 @@ pub struct PickerItem {
 pub struct PickerState {
     pub title: String,
     pub items: Vec<PickerItem>,
-    pub filter: String,
+    pub filter: TextInput,
+    /// Index in the filtered items.
     pub selected: usize,
     /// Ids of the items picked with tab, in the order picked.
     pub marked: Vec<String>,
+    /// More items are on their way (projects being discovered).
+    pub loading: bool,
+    /// The first item on screen (kept between draws).
+    pub offset: usize,
 }
 
 impl PickerState {
@@ -142,10 +156,34 @@ impl PickerState {
         Self {
             title: title.into(),
             items,
-            filter: String::new(),
+            filter: TextInput::default(),
             selected: 0,
             marked: Vec::new(),
+            loading: false,
+            offset: 0,
         }
+    }
+
+    /// Replace the items, keeping the highlighted one (by id) when it is
+    /// still there, and the filter and picks.
+    pub fn set_items(&mut self, items: Vec<PickerItem>) {
+        let selected = self.selected_item().map(|item| item.id.clone());
+        self.items = items;
+        self.selected = selected
+            .and_then(|id| self.filtered_items().iter().position(|item| item.id == id))
+            .unwrap_or(0);
+    }
+
+    /// Apply an editing key to the filter: `false` when it is not one.
+    pub fn edit(&mut self, key: KeyEvent) -> bool {
+        let before = self.filter.value().to_string();
+        if !self.filter.handle(key) {
+            return false;
+        }
+        if self.filter.value() != before {
+            self.selected = 0;
+        }
+        true
     }
 
     /// Pick the highlighted item (or unpick it), then move down. Items whose
@@ -166,16 +204,29 @@ impl PickerState {
         self.select_next();
     }
 
-    pub fn filtered_items(&self) -> Vec<&PickerItem> {
+    /// The items the filter matches, the best matches first (in their
+    /// order when they match as well), with the characters matched.
+    pub fn filtered(&self) -> Vec<(&PickerItem, Vec<usize>)> {
         if self.filter.is_empty() {
-            self.items.iter().collect()
-        } else {
-            let lower = self.filter.to_lowercase();
-            self.items
-                .iter()
-                .filter(|item| item.display.to_lowercase().contains(&lower))
-                .collect()
+            return self.items.iter().map(|item| (item, Vec::new())).collect();
         }
+        let mut matched: Vec<(&PickerItem, i32, Vec<usize>)> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                fuzzy(self.filter.value(), &item.display).map(|m| (item, m.score, m.positions))
+            })
+            .collect();
+        // Stable: equal scores keep the items' order.
+        matched.sort_by_key(|(_, score, _)| std::cmp::Reverse(*score));
+        matched
+            .into_iter()
+            .map(|(item, _, positions)| (item, positions))
+            .collect()
+    }
+
+    pub fn filtered_items(&self) -> Vec<&PickerItem> {
+        self.filtered().into_iter().map(|(item, _)| item).collect()
     }
 
     pub fn selected_item(&self) -> Option<&PickerItem> {
@@ -193,16 +244,20 @@ impl PickerState {
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }
+}
 
-    pub fn type_char(&mut self, c: char) {
-        self.filter.push(c);
-        self.selected = 0;
-    }
-
-    pub fn backspace(&mut self) {
-        self.filter.pop();
-        self.selected = 0;
-    }
+/// Where the last draw put what the mouse can act on.
+#[derive(Debug, Default)]
+pub struct Hits {
+    /// The task list's rows (below its column names).
+    pub list: Rect,
+    /// For each row of `list` from its top: the visible task it belongs
+    /// to (its index), and the member it is about.
+    pub rows: Vec<Option<(usize, Option<String>)>>,
+    /// The detail pane.
+    pub pane: Option<Rect>,
+    /// The project picker's items, and the index of the first one shown.
+    pub picker: Option<(Rect, usize)>,
 }
 
 pub struct App {
@@ -212,7 +267,7 @@ pub struct App {
     pub mode: Mode,
     /// The preview pane, when shown.
     pub peek: Option<Peek>,
-    pub filter: String,
+    pub filter: TextInput,
     pub filter_active: bool,
     pub commands: Vec<CustomCommand>,
     /// See [`App::focused_member`].
@@ -226,6 +281,12 @@ pub struct App {
     /// The first row of the task list on screen (kept between draws, so
     /// the list scrolls only when the selection would leave it).
     pub table_offset: usize,
+    /// The projects found under `$HOME` last time (for the picker, while
+    /// they are looked for again).
+    pub projects: Option<Vec<PickerItem>>,
+    /// Projects are being looked for.
+    pub discovering: bool,
+    pub hits: Hits,
 }
 
 impl App {
@@ -236,7 +297,7 @@ impl App {
             status: None,
             mode: Mode::Normal,
             peek: None,
-            filter: String::new(),
+            filter: TextInput::default(),
             filter_active: false,
             commands: Vec::new(),
             focus: None,
@@ -245,6 +306,9 @@ impl App {
             branches: HashMap::new(),
             order: Order::default(),
             table_offset: 0,
+            projects: None,
+            discovering: false,
+            hits: Hits::default(),
         }
     }
 
@@ -253,13 +317,7 @@ impl App {
         let prev_name = self.selected_task().map(|t| t.name.clone());
         self.tasks = tasks;
         self.sort_tasks();
-        if let Some(name) = prev_name {
-            if let Some(pos) = self.tasks.iter().position(|t| t.name == name) {
-                self.selected = pos;
-                return;
-            }
-        }
-        self.clamp_selection();
+        self.reselect(prev_name);
     }
 
     fn sort_tasks(&mut self) {
@@ -320,24 +378,63 @@ impl App {
         rows
     }
 
+    /// The tasks the filter matches (by name, or a member's name,
+    /// repository or branch), in the list's order.
     pub fn visible_tasks(&self) -> Vec<&Task> {
-        if self.filter.is_empty() {
-            self.tasks.iter().collect()
-        } else {
-            let lower = self.filter.to_lowercase();
-            self.tasks
+        let query = self.filter.value();
+        if query.is_empty() {
+            return self.tasks.iter().collect();
+        }
+        let matches = |text: &str| fuzzy(query, text).is_some();
+        self.tasks
+            .iter()
+            .filter(|t| {
+                matches(&t.name)
+                    || t.members.iter().any(|m| {
+                        matches(&m.info.name) || matches(&m.info.repo) || matches(&m.info.branch)
+                    })
+            })
+            .collect()
+    }
+
+    /// Empty the filter, the task found with it still selected.
+    pub fn clear_filter(&mut self) {
+        let prev = self.selected_task().map(|t| t.name.clone());
+        self.filter.clear();
+        self.reselect(prev);
+    }
+
+    /// The project list was looked for: keep it, and show it in the picker
+    /// if it is open.
+    pub fn set_projects(&mut self, projects: Vec<PickerItem>) {
+        self.discovering = false;
+        if let Mode::NewTaskPickProject(picker) = &mut self.mode {
+            let mut items: Vec<PickerItem> = picker
+                .items
                 .iter()
-                .filter(|t| {
-                    t.name.to_lowercase().contains(&lower)
-                        || t.repo_name().to_lowercase().contains(&lower)
-                        || t.members.iter().any(|m| {
-                            m.info.dir.to_string_lossy().to_lowercase().contains(&lower)
-                                || m.agent_info
-                                    .as_ref()
-                                    .is_some_and(|a| a.provider.to_lowercase().contains(&lower))
-                        })
-                })
-                .collect()
+                .filter(|item| item.id.starts_with("__"))
+                .cloned()
+                .collect();
+            items.extend(projects.iter().cloned());
+            picker.set_items(items);
+            picker.loading = false;
+        }
+        self.projects = Some(projects);
+    }
+
+    /// Select the visible task at `index` (e.g. clicked), focusing
+    /// `member` when the pane shows one.
+    pub fn select_at(&mut self, index: usize, member: Option<String>) {
+        if index >= self.visible_tasks().len() {
+            return;
+        }
+        self.selected = index;
+        self.sync_focus();
+        let Some(member) = member.filter(|_| self.peek.is_some()) else {
+            return;
+        };
+        if let Some(task) = self.selected_task().map(|t| t.name.clone()) {
+            self.focus = Some(Focus { task, member });
         }
     }
 

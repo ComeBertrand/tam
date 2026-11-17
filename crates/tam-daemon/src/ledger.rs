@@ -33,7 +33,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tam_proto::{MemberHealth, MemberInfo, MessageInfo, NewMember, RunInfo, TaskInfo};
+use tam_proto::{
+    AgentResponse, MemberHealth, MemberInfo, MessageInfo, NewMember, RunInfo, TaskInfo,
+};
 
 /// A single event recorded in the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +77,10 @@ pub enum LedgerEvent {
         member: String,
         exit_code: i32,
         timestamp: u64,
+        /// The response that ended the run's last turn (`tam result`), when
+        /// its agent had one at the end.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<AgentResponse>,
     },
     WorktreeDeleted {
         task: String,
@@ -197,6 +203,9 @@ struct MemberRecord {
     branch: String,
     dir: PathBuf,
     runs: Vec<RunInfo>,
+    /// The response that ended the last turn of the latest run, once the
+    /// run is over (see `Ledger::last_response`).
+    response: Option<AgentResponse>,
     /// Member events, kept for compaction, tagged with their order.
     events: Vec<(usize, LedgerEvent)>,
     /// Messages to this member, in the order they were sent.
@@ -621,6 +630,17 @@ impl Ledger {
     /// Record the end of the member's open run. Returns the updated task, or
     /// `None` when there was no open run (nothing recorded).
     pub fn run_ended(&mut self, member: &str, exit_code: i32) -> Result<Option<TaskInfo>> {
+        self.run_ended_with(member, exit_code, None)
+    }
+
+    /// Record the end of the member's open run with the response that ended
+    /// its last turn (see `run_ended`).
+    pub fn run_ended_with(
+        &mut self,
+        member: &str,
+        exit_code: i32,
+        response: Option<AgentResponse>,
+    ) -> Result<Option<TaskInfo>> {
         if !self.has_open_run(member) {
             return Ok(None);
         }
@@ -628,8 +648,18 @@ impl Ledger {
             member: member.into(),
             exit_code,
             timestamp: now(),
+            response,
         })?;
         Ok(self.member_task(member).and_then(|t| self.task(t)))
+    }
+
+    /// The response that ended the last turn of the member's latest run,
+    /// once that run is over (while it runs, its agent has it). `None` when
+    /// it ended before a turn did, or mid-turn.
+    pub fn last_response(&self, member: &str) -> Option<AgentResponse> {
+        let record = self.state.members.get(member)?;
+        let ended = record.runs.last().is_some_and(|r| r.ended_at.is_some());
+        record.response.clone().filter(|_| ended)
     }
 
     /// Forget a task and its members. Their open runs, if any, are ended
@@ -863,6 +893,7 @@ impl State {
                     branch: branch.clone(),
                     dir: dir.clone(),
                     runs: Vec::new(),
+                    response: None,
                     events: Vec::new(),
                     messages: Vec::new(),
                 };
@@ -891,14 +922,18 @@ impl State {
                         provider,
                         session_id,
                         timestamp,
-                    } => record.runs.push(RunInfo {
-                        member: member.clone(),
-                        provider: provider.clone(),
-                        session_id: session_id.clone(),
-                        started_at: *timestamp,
-                        ended_at: None,
-                        exit_code: None,
-                    }),
+                    } => {
+                        record.runs.push(RunInfo {
+                            member: member.clone(),
+                            provider: provider.clone(),
+                            session_id: session_id.clone(),
+                            started_at: *timestamp,
+                            ended_at: None,
+                            exit_code: None,
+                        });
+                        // The new run has no turn yet.
+                        record.response = None;
+                    }
                     LedgerEvent::AgentSessionIdentified { session_id, .. } => {
                         if let Some(run) = record.runs.last_mut() {
                             run.session_id.get_or_insert_with(|| session_id.clone());
@@ -907,11 +942,13 @@ impl State {
                     LedgerEvent::AgentRunEnded {
                         exit_code,
                         timestamp,
+                        response,
                         ..
                     } => {
                         if let Some(run) = record.runs.last_mut().filter(|r| r.ended_at.is_none()) {
                             run.ended_at = Some(*timestamp);
                             run.exit_code = Some(*exit_code);
+                            record.response = response.clone();
                         }
                     }
                     _ => unreachable!(),
@@ -1302,6 +1339,7 @@ impl Migration {
                     member,
                     exit_code,
                     timestamp,
+                    response: None,
                 }),
             ),
         };
@@ -1576,6 +1614,7 @@ mod tests {
             branch: "main".into(),
             dir: "/1".into(),
             runs: vec![],
+            response: None,
             events: vec![],
             messages: vec![],
         };
@@ -1868,6 +1907,7 @@ mod tests {
                     member: "m-ghost".into(),
                     exit_code: 0,
                     timestamp: 6,
+                    response: None,
                 },
                 member_added("ghost", "m-x", "/x", 7),
             ],
@@ -2308,6 +2348,7 @@ mod tests {
             member: "m-1".into(),
             exit_code: 0,
             timestamp: ts,
+            response: None,
         };
         write_lines(
             &path,
@@ -2434,5 +2475,44 @@ mod tests {
             .unwrap();
         assert_eq!(answer.reply_to.as_deref(), Some(question.id.as_str()));
         assert_eq!(ledger.unanswered_message(&a, &b, 0), None);
+    }
+
+    #[test]
+    fn last_response_outlives_the_run_and_a_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let response = AgentResponse {
+            text: "All done.\nDetails…".into(),
+            at: 42,
+        };
+        let member = {
+            let mut ledger = open(&tmp);
+            let member = create(&mut ledger, "feat", "/w/feat");
+            ledger.run_started(&member, "claude", None).unwrap();
+            // While the run goes on, its agent has the response.
+            assert_eq!(ledger.last_response(&member), None);
+            ledger
+                .run_ended_with(&member, 0, Some(response.clone()))
+                .unwrap();
+            assert_eq!(ledger.last_response(&member), Some(response.clone()));
+            member
+        };
+        // Read back as a current event, not mistaken for a legacy one.
+        let ledger = open(&tmp);
+        assert_eq!(ledger.last_response(&member), Some(response.clone()));
+        assert_eq!(ledger.member_runs(&member)[0].exit_code, Some(0));
+        assert_eq!(event_types(&path).last().unwrap(), "agent_run_ended");
+        drop(ledger);
+
+        // A new run starts with none, and keeps none if it ends before a
+        // turn does.
+        let mut ledger = open(&tmp);
+        ledger.run_started(&member, "claude", None).unwrap();
+        assert_eq!(ledger.last_response(&member), None);
+        ledger.run_ended(&member, -1).unwrap();
+        assert_eq!(ledger.last_response(&member), None);
+        let ended = std::fs::read_to_string(&path).unwrap();
+        let last = ended.lines().last().unwrap();
+        assert!(!last.contains("response"), "{last}");
     }
 }

@@ -85,10 +85,13 @@ tam
 ```
 tam new NAME                   Create task: branch NAME and its worktree, in the current repo
 tam new NAME -s REF            Branch from a specific ref
+tam new NAME -p TEXT           Start its agent on a prompt
+tam new NAME -d                Don't attach to the agent (--json: print a receipt)
 
 tam run NAME                   Start the task's agent, resuming its current session
 tam run NAME --new-session     Start a new session instead
 tam run NAME --session ID      Resume a given agent session
+tam run NAME -p TEXT -d        On a prompt, without attaching (--json: print a receipt)
 
 tam stop NAME                  Kill the task's agents (task persists)
 tam stop                       Resolve the member from the current directory
@@ -141,6 +144,137 @@ tam peers --all                ...of every task (--json: machine-readable)
 A Claude agent gets a message right away: when idle it wakes up, when busy it reads it at its next step (after a pending permission prompt is answered). Other agents get it typed in once idle. A member with no running agent gets it when its next agent starts. Sent from inside an agent TAM started, a message comes from that agent, which the recipient can answer with `tam msg`; otherwise it comes from you. The reply `--wait` prints is the recipient's next message back, or its response at the end of the turn that got the message. Two agents answering each other are stopped after 6 messages, until you prompt one of them; an agent sends at most 20 messages per 10 minutes.
 
 An agent TAM starts knows its task. A Claude agent is told when its session starts (again on resume, `/clear` and compaction): its task, its name, and the other members with their repositories and worktrees, so a backend and a frontend session can agree on an API without you relaying. Other agents have their member id in `$TAM_AGENT_ID` and can run `tam peers`. From an agent, `tam msg`, `tam run`, `tam stop` and `tam attach` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
+
+### Scripting
+
+For agents and scripts: nothing waits on a terminal, exit statuses tell what happened, and `--json` output has a versioned shape.
+
+```
+tam new NAME -p TEXT -d --json Create a task, start its agent on a prompt, print a receipt
+tam run NAME -p TEXT -d --json Start the agent on a prompt, print a receipt
+tam wait NAME                  Wait until the task's agents stop working; print their states
+tam wait NAME -u input -t 30m  ... until they wait for input, for at most 30 minutes
+tam result NAME                Print the last response of the task's agents
+tam ps --json                  Every task, as JSON
+```
+
+`tam new` and `tam run` attach only when stdin and stdout are terminals: otherwise they start the agent and say so. `tam wait` returns once each agent is in one of the `--until` states, comma-separated: `working`, `blocked`, `input`, `idle`, `question`, `error`, `exit` (no agent runs). The default is any state but `working`. `input` takes in `idle`, since agents without hooks never report `input`. It gives up at once when an agent exits or its turn fails, unless `--until` takes `exit` or `error`. `tam result` prints the response that ended the agent's last turn, in full; it is still there once the agent exited, or the daemon restarted. There is none while a turn runs, before the first turn of a run ends, after a failed or interrupted turn, and for agents other than Claude. For `wait` and `result`, NAME is a task (all its members), TASK/MEMBER or a member id. Both report what they find: right after `tam msg`, an agent that has not picked the message up yet is still `input`, with its previous response. `tam msg --wait` waits for the reply instead, and `response_at` tells when a response came.
+
+Claude asks whether to trust a folder it does not know yet, and runs no hook until it is answered: a detached agent in a new worktree waits there (`tam wait` sees `input` after 10s, and `tam result` has nothing). Attach once to answer it.
+
+| Exit status | Meaning | `error.kind` |
+|---|---|---|
+| 0 | Done | |
+| 1 | Failed; `tam wait` gave up; `tam result` has no response | `failed`, `unreachable`, `no_result` |
+| 2 | Invalid arguments (reported as text by the argument parser) | |
+| 3 | No such task or member, or a task name where one member is needed | `not_found` |
+| 4 | `tam wait` timed out | `timeout` |
+| 5 | The daemon cannot be reached, or broke off | `daemon` |
+
+With `--json`, stdout holds one JSON document and nothing else, also when the command fails: its `error` is then `{"kind": …, "message": …}`, next to what could still be reported (a command with nothing to report prints only `schema_version` and `error`). Every document has `"schema_version": 1`, raised only when a key is removed, renamed or retyped: new keys may come. Every key is always present, `null` when it has no value.
+
+`tam ps --json`, tasks most urgent first:
+
+```json
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "name": "feat",
+      "status": "input",
+      "dir": "/home/me/worktrees/app--feat",
+      "agent": "claude",
+      "context_percent": 34,
+      "run_count": 2,
+      "last_activity": 1763400000,
+      "created_at": 1763300000,
+      "members": [
+        {
+          "id": "m-1a2b3c4d",
+          "name": "app",
+          "repo": "app",
+          "branch": "feat",
+          "dir": "/home/me/worktrees/app--feat",
+          "status": "input",
+          "agent": "claude",
+          "health": { "state": "ok", "branch": "feat" },
+          "label": "feat",
+          "repo_root": "/home/me/src/app",
+          "state": "input",
+          "pid": 4242,
+          "viewers": 0,
+          "context_percent": 34,
+          "session_id": "8c1f2a90-…",
+          "pending": null,
+          "turn_error": null,
+          "denied": null,
+          "last_message": "Fixed the bug: …",
+          "last_run": {
+            "provider": "claude",
+            "session_id": "8c1f2a90-…",
+            "started_at": 1763390000,
+            "ended_at": null,
+            "exit_code": null
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `status` (of a task: its most urgent member's) is `run`, `input`, `block`, `question`, `error`, `idle`, `stale` or `gone`. `state` is the running agent's: `working`, `blocked`, `input`, `idle`, `question` or `error`; `null` without one. A task's `dir`, `agent` and `context_percent` are its first member's.
+- `pending` (while `blocked` or `question`) is `{"tool", "summary"}`, `turn_error` (while `error`) `{"kind", "message"}`, `denied` (the last tool call auto mode refused in this turn) `{"tool", "summary", "reason"}`.
+- `session_id` is the running agent's session, else the last run's. `last_message` is the start of the agent's last response: `tam result` has all of it. A run's `exit_code` is -1 when it was stopped.
+- `health` is what the daemon saw in git: `{"state": "ok", "branch"}`, `{"state": "gone", "cannot_repair"}` or `{"state": "broken", "problem"}`; `null` until checked.
+- Before version 1, `tam ps --json` printed the `tasks` array alone, with the keys up to `last_activity` (tasks) and `health` (members).
+
+`tam new --json` and `tam run --json`: the task's members (`new`) or the one started (`run`). `agent` is `null` when none started, `resumed_session` is `null` for a new session.
+
+```json
+{
+  "schema_version": 1,
+  "task": "feat",
+  "members": [
+    {
+      "id": "m-1a2b3c4d",
+      "name": "app",
+      "label": "feat",
+      "repo": "app",
+      "branch": "feat",
+      "dir": "/home/me/worktrees/app--feat",
+      "agent": "claude",
+      "resumed_session": null
+    }
+  ],
+  "error": null
+}
+```
+
+`tam wait --json` and `tam result --json`: `state` is the agent's, or `exit` when none runs; `exit_code` then tells how its last run ended. `response` is the full text that ended the last turn, `response_at` when.
+
+```json
+{
+  "schema_version": 1,
+  "task": "feat",
+  "members": [
+    {
+      "id": "m-1a2b3c4d",
+      "name": "app",
+      "label": "feat",
+      "state": "input",
+      "agent": "claude",
+      "session_id": "8c1f2a90-…",
+      "exit_code": null,
+      "pending": null,
+      "turn_error": null,
+      "response": "Fixed the bug: …",
+      "response_at": 1763400000
+    }
+  ],
+  "error": null
+}
+```
 
 ### TUI
 

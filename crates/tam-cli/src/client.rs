@@ -7,14 +7,16 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use tam_proto::{
-    AgentInfo, MemberInfo, NewMember, Request, Response, RunInfo, ScreenInfo, ServerMessage,
-    SessionChoice, TaskInfo, WorktreeReport,
+    AgentInfo, MemberInfo, MemberOutcome, MemberState, NewMember, Request, Response, RunInfo,
+    ScreenInfo, ServerMessage, SessionChoice, TaskInfo, WorktreeReport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{sleep_until, Duration, Instant};
+
+use crate::script::{self, ErrorKind};
 
 const DETACH_KEY: u8 = 0x1d; // ctrl-]
 
@@ -75,7 +77,7 @@ impl Client {
         let stream = match UnixStream::connect(&socket_path).await {
             Ok(s) => s,
             Err(_) => {
-                Self::start_daemon()?;
+                Self::start_daemon().map_err(daemon_error)?;
                 // Poll until daemon is ready (up to 2s)
                 let mut attempts = 0;
                 loop {
@@ -87,7 +89,10 @@ impl Client {
                             continue;
                         }
                         Err(e) => {
-                            return Err(e).context("failed to connect to daemon after starting it");
+                            return Err(daemon_error(
+                                anyhow::Error::new(e)
+                                    .context("failed to connect to daemon after starting it"),
+                            ));
                         }
                     }
                 }
@@ -115,11 +120,14 @@ impl Client {
         match resp {
             Response::Hello { .. } => Ok(()),
             Response::Error { message } if message.contains("protocol version mismatch") => {
-                anyhow::bail!("{}", message);
+                Err(script::error(ErrorKind::Daemon, message))
             }
             Response::Error { .. } => {
                 // Old daemon that doesn't understand Hello — suggest restart
-                anyhow::bail!("daemon is running an older version. Run 'tam shutdown' then retry.");
+                Err(script::error(
+                    ErrorKind::Daemon,
+                    "daemon is running an older version. Run 'tam shutdown' then retry.",
+                ))
             }
             _ => Ok(()),
         }
@@ -157,7 +165,9 @@ impl Client {
     pub async fn send(&mut self, request: Request) -> Result<Response> {
         let mut json = serde_json::to_string(&request)?;
         json.push('\n');
-        self.writer.write_all(json.as_bytes()).await?;
+        self.writer.write_all(json.as_bytes()).await.map_err(|e| {
+            daemon_error(anyhow::Error::new(e).context("lost connection to daemon"))
+        })?;
 
         loop {
             match self.next_message().await? {
@@ -184,12 +194,18 @@ impl Client {
             .reader
             .read_until(b'\n', &mut self.line)
             .await
-            .context("lost connection to daemon")?;
+            .context("lost connection to daemon")
+            .map_err(daemon_error)?;
         if n == 0 {
-            anyhow::bail!("lost connection to daemon");
+            return Err(script::error(
+                ErrorKind::Daemon,
+                "lost connection to daemon",
+            ));
         }
         let line = std::mem::take(&mut self.line);
-        serde_json::from_slice(line.trim_ascii()).context("failed to parse daemon message")
+        serde_json::from_slice(line.trim_ascii())
+            .context("failed to parse daemon message")
+            .map_err(daemon_error)
     }
 
     /// Receive pushed daemon events on this connection (see `read_message`).
@@ -218,6 +234,7 @@ impl Client {
     pub async fn get_task(&mut self, name: &str) -> Result<(TaskInfo, Vec<RunInfo>)> {
         match self.send(Request::GetTask { name: name.into() }).await? {
             Response::Task { task, runs } => Ok((task, runs)),
+            Response::Error { message } => Err(script::error(ErrorKind::NotFound, message)),
             other => Err(unexpected("GetTask", other)),
         }
     }
@@ -251,6 +268,7 @@ impl Client {
         };
         match self.send(request).await? {
             Response::Member { task, member, runs } => Ok((task, *member, runs)),
+            Response::Error { message } => Err(script::error(ErrorKind::NotFound, message)),
             other => Err(unexpected("ResolveMember", other)),
         }
     }
@@ -488,14 +506,51 @@ impl Client {
 
         Ok(())
     }
+
+    /// What the agents of `members` (each what `ResolveMember` takes) are
+    /// doing, and the responses that ended their last turns.
+    pub async fn outcomes(&mut self, members: Vec<String>) -> Result<Vec<MemberOutcome>> {
+        match self.send(Request::GetOutcomes { members }).await? {
+            Response::Outcomes { members, .. } => Ok(members),
+            other => Err(unexpected("GetOutcomes", other)),
+        }
+    }
+
+    /// Wait until the agents of `members` settle in one of `until` (see
+    /// `Request::WaitAgents`). Returns what they are doing then, and
+    /// whether the time ran out first. Holds the connection meanwhile.
+    pub async fn wait_agents(
+        &mut self,
+        members: Vec<String>,
+        until: Vec<MemberState>,
+        timeout_secs: Option<u64>,
+    ) -> Result<(Vec<MemberOutcome>, bool)> {
+        let request = Request::WaitAgents {
+            members,
+            until,
+            timeout_secs,
+        };
+        match self.send(request).await? {
+            Response::Outcomes { members, timed_out } => Ok((members, timed_out)),
+            other => Err(unexpected("WaitAgents", other)),
+        }
+    }
 }
 
 /// Turn a daemon error (or an unexpected reply) into an error.
 fn unexpected(request: &str, response: Response) -> anyhow::Error {
     match response {
         Response::Error { message } => anyhow::anyhow!("{message}"),
-        other => anyhow::anyhow!("unexpected response to {request}: {other:?}"),
+        other => script::error(
+            ErrorKind::Daemon,
+            format!("unexpected response to {request}: {other:?}"),
+        ),
     }
+}
+
+/// The daemon could not be reached, or broke off (exit status 5).
+fn daemon_error(err: anyhow::Error) -> anyhow::Error {
+    script::error(ErrorKind::Daemon, format!("{err:#}"))
 }
 
 /// Resize an agent's PTY. Sent on a separate control connection because the

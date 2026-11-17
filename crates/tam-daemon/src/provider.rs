@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
-use tam_proto::{AgentDetail, AgentError, AgentState, DeniedTool, Pending};
+use tam_proto::{AgentDetail, AgentError, AgentResponse, AgentState, DeniedTool, Pending};
 
 /// Context window usage for an agent.
 pub struct ContextUsage {
@@ -32,6 +32,9 @@ pub struct HookData {
     /// it can be resumed into later. A session nobody typed in has no
     /// transcript yet, and resuming it fails.
     pub resumable_session: Option<String>,
+    /// The response that ended the agent's last turn, in full (`detail`
+    /// keeps an excerpt for every `AgentInfo`); `None` while a turn runs.
+    pub response: Option<AgentResponse>,
 }
 
 /// Outcome of a hook event for a provider.
@@ -164,6 +167,8 @@ const CLAUDE_SILENT_WORKING_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_MESSAGE_LEN: usize = 2000;
 /// Longest one-line summary of a tool call or question.
 const MAX_SUMMARY_LEN: usize = 200;
+/// Longest response kept in full (`HookData::response`).
+const MAX_RESPONSE_LEN: usize = 100_000;
 
 impl ClaudeProvider {
     /// A provider whose hooks run `hook_command`.
@@ -391,6 +396,7 @@ fn claude_handle_hook(
             detail.denied = None;
             // Belongs to the previous turn (an interrupted turn has none)
             detail.last_message = None;
+            data.response = None;
             Some(AgentState::Working)
         }
         // Registered for AskUserQuestion only: the question shows before
@@ -442,6 +448,10 @@ fn claude_handle_hook(
             detail.error = None;
             detail.last_message =
                 str_field(p, "last_assistant_message").map(|m| truncate(m, MAX_MESSAGE_LEN));
+            data.response = str_field(p, "last_assistant_message").map(|m| AgentResponse {
+                text: truncate(m, MAX_RESPONSE_LEN),
+                at: crate::ledger::now(),
+            });
             Some(AgentState::Input)
         }
         "StopFailure" => {
@@ -1655,5 +1665,45 @@ mod tests {
             assert!(paste.starts_with(b"\x1b[200~[tam] Message"));
             assert!(paste.ends_with(b"user:\nhi\x1b[201~"));
         }
+    }
+
+    #[test]
+    fn claude_response_is_kept_in_full_until_the_next_prompt() {
+        let mut d = HookData::default();
+        let long = "x".repeat(MAX_MESSAGE_LEN * 3);
+        hook(
+            "Stop",
+            serde_json::json!({"last_assistant_message": long}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert_eq!(d.response.as_ref().unwrap().text, long);
+        assert!(d.response.as_ref().unwrap().at > 0);
+        // The excerpt every client gets stays short.
+        assert!(d.detail.last_message.as_ref().unwrap().chars().count() <= MAX_MESSAGE_LEN + 1);
+
+        // Hooks that are not about the turn keep it.
+        hook(
+            "SessionStart",
+            serde_json::json!({"session_id": "s1", "source": "resume"}),
+            AgentState::Input,
+            &mut d,
+        );
+        assert!(d.response.is_some());
+        hook(
+            "UserPromptSubmit",
+            serde_json::json!({"prompt": "more"}),
+            AgentState::Input,
+            &mut d,
+        );
+        assert!(d.response.is_none());
+        // A failed turn has none.
+        hook(
+            "StopFailure",
+            serde_json::json!({"error": "rate_limit", "last_assistant_message": "API Error"}),
+            AgentState::Working,
+            &mut d,
+        );
+        assert!(d.response.is_none());
     }
 }

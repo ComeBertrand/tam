@@ -35,18 +35,34 @@ mod task;
 mod tui;
 
 mod output;
+mod schema;
+mod script;
 
 use cli::{Cli, Commands};
 use tam_proto::{MemberInfo, RunInfo, SessionChoice, TaskInfo};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    let json = cli.command.as_ref().is_some_and(script::json_output);
+    if let Err(e) = run(cli).await {
+        // Its exit status tells scripts why (see `script::ErrorKind`).
+        std::process::exit(script::fail(&e, json));
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let config = config::load_config()?;
 
     let command = match cli.command {
         Some(cmd) => cmd,
-        None => return tui::run().await,
+        None => {
+            anyhow::ensure!(
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+                "the dashboard needs a terminal (tam --help lists the commands)"
+            );
+            return tui::run().await;
+        }
     };
 
     match command {
@@ -54,6 +70,9 @@ async fn main() -> Result<()> {
             name,
             source,
             no_start,
+            prompt,
+            detach,
+            json,
         } => {
             let mut client = client::Client::connect().await?;
             if client.list_tasks().await?.iter().any(|t| t.name == name) {
@@ -70,16 +89,25 @@ async fn main() -> Result<()> {
 
             let task = client.create_task(&name, vec![member]).await?;
             let member = task.members[0].clone();
-            println!("Created task '{}' at {}", name, member.dir.display());
+            if !json {
+                println!("Created task '{}' at {}", name, member.dir.display());
+            }
 
-            if !no_start {
-                let start = Start {
-                    agent: None,
-                    session: SessionChoice::New,
-                    prompt: None,
-                    args: vec![],
-                };
-                run_and_attach(&mut client, &task, &member, &config, start).await?;
+            let start = (!no_start).then_some(Start {
+                agent: None,
+                session: SessionChoice::New,
+                prompt,
+                args: vec![],
+            });
+            match start {
+                Some(start) if script::attaching(detach || json) => {
+                    run_and_attach(&mut client, &task, &member, &config, start).await?
+                }
+                start => {
+                    let members = &task.members;
+                    script::start_detached(&mut client, &task, members, &config, start, json)
+                        .await?
+                }
             }
         }
 
@@ -90,6 +118,9 @@ async fn main() -> Result<()> {
             agent,
             prompt,
             args,
+            prompt_option,
+            detach,
+            json,
         } => {
             let mut client = client::Client::connect().await?;
             let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
@@ -104,10 +135,16 @@ async fn main() -> Result<()> {
             let start = Start {
                 agent,
                 session,
-                prompt,
+                prompt: prompt_option.or(prompt),
                 args,
             };
-            run_and_attach(&mut client, &task, &member, &config, start).await?;
+            if script::attaching(detach || json) {
+                run_and_attach(&mut client, &task, &member, &config, start).await?;
+            } else {
+                let members = std::slice::from_ref(&member);
+                script::start_detached(&mut client, &task, members, &config, Some(start), json)
+                    .await?;
+            }
         }
 
         Commands::Stop { name } => {
@@ -281,6 +318,9 @@ async fn main() -> Result<()> {
             // Fresh worktree health from the daemon.
             let infos = client.reconcile().await?;
             let agents = client.list_agents().await.unwrap_or_default();
+            if json {
+                return script::ps(&mut client, infos, &agents).await;
+            }
 
             let mut tasks: Vec<task::Task> = infos
                 .into_iter()
@@ -289,40 +329,7 @@ async fn main() -> Result<()> {
 
             tasks.sort_by_key(|t| (t.status().sort_priority(), t.name.clone()));
 
-            if json {
-                let entries: Vec<serde_json::Value> = tasks
-                    .iter()
-                    .map(|t| {
-                        let members: Vec<serde_json::Value> = t
-                            .members
-                            .iter()
-                            .map(|m| {
-                                serde_json::json!({
-                                    "id": m.info.id,
-                                    "name": m.info.name,
-                                    "repo": m.info.repo,
-                                    "branch": m.info.branch,
-                                    "dir": m.info.dir,
-                                    "status": t.member_status(m).to_string(),
-                                    "agent": m.agent_info.as_ref().map(|a| &a.provider),
-                                    "health": m.info.health,
-                                })
-                            })
-                            .collect();
-                        serde_json::json!({
-                            "name": t.name,
-                            "status": t.status().to_string(),
-                            "dir": t.dir(),
-                            "agent": t.agent_info().map(|a| &a.provider),
-                            "context_percent": t.agent_info().and_then(|a| a.context_percent),
-                            "run_count": t.run_count,
-                            "last_activity": t.last_activity,
-                            "members": members,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&entries)?);
-            } else if tasks.is_empty() {
+            if tasks.is_empty() {
                 println!("No tasks.");
             } else {
                 println!(
@@ -511,6 +518,15 @@ async fn main() -> Result<()> {
         }
 
         Commands::Peers { all, json, from } => peers::peers(all, json, from).await?,
+
+        Commands::Wait {
+            name,
+            until,
+            timeout,
+            json,
+        } => script::wait(name, until, timeout, json).await?,
+
+        Commands::Result { name, json } => script::result(name, json).await?,
     }
 
     Ok(())
@@ -574,7 +590,10 @@ async fn resolve_member(
             client
                 .resolve_member(None, Some(&cwd))
                 .await
-                .map_err(|_| anyhow::anyhow!("no task in current directory"))
+                .map_err(|e| match script::kind_of(&e) {
+                    script::ErrorKind::Daemon => e,
+                    _ => script::error(script::ErrorKind::NotFound, "no task in current directory"),
+                })
         }
     }
 }

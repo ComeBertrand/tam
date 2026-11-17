@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use tam_proto::{AgentInfo, AgentState, ScreenInfo};
+use tam_proto::{AgentInfo, AgentResponse, AgentState, ScreenInfo};
 use tokio::sync::{broadcast, watch};
 use tracing::error;
 
@@ -425,6 +425,12 @@ impl Agent {
     /// Bytes that type `text` into the agent's input (Enter not included).
     pub fn pty_input(&self, text: &str) -> Vec<u8> {
         self.provider.pty_input(text)
+    }
+
+    /// The response that ended the agent's last turn, in full, as its hooks
+    /// reported it; `None` while a turn runs or before the first one ends.
+    pub fn response(&self) -> Option<&AgentResponse> {
+        self.hook_data.response.as_ref()
     }
 }
 

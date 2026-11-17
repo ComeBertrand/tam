@@ -520,6 +520,133 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<String>,
     },
+    /// What the agents of task members are doing now, with the responses
+    /// that ended their last turns. Replies `Outcomes`, in the order asked.
+    GetOutcomes {
+        /// What `ResolveMember` takes as a target, each: a member id, a task
+        /// name (its only member) or `<task>/<member>`.
+        members: Vec<String>,
+    },
+    /// Wait until the agents of task members settle: each one's state is
+    /// one of `until` (see `MemberState::satisfies`). Gives up as soon as
+    /// an agent exits or its turn fails (`exit`, `error`) when `until` does
+    /// not take that state: it would not move on without someone acting.
+    /// Replies `Outcomes` then, or with `timed_out` once `timeout_secs` have
+    /// passed. The reply may take long: send it on a connection of its own.
+    WaitAgents {
+        /// As `GetOutcomes` takes them.
+        members: Vec<String>,
+        /// Empty: any state but `working` (`MemberState::SETTLED`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        until: Vec<MemberState>,
+        /// `None`: no limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
+}
+
+/// What the agent of a task member is doing: its state, or `Exit` when no
+/// agent runs for the member (it exited, was stopped, or never started).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberState {
+    Working,
+    Blocked,
+    Input,
+    Idle,
+    Question,
+    Error,
+    Exit,
+}
+
+impl MemberState {
+    /// Every state but `Working`: the agent waits on someone, or is gone.
+    pub const SETTLED: [MemberState; 6] = [
+        Self::Blocked,
+        Self::Input,
+        Self::Idle,
+        Self::Question,
+        Self::Error,
+        Self::Exit,
+    ];
+
+    /// Whether a member in this state is one `until` waits for. `Input`
+    /// takes in `Idle`: agents tam knows only by their output (no hooks)
+    /// are never `input`, they go `idle` once quiet.
+    pub fn satisfies(self, until: &[MemberState]) -> bool {
+        until.contains(&self) || (self == Self::Idle && until.contains(&Self::Input))
+    }
+}
+
+impl From<AgentState> for MemberState {
+    fn from(state: AgentState) -> Self {
+        match state {
+            AgentState::Working => Self::Working,
+            AgentState::Blocked => Self::Blocked,
+            AgentState::Input => Self::Input,
+            AgentState::Idle => Self::Idle,
+            AgentState::Question => Self::Question,
+            AgentState::Error => Self::Error,
+        }
+    }
+}
+
+impl std::fmt::Display for MemberState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Working => write!(f, "working"),
+            Self::Blocked => write!(f, "blocked"),
+            Self::Input => write!(f, "input"),
+            Self::Idle => write!(f, "idle"),
+            Self::Question => write!(f, "question"),
+            Self::Error => write!(f, "error"),
+            Self::Exit => write!(f, "exit"),
+        }
+    }
+}
+
+/// The response that ended an agent's turn, as its hooks reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentResponse {
+    /// The text, in full (`AgentDetail::last_message` is an excerpt).
+    pub text: String,
+    /// Unix timestamp (seconds) of the end of the turn.
+    pub at: u64,
+}
+
+/// A task member's agent, as `GetOutcomes` and `WaitAgents` report it: what
+/// it is doing, and the response that ended its last turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberOutcome {
+    /// Member id.
+    pub member: String,
+    pub task: String,
+    /// How to name the member (see `TaskInfo::member_label`).
+    pub label: String,
+    pub state: MemberState,
+    /// The running agent, else the agent of the member's last run; `None`
+    /// when the member never ran one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The running agent's session as its hooks report it, else the
+    /// session of the member's last run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// How the member's last run ended (-1: stopped), while no agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// What the agent waits on, while `blocked` or `question`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Pending>,
+    /// Why the last turn failed, while `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AgentError>,
+    /// The response that ended the last turn of the member's latest run,
+    /// kept once the run is over. `None` while a turn runs (a prompt clears
+    /// it), until the run's first turn ends, when the turn failed or was
+    /// interrupted, and for agents whose hooks report none (all but Claude).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<AgentResponse>,
 }
 
 /// Which session a member's agent starts in.
@@ -623,6 +750,13 @@ pub enum Response {
     /// `SessionStart` of a member's agent: its task and the other members.
     HookContext {
         context: String,
+    },
+    /// What members' agents are doing (`GetOutcomes`, `WaitAgents`).
+    Outcomes {
+        members: Vec<MemberOutcome>,
+        /// `WaitAgents` ran out of time before they settled.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        timed_out: bool,
     },
 }
 
@@ -1675,5 +1809,114 @@ mod tests {
             Request::ResolveMember { target: Some(t), dir: None, from: Some(f) }
                 if t == "web" && f == "m-00000001"
         ));
+    }
+
+    #[test]
+    fn outcome_requests_wire_format() {
+        let req = Request::WaitAgents {
+            members: vec!["feat".into()],
+            until: vec![],
+            timeout_secs: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"type":"wait_agents","members":["feat"]}"#
+        );
+        let req: Request = serde_json::from_str(
+            r#"{"type":"wait_agents","members":["m-1"],"until":["input","exit"],"timeout_secs":30}"#,
+        )
+        .unwrap();
+        match req {
+            Request::WaitAgents {
+                members,
+                until,
+                timeout_secs,
+            } => {
+                assert_eq!(members, ["m-1"]);
+                assert_eq!(until, [MemberState::Input, MemberState::Exit]);
+                assert_eq!(timeout_secs, Some(30));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&Request::GetOutcomes {
+                members: vec!["feat/api".into()]
+            })
+            .unwrap(),
+            r#"{"type":"get_outcomes","members":["feat/api"]}"#
+        );
+    }
+
+    #[test]
+    fn member_states_follow_agent_states() {
+        for state in [
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Input,
+            AgentState::Idle,
+            AgentState::Question,
+            AgentState::Error,
+        ] {
+            let member = MemberState::from(state);
+            assert_eq!(member.to_string(), state.to_string());
+            assert_eq!(
+                serde_json::to_string(&member).unwrap(),
+                serde_json::to_string(&state).unwrap()
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&MemberState::Exit).unwrap(),
+            r#""exit""#
+        );
+        assert!(!MemberState::SETTLED.contains(&MemberState::Working));
+    }
+
+    #[test]
+    fn idle_satisfies_a_wait_for_input() {
+        use MemberState::*;
+        assert!(Idle.satisfies(&[Input]));
+        assert!(Input.satisfies(&[Input, Exit]));
+        assert!(!Input.satisfies(&[Idle]));
+        assert!(!Working.satisfies(&MemberState::SETTLED));
+        assert!(Exit.satisfies(&MemberState::SETTLED));
+    }
+
+    #[test]
+    fn outcomes_reply_is_a_response() {
+        let outcome = MemberOutcome {
+            member: "m-1".into(),
+            task: "feat".into(),
+            label: "feat".into(),
+            state: MemberState::Exit,
+            provider: Some("claude".into()),
+            session_id: None,
+            exit_code: Some(0),
+            pending: None,
+            error: None,
+            response: Some(AgentResponse {
+                text: "done".into(),
+                at: 7,
+            }),
+        };
+        let resp = Response::Outcomes {
+            members: vec![outcome.clone()],
+            timed_out: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("timed_out"), "{json}");
+        assert!(!json.contains("session_id"), "{json}");
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::Outcomes { members, timed_out }) => {
+                assert_eq!(members, [outcome]);
+                assert!(!timed_out);
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
+        let json = serde_json::to_string(&Response::Outcomes {
+            members: vec![],
+            timed_out: true,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"outcomes","members":[],"timed_out":true}"#);
     }
 }

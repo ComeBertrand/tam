@@ -1,5 +1,6 @@
-//! What git says of a member's worktree for the detail pane: how its branch
-//! compares with the repository's default branch, and what it changed.
+//! What git says of a member's worktree for the task list and the detail
+//! pane: how its branch compares with the repository's default branch, and
+//! what it changed.
 //!
 //! Read-only and lock-free (`GIT_OPTIONAL_LOCKS=0`: the agent may be running
 //! git in the same worktree). Run off the UI thread: git can be slow on a
@@ -11,6 +12,9 @@ use std::time::{Duration, Instant};
 
 /// How often the focused member's worktree is looked at again while shown.
 pub const REFRESH: Duration = Duration::from_secs(10);
+/// How often the other members' worktrees are, for the task list (and after
+/// their agent's state changes).
+pub const BACKGROUND: Duration = Duration::from_secs(60);
 
 /// A member's branch and changes, as git had them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,9 +45,9 @@ pub struct Observation {
 }
 
 impl Observation {
-    /// Whether to look again.
-    pub fn due(&self) -> bool {
-        !self.running && self.at.is_none_or(|at| at.elapsed() >= REFRESH)
+    /// Whether to look again, looking `every` so often.
+    pub fn due(&self, every: Duration) -> bool {
+        !self.running && self.at.is_none_or(|at| at.elapsed() >= every)
     }
 }
 

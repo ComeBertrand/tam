@@ -185,8 +185,9 @@ adopt). `tam-cli` depends on all three.
   failed, what auto mode refused; without an agent, how its last run ended
   (`GetTask` runs) or what is wrong with its worktree; its branch against
   the default branch and its diff stat (`tui/branch.rs`: read-only git with
-  `GIT_OPTIONAL_LOCKS=0`, off the UI thread, for the focused member only,
-  every 10s while shown and after its state changes); its latest messages
+  `GIT_OPTIONAL_LOCKS=0`, off the UI thread, one worktree at a time:
+  `App::branch_due`, the focused member every 10s while shown, the others
+  every 60s for the task list, any after its state changes); its latest messages
   (`ListMessages`, then `MessageSent`/`MessageDelivered`); its screen below.
   `tab` shows the screen on the whole pane. Member actions (enter, `s`, `r`,
   `R`, custom commands) apply to the focused member (`App::focused_member`):
@@ -266,6 +267,21 @@ adopt). `tam-cli` depends on all three.
   drop dialogs of a task with several members offer the focused member alone
   (`m`, `M` with its branch; `MemberChoice`), sent by member id: `<task>/<member>`
   could name another task.
+- **Task list** — `tui/table.rs` draws `App::rows`: a header row per
+  repository (`app::repo_group`: the set of a task's repositories, `api +
+  web`), a row per task, and below a task with several members a row per
+  member (`▸` marks `App::focused_member`). Only task rows are selected
+  (`App::selected` indexes visible tasks); `App::table_offset` keeps the
+  scroll between draws so the selected task's member rows (and its group's
+  header) stay in view. `g` (`App::toggle_order`, `Order`) switches to
+  attention first: no groups, a REPO column. Columns: status and time in it
+  (`state_since`, else the task's `last_activity`), task, branch
+  (`↑`/`↓`/`*` from `App::branches`), agent, context, and from 100 columns
+  what the member waits on; `table::fit` drops columns (`DROP_ORDER`)
+  before cutting task names. `ui::split`: the pane beside the list from
+  136 columns (pane >= 82: an agent's 80-column screen), else below it,
+  the list as tall as its rows up to 2/5. The footer keeps the hints that
+  fit (`ui::fit_hints`, by priority).
 
 ## Build & check
 

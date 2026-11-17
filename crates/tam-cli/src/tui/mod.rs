@@ -1,6 +1,7 @@
 mod app;
 mod branch;
 mod peek;
+mod table;
 mod triage;
 mod ui;
 
@@ -399,6 +400,10 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             _ => Action::None,
         },
         (KeyCode::Char('p'), _) => Action::TogglePeek,
+        (KeyCode::Char('g'), _) => {
+            app.toggle_order();
+            Action::None
+        }
         (KeyCode::Tab, _) if app.peek.is_some() => {
             app.tab = match app.tab {
                 PaneTab::Triage => PaneTab::Terminal,
@@ -1965,5 +1970,51 @@ mod tests {
             Action::DropTask { ref name, ref label, force: true, .. }
                 if name == "m-2" && label == "feat/web"
         ));
+    }
+
+    #[test]
+    fn git_looks_at_one_worktree_at_a_time_the_focused_one_first() {
+        use std::time::{Duration, Instant};
+        let mut app = two_member_app(&[]);
+        let looked = |app: &mut App, id: &str, ago: u64| {
+            app.set_branch(id.into(), Ok(Default::default()));
+            app.branches.get_mut(id).unwrap().at = Some(Instant::now() - Duration::from_secs(ago));
+        };
+        // Never looked at: each in turn, one at a time.
+        let mut seen = Vec::new();
+        while let Some((id, _)) = app.branch_due() {
+            assert_eq!(app.branch_due(), None, "one at a time");
+            looked(&mut app, &id, 0);
+            seen.push(id);
+        }
+        seen.sort();
+        assert_eq!(seen, ["m-1", "m-2", "m-3"]);
+
+        // Looked at 30s ago: not due in the background (every 60s)...
+        for id in ["m-1", "m-2", "m-3"] {
+            looked(&mut app, id, 30);
+        }
+        assert_eq!(app.branch_due(), None);
+        // ...but the member the pane shows is (every 10s).
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.peek = Some(Peek::default());
+        app.sync_focus();
+        let focused = app.focused_member().unwrap().1.id().to_string();
+        assert_eq!(app.branch_due().map(|(id, _)| id), Some(focused.clone()));
+        looked(&mut app, &focused, 0);
+
+        // The oldest look goes first; a state change asks for a new one.
+        looked(&mut app, "m-3", 90);
+        app.update_state("m-1", tam_proto::AgentState::Input);
+        assert_eq!(app.branch_due().map(|(id, _)| id).as_deref(), Some("m-1"));
+        looked(&mut app, "m-1", 0);
+        assert_eq!(app.branch_due().map(|(id, _)| id).as_deref(), Some("m-3"));
+        looked(&mut app, "m-3", 0);
+
+        // A gone worktree is not looked at.
+        let mut gone = app_with(Some(tam_proto::MemberHealth::Gone {
+            cannot_repair: None,
+        }));
+        assert_eq!(gone.branch_due(), None);
     }
 }

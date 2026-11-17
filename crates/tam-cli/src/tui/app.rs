@@ -7,7 +7,7 @@ use tam_proto::{AgentInfo, MessageInfo, RunInfo, TaskInfo};
 use crate::config::CustomCommand;
 use crate::task::{Member, Task};
 
-use super::branch::{BranchState, Observation};
+use super::branch::{self, BranchState, Observation};
 use super::peek::Peek;
 
 pub enum Mode {
@@ -53,6 +53,33 @@ pub enum Mode {
         /// The focused member, when the task has others: it can be dropped
         /// alone.
         member: Option<MemberChoice>,
+    },
+}
+
+/// How the task list is ordered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Order {
+    /// Under a header row per repository (the set of them for a task in
+    /// several), the most urgent first in each.
+    #[default]
+    Repo,
+    /// The most urgent first, all repositories together.
+    Attention,
+}
+
+/// A row of the task list.
+#[derive(Debug, Clone, Copy)]
+pub enum Row<'a> {
+    /// The repositories of the tasks below it.
+    Group(&'a Task),
+    /// A task: the row of its only member, or the head of its members'
+    /// rows. The only rows that can be selected.
+    Task(&'a Task),
+    /// A member of a task with several, below the task's row.
+    Member {
+        task: &'a Task,
+        member: &'a Member,
+        last: bool,
     },
 }
 
@@ -195,6 +222,10 @@ pub struct App {
     pub detail: Option<TaskDetail>,
     /// Git's view of members' worktrees, by member id.
     pub branches: HashMap<String, Observation>,
+    pub order: Order,
+    /// The first row of the task list on screen (kept between draws, so
+    /// the list scrolls only when the selection would leave it).
+    pub table_offset: usize,
 }
 
 impl App {
@@ -212,6 +243,8 @@ impl App {
             tab: PaneTab::default(),
             detail: None,
             branches: HashMap::new(),
+            order: Order::default(),
+            table_offset: 0,
         }
     }
 
@@ -230,13 +263,61 @@ impl App {
     }
 
     fn sort_tasks(&mut self) {
-        self.tasks.sort_by_key(|t| {
-            (
-                t.repo_name().to_lowercase(),
-                t.status().sort_priority(),
-                t.name.to_lowercase(),
-            )
-        });
+        match self.order {
+            Order::Repo => self.tasks.sort_by_key(|t| {
+                (
+                    repo_group(t).to_lowercase(),
+                    t.status().sort_priority(),
+                    t.name.to_lowercase(),
+                )
+            }),
+            Order::Attention => self
+                .tasks
+                .sort_by_key(|t| (t.status().sort_priority(), t.name.to_lowercase())),
+        }
+    }
+
+    /// Group the list by repository, or show the most urgent first.
+    pub fn toggle_order(&mut self) {
+        let prev = self.selected_task().map(|t| t.name.clone());
+        self.order = match self.order {
+            Order::Repo => Order::Attention,
+            Order::Attention => Order::Repo,
+        };
+        self.sort_tasks();
+        self.reselect(prev);
+    }
+
+    /// The task list's rows: the visible tasks in order, a header row
+    /// before each repository's tasks (when grouped), a row per member
+    /// below a task with several.
+    pub fn rows(&self) -> Vec<Row<'_>> {
+        let mut rows = Vec::new();
+        let mut group: Option<String> = None;
+        for task in self.visible_tasks() {
+            if self.order == Order::Repo {
+                let name = repo_group(task);
+                if group.as_ref() != Some(&name) {
+                    rows.push(Row::Group(task));
+                    group = Some(name);
+                }
+            }
+            rows.push(Row::Task(task));
+            if task.members.len() > 1 {
+                let count = task.members.len();
+                rows.extend(
+                    task.members
+                        .iter()
+                        .enumerate()
+                        .map(|(i, member)| Row::Member {
+                            task,
+                            member,
+                            last: i + 1 == count,
+                        }),
+                );
+            }
+        }
+        rows
     }
 
     pub fn visible_tasks(&self) -> Vec<&Task> {
@@ -498,20 +579,32 @@ impl App {
         }
     }
 
-    /// The focused member's worktree, when git should be asked about it
-    /// again (marked as being looked at): `(member id, dir)`.
+    /// The next member worktree git should be asked about (marked as being
+    /// looked at), one at a time: `(member id, dir)`. The focused member
+    /// while the pane shows it, every [`branch::REFRESH`]; else the member
+    /// looked at longest ago (never, or before its agent's state changed,
+    /// first), every [`branch::BACKGROUND`]. Gone worktrees are left out.
     pub fn branch_due(&mut self) -> Option<(String, PathBuf)> {
-        self.peek.as_ref()?;
-        let (_, member) = self.focused_member()?;
-        if member.is_unhealthy() {
+        if self.branches.values().any(|o| o.running) {
             return None;
         }
+        let due = |member: &Member, every| {
+            !member.is_unhealthy() && self.branches.get(member.id()).is_none_or(|o| o.due(every))
+        };
+        let focused = self
+            .focused_member()
+            .filter(|_| self.peek.is_some())
+            .map(|(_, m)| m)
+            .filter(|m| due(m, branch::REFRESH));
+        let member = focused.or_else(|| {
+            self.tasks
+                .iter()
+                .flat_map(|t| &t.members)
+                .filter(|m| due(m, branch::BACKGROUND))
+                .min_by_key(|m| self.branches.get(m.id()).and_then(|o| o.at))
+        })?;
         let (id, dir) = (member.id().to_string(), member.info.dir.clone());
-        let observation = self.branches.entry(id.clone()).or_default();
-        if !observation.due() {
-            return None;
-        }
-        observation.running = true;
+        self.branches.entry(id.clone()).or_default().running = true;
         Some((id, dir))
     }
 
@@ -532,9 +625,18 @@ impl App {
 }
 
 /// The member that most needs the user (the first one, in join order, of
-/// the most urgent status).
-fn most_urgent(task: &Task) -> Option<&Member> {
+/// the most urgent status): the one the task's status is about.
+pub fn most_urgent(task: &Task) -> Option<&Member> {
     task.members
         .iter()
         .min_by_key(|m| task.member_status(m).sort_priority())
+}
+
+/// The repositories of a task's members, as its group in the task list
+/// names them: `api`, or `api + web` for a task in both.
+pub fn repo_group(task: &Task) -> String {
+    let mut repos: Vec<&str> = task.members.iter().map(|m| m.info.repo.as_str()).collect();
+    repos.sort_unstable();
+    repos.dedup();
+    repos.join(" + ")
 }

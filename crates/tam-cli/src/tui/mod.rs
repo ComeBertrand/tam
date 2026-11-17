@@ -1,5 +1,7 @@
 mod app;
+mod branch;
 mod peek;
+mod triage;
 mod ui;
 
 use std::io::IsTerminal;
@@ -19,7 +21,7 @@ use crate::config::{self, Config};
 use crate::task::{self, Member, Task};
 use tam_proto::SessionChoice;
 
-use self::app::{App, Mode, PickerItem, PickerState};
+use self::app::{App, Mode, PaneTab, PickerItem, PickerState, TaskDetail};
 use self::peek::{Peek, Scroll};
 
 /// Actions returned from the event loop.
@@ -186,12 +188,29 @@ async fn run_loop(
     config: &Config,
 ) -> Result<()> {
     let mut input = InputReader::spawn();
+    // Redraw at least every second: times in state move on.
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // What git said of a member's worktree (looked at off this thread).
+    let (branch_tx, mut branch_rx) = tokio::sync::mpsc::unbounded_channel();
 
     loop {
+        app.sync_focus();
         // Whatever moved the selection (a key, a re-sort, an agent starting
         // or exiting), the preview follows.
         if app.peek_stale() {
             refresh_peek(client, app).await;
+        }
+        if app.detail_stale() {
+            refresh_detail(client, app).await;
+        }
+        if let Some((id, dir)) = app.branch_due() {
+            let tx = branch_tx.clone();
+            // A thread of its own: quitting never waits for a slow git (the
+            // runtime would, for a blocking task).
+            std::thread::spawn(move || {
+                let _ = tx.send((id, branch::observe(&dir)));
+            });
         }
         terminal.draw(|frame| ui::render(frame, app))?;
 
@@ -221,6 +240,11 @@ async fn run_loop(
                     ServerMessage::Response(_) => Action::None,
                 }
             }
+            Some((id, state)) = branch_rx.recv() => {
+                app.set_branch(id, state);
+                Action::None
+            }
+            _ = tick.tick() => Action::None,
         };
 
         match action {
@@ -367,6 +391,23 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             _ => Action::None,
         },
         (KeyCode::Char('p'), _) => Action::TogglePeek,
+        (KeyCode::Tab, _) if app.peek.is_some() => {
+            app.tab = match app.tab {
+                PaneTab::Triage => PaneTab::Terminal,
+                PaneTab::Terminal => PaneTab::Triage,
+            };
+            Action::None
+        }
+        // The pane (and the member keys) move to another member of the
+        // task: only while shown, never out of sight.
+        (KeyCode::Right, _) if app.peek.is_some() => {
+            app.cycle_member(1);
+            Action::None
+        }
+        (KeyCode::Left, _) if app.peek.is_some() => {
+            app.cycle_member(-1);
+            Action::None
+        }
         // A gone worktree: recreate it, or drop the task.
         (KeyCode::Char('d'), _)
             if app
@@ -386,16 +427,17 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         }
         (KeyCode::Char(c), _) => {
             if let Some(cmd) = config.commands.iter().find(|cmd| cmd.key_char() == c) {
-                if let Some(task) = app.selected_task() {
-                    let provider = task
-                        .agent_info()
+                if let Some((task, member)) = selected_member(app) {
+                    let provider = member
+                        .agent_info
+                        .as_ref()
                         .map(|a| a.provider.clone())
                         .unwrap_or_default();
                     Action::CustomCommand {
                         name: cmd.name.clone(),
                         command: cmd.command.clone(),
                         task: task.name.clone(),
-                        dir: task.dir().map(Path::to_path_buf).unwrap_or_default(),
+                        dir: member.info.dir.clone(),
                         provider,
                     }
                 } else {
@@ -633,10 +675,10 @@ fn handle_repair_or_drop_key(key: KeyEvent, app: &mut App) -> Action {
     }
 }
 
-/// The selected task and the member actions apply to.
+/// The selected task and the member actions apply to: the one the detail
+/// pane shows.
 fn selected_member(app: &App) -> Option<(&Task, &Member)> {
-    let task = app.selected_task()?;
-    Some((task, task.primary()?))
+    app.focused_member()
 }
 
 fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
@@ -768,6 +810,35 @@ async fn refresh_peek(client: &mut Client, app: &mut App) {
             peek.error = Some(format!("{e:#}"));
         }
     }
+}
+
+/// Fetch the selected task's runs and messages for the detail pane (it
+/// follows the daemon's events from then on).
+async fn refresh_detail(client: &mut Client, app: &mut App) {
+    let Some(name) = app.selected_task().map(|t| t.name.clone()) else {
+        app.detail = None;
+        return;
+    };
+    // Shown without them when they cannot be had: no retry until it changes.
+    let runs = match client.get_task(&name).await {
+        Ok((_, runs)) => runs,
+        Err(_) => Vec::new(),
+    };
+    let messages = match client
+        .send(tam_proto::Request::ListMessages {
+            task: Some(name.clone()),
+        })
+        .await
+    {
+        Ok(tam_proto::Response::Messages { messages }) => messages,
+        _ => Vec::new(),
+    };
+    app.detail = Some(TaskDetail {
+        task: name,
+        runs,
+        messages,
+        stale: false,
+    });
 }
 
 /// Stop the daemon's screen updates (the pane is closed, or the dashboard
@@ -1074,7 +1145,9 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
         }
         // Followed by the event loop (see `refresh_peek`).
         tam_proto::Event::ScreenUpdated { .. } => {}
-        tam_proto::Event::MessageSent { .. } => {}
+        tam_proto::Event::MessageSent { message } => {
+            app.note_message(message);
+        }
         tam_proto::Event::MessageDelivered { message } => {
             app.set_status(
                 format!(
@@ -1083,6 +1156,7 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
                 ),
                 Duration::from_secs(5),
             );
+            app.note_message(message);
         }
     }
 }
@@ -1407,5 +1481,219 @@ mod tests {
                 Action::ScrollPeek(s) if s == scroll
             ));
         }
+    }
+
+    /// Tasks `feat` (members app and web) and `other`, with the agents
+    /// `agents` (`(member id, state)`).
+    fn two_member_app(agents: &[(&str, tam_proto::AgentState)]) -> App {
+        let member = |id: &str, name: &str| tam_proto::MemberInfo {
+            id: id.into(),
+            name: name.into(),
+            repo: name.into(),
+            repo_root: None,
+            branch: "feat".into(),
+            dir: PathBuf::from(format!("/w/{name}--feat")),
+            health: None,
+        };
+        let task = |name: &str, members| tam_proto::TaskInfo {
+            name: name.into(),
+            members,
+            created_at: 0,
+            run_count: 0,
+            last_activity: Some(task::now()),
+        };
+        let agents: Vec<tam_proto::AgentInfo> = agents
+            .iter()
+            .map(|(id, state)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "provider": "claude", "dir": "/w", "state": state,
+                    "pid": 1, "uptime_secs": 1,
+                }))
+                .unwrap()
+            })
+            .collect();
+        let mut app = App::new();
+        app.set_tasks(vec![
+            Task::from_info(
+                task("feat", vec![member("m-1", "app"), member("m-2", "web")]),
+                &agents,
+            ),
+            Task::from_info(task("other", vec![member("m-3", "lib")]), &agents),
+        ]);
+        app
+    }
+
+    fn attach_target(app: &mut App) -> Option<String> {
+        match handle_normal_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            app,
+            &Config::default(),
+        ) {
+            Action::Attach { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn member_keys_act_on_the_member_that_needs_the_user() {
+        use tam_proto::AgentState::{Blocked, Input, Working};
+        let mut app = two_member_app(&[("m-1", Working), ("m-2", Blocked)]);
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-2"));
+
+        // Pane closed: the one the task's status is about, as it changes.
+        app.update_state("m-2", Working);
+        app.update_state("m-1", Blocked);
+        app.sync_focus();
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
+
+        // Pane open: the one it shows. It stays when the other one comes
+        // to need the user more: a key never acts on a member the pane did
+        // not show.
+        app.peek = Some(Peek::default());
+        app.sync_focus();
+        assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
+        app.update_state("m-1", Working);
+        app.update_state("m-2", Blocked);
+        app.sync_focus();
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
+        assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
+
+        // Back on the task after another one: the most urgent again.
+        let feat = app.selected;
+        app.selected = 1 - feat;
+        app.sync_focus();
+        app.selected = feat;
+        app.sync_focus();
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-2"));
+
+        // ←/→ move it, only while the pane shows which member it is.
+        let config = Config::default();
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_normal_key(right, &mut app, &config);
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
+        handle_normal_key(right, &mut app, &config);
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-2"));
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_normal_key(left, &mut app, &config);
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
+        app.peek = None;
+        app.sync_focus();
+        handle_normal_key(left, &mut app, &config);
+        assert_eq!(
+            attach_target(&mut app).as_deref(),
+            Some("m-2"),
+            "no pane, no ←"
+        );
+        app.peek = Some(Peek::default());
+        app.sync_focus();
+        handle_normal_key(left, &mut app, &config);
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
+
+        // `s` and `r` too: here `r` runs the idle one.
+        app.remove_agent("m-1");
+        assert!(matches!(
+            handle_normal_key(press('r'), &mut app, &config),
+            Action::RunAgent { ref member } if member == "m-1"
+        ));
+        app.update_state("m-2", Input);
+        app.cycle_member(1);
+        assert!(matches!(
+            handle_normal_key(press('s'), &mut app, &config),
+            Action::StopAgent { ref id, ref label } if id == "m-2" && label == "feat/web"
+        ));
+    }
+
+    #[test]
+    fn tab_switches_the_pane_between_triage_and_terminal() {
+        let config = Config::default();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let mut app = App::new();
+        handle_normal_key(tab, &mut app, &config);
+        assert_eq!(app.tab, PaneTab::Triage, "no pane, no tab");
+        app.peek = Some(Peek::default());
+        handle_normal_key(tab, &mut app, &config);
+        assert_eq!(app.tab, PaneTab::Terminal);
+        handle_normal_key(tab, &mut app, &config);
+        assert_eq!(app.tab, PaneTab::Triage);
+    }
+
+    #[test]
+    fn state_changes_note_when_they_happened() {
+        let mut app = two_member_app(&[("m-1", tam_proto::AgentState::Working)]);
+        let since = |app: &App| {
+            app.find_member("m-1")
+                .unwrap()
+                .1
+                .agent_info
+                .as_ref()
+                .unwrap()
+                .state_since
+        };
+        assert_eq!(since(&app), None);
+        app.update_state("m-1", tam_proto::AgentState::Blocked);
+        let now = task::now();
+        assert!(since(&app).is_some_and(|s| s + 1 >= now));
+        // Already the daemon's (from a hook's AgentUpdated): kept.
+        let agent = app.tasks.iter_mut().find_map(|t| t.member_mut("m-1"));
+        agent.unwrap().agent_info.as_mut().unwrap().state_since = Some(5);
+        app.update_state("m-1", tam_proto::AgentState::Blocked);
+        assert_eq!(since(&app), Some(5));
+    }
+
+    #[test]
+    fn the_pane_keeps_the_shown_task_runs_and_messages() {
+        let mut app = two_member_app(&[]);
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        assert!(!app.detail_stale(), "pane closed: nothing to fetch");
+        app.peek = Some(Peek::default());
+        assert!(app.detail_stale());
+        app.detail = Some(TaskDetail {
+            task: "feat".into(),
+            ..Default::default()
+        });
+        assert!(!app.detail_stale());
+
+        let message = |id: &str, from: Option<&str>, to: &str| tam_proto::MessageInfo {
+            id: id.into(),
+            from: from.map(str::to_string),
+            from_label: "user".into(),
+            to: to.into(),
+            to_label: to.into(),
+            text: "hi".into(),
+            hop: 0,
+            reply_to: None,
+            sent_at: 1,
+            delivered_at: None,
+        };
+        app.note_message(message("msg-1", None, "m-2"));
+        app.note_message(message("msg-2", Some("m-3"), "m-3"));
+        app.note_message(message("msg-3", Some("m-1"), "m-3"));
+        let mut delivered = message("msg-1", None, "m-2");
+        delivered.delivered_at = Some(2);
+        app.note_message(delivered);
+        let detail = app.detail.as_ref().unwrap();
+        let ids: Vec<&str> = detail.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["msg-1", "msg-3"], "only the task's members'");
+        assert_eq!(detail.messages[0].delivered_at, Some(2));
+
+        // A run started or ended: fetched again. Another task: too.
+        let info = tam_proto::TaskInfo {
+            name: "feat".into(),
+            members: app.tasks[app.selected]
+                .members
+                .iter()
+                .map(|m| m.info.clone())
+                .collect(),
+            created_at: 0,
+            run_count: 1,
+            last_activity: Some(task::now()),
+        };
+        app.update_task_info(info);
+        assert!(app.detail_stale());
+        app.detail.as_mut().unwrap().stale = false;
+        app.selected = 1 - app.selected;
+        assert!(app.detail_stale());
     }
 }

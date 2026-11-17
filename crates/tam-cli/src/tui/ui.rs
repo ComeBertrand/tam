@@ -10,8 +10,9 @@ use tam_proto::{AgentDetail, AgentState};
 
 use crate::task::{Task, TaskStatus};
 
-use super::app::{App, Mode, PickerState};
+use super::app::{App, Mode, PaneTab, PickerState};
 use super::peek::{Peek, ScreenView};
+use super::triage;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let show_filter = app.filter_active || !app.filter.is_empty();
@@ -33,13 +34,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         render_tasks(frame, table_area, app);
 
-        let selected = app.selected_task();
-        let task_name = selected.map_or_else(|| "—".to_string(), |t| t.name.clone());
-        let detail = selected
-            .and_then(|t| t.agent_info())
-            .and_then(|a| agent_detail_line(a.state, &a.detail));
-        if let Some(peek) = app.peek.as_mut() {
-            render_preview(frame, preview_area, &task_name, detail, peek);
+        // Out of the app while drawn: the pane reads the rest of it.
+        if let Some(mut peek) = app.peek.take() {
+            render_pane(frame, preview_area, app, &mut peek);
+            app.peek = Some(peek);
         }
 
         render_footer(frame, footer_area, app);
@@ -219,7 +217,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
         let hints = match app.mode {
             Mode::Normal => {
                 let selected = app.selected_task();
-                let has_agent = selected.is_some_and(|t| t.agent_info().is_some());
+                let has_agent = app
+                    .focused_member()
+                    .is_some_and(|(_, m)| m.agent_info.is_some());
 
                 let mut hints = Vec::new();
                 if has_agent {
@@ -246,6 +246,19 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw(":peek  "),
                 ]);
                 if let Some(peek) = &app.peek {
+                    hints.extend([
+                        Span::styled("tab", Style::new().bold()),
+                        Span::raw(match app.tab {
+                            PaneTab::Triage => ":terminal  ",
+                            PaneTab::Terminal => ":triage  ",
+                        }),
+                    ]);
+                    if selected.is_some_and(|t| t.members.len() > 1) {
+                        hints.extend([
+                            Span::styled("←/→", Style::new().bold()),
+                            Span::raw(":member  "),
+                        ]);
+                    }
                     hints.extend([
                         Span::styled("pgup/pgdn", Style::new().bold()),
                         Span::raw(":scroll  "),
@@ -339,9 +352,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// What the agent waits on or reported, for the peek pane: the pending
+/// What the agent waits on or reported, on one line: the pending
 /// permission or question, the error, or a tool call refused by auto mode.
-fn agent_detail_line(state: AgentState, detail: &AgentDetail) -> Option<(String, Color)> {
+pub(super) fn agent_detail_line(
+    state: AgentState,
+    detail: &AgentDetail,
+) -> Option<(String, Color)> {
     let pending = |label: &str, color| {
         detail.pending.as_ref().map(|p| match &p.tool {
             Some(tool) if label == "permission" => {
@@ -380,46 +396,104 @@ fn first_line(s: &str) -> &str {
         .unwrap_or("")
 }
 
-/// The selected task's agent screen, as the daemon's terminal emulator has
-/// it: its live screen (the content's bottom when the pane is shorter) or
-/// history, cut at the pane's right edge.
-fn render_preview(
-    frame: &mut Frame,
-    area: Rect,
-    task_name: &str,
-    detail: Option<(String, Color)>,
-    peek: &mut Peek,
-) {
+/// The detail pane, about the focused member of the selected task. Triage
+/// tab: what it needs from the user (see `triage`), its screen below.
+/// Terminal tab: its screen on the whole pane, with what it waits on in the
+/// bottom border.
+fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
+    let focused = app.focused_member();
+    let label = focused.map_or_else(|| "—".to_string(), |(t, m)| t.member_label(m));
+    let agent = focused.and_then(|(_, m)| m.agent_info.as_ref());
+
+    let title = match peek.scrolled_back() {
+        Some(0) => format!(" {label} · scrolled back "),
+        Some(n) => format!(" {label} · {n} lines into history "),
+        None => format!(" {label} "),
+    };
+    let tab = |name: &'static str, shown: bool| {
+        if shown {
+            Span::styled(name, Style::new().bold())
+        } else {
+            Span::styled(name, Style::new().fg(Color::DarkGray))
+        }
+    };
+    let tabs = Line::from(vec![
+        Span::raw(" "),
+        tab("triage", app.tab == PaneTab::Triage),
+        Span::styled(" │ ", Style::new().fg(Color::DarkGray)),
+        tab("terminal", app.tab == PaneTab::Terminal),
+        Span::raw(" "),
+    ]);
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    peek.height = inner.height;
-    let title = match peek.scrolled_back() {
-        Some(0) => format!(" {task_name} · scrolled back "),
-        Some(n) => format!(" {task_name} · {n} lines into history "),
-        None => format!(" {task_name} "),
-    };
-    block = block.title(title);
-    if let Some((text, color)) = detail {
-        block = block.title_bottom(Line::styled(format!(" {text} "), Style::new().fg(color)));
+        .border_style(Style::new().fg(Color::DarkGray))
+        .title(title)
+        .title_top(tabs.right_aligned());
+    if app.tab == PaneTab::Terminal {
+        if let Some((text, color)) = agent.and_then(|a| agent_detail_line(a.state, &a.detail)) {
+            block = block.title_bottom(Line::styled(format!(" {text} "), Style::new().fg(color)));
+        }
     }
+    let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let Some((task, member)) = focused.filter(|_| app.tab == PaneTab::Triage) else {
+        render_screen(frame, inner, peek);
+        return;
+    };
+    let detail = app.detail.as_ref().filter(|d| d.task == task.name);
+    let view = triage::triage(
+        task,
+        member,
+        detail,
+        app.branches.get(member.id()),
+        crate::task::now(),
+    );
+    // With an agent, its screen keeps at least half of the pane.
+    let rows = if agent.is_some() {
+        inner.height - inner.height / 2
+    } else {
+        inner.height
+    };
+    let lines = triage::fit(view, inner.width, rows);
+    let used = lines.len() as u16;
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x, inner.y, inner.width, used),
+    );
+    let below = inner.height.saturating_sub(used + 1);
+    if agent.is_none() || below == 0 {
+        peek.height = 0;
+        return;
+    }
+    let rule = "─".repeat(inner.width as usize);
+    frame.render_widget(
+        Line::styled(rule, Style::new().fg(Color::DarkGray)),
+        Rect::new(inner.x, inner.y + used, inner.width, 1),
+    );
+    let screen = Rect::new(inner.x, inner.y + used + 1, inner.width, below);
+    render_screen(frame, screen, peek);
+}
+
+/// The agent's screen, as the daemon's terminal emulator has it: its live
+/// screen (the content's bottom when the area is shorter) or history, cut
+/// at the area's right edge.
+fn render_screen(frame: &mut Frame, area: Rect, peek: &mut Peek) {
+    peek.height = area.height;
     let message = match (&peek.agent, &peek.screen, &peek.error) {
         (None, _, _) => "(no agent running)".to_string(),
         (Some(_), Some(screen), _) => {
             let view = ScreenView {
                 screen: screen.screen(),
-                first: screen.first_row(peek.from, inner.height),
+                first: screen.first_row(peek.from, area.height),
             };
-            frame.render_widget(view, inner);
+            frame.render_widget(view, area);
             return;
         }
         (Some(_), None, Some(error)) => format!("(error: {error})"),
         (Some(_), None, None) => String::new(),
     };
-    frame.render_widget(Paragraph::new(message).fg(Color::DarkGray), inner);
+    frame.render_widget(Paragraph::new(message).fg(Color::DarkGray), area);
 }
 
 fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
@@ -698,7 +772,7 @@ fn render_notice_popup(frame: &mut Frame, title: &str, lines: &[String]) {
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
-fn status_display(status: &TaskStatus) -> (&'static str, Color) {
+pub(super) fn status_display(status: &TaskStatus) -> (&'static str, Color) {
     match status {
         TaskStatus::Run => ("● run", Color::Blue),
         TaskStatus::Input => ("▲ input", Color::Yellow),
@@ -901,8 +975,383 @@ mod tests {
         peek.from = Some(4);
         info.top = 4;
         peek.set_screen(&info);
-        let s = screen(&mut app, 60, 20);
+        let s = screen(&mut app, 80, 20);
         assert!(s.contains("— · 6 lines into history"), "{s}");
         assert!(s.contains("end:live"), "{s}");
+    }
+
+    // -- The triage pane ---------------------------------------------------
+
+    use crate::task::Task;
+    use crate::tui::app::{PaneTab, TaskDetail};
+    use crate::tui::branch::{BranchState, Observation};
+    use tam_proto::{AgentInfo, MemberHealth, MemberInfo, MessageInfo, RunInfo, TaskInfo};
+
+    fn member_info(id: &str, name: &str) -> MemberInfo {
+        MemberInfo {
+            id: id.into(),
+            name: name.into(),
+            repo: name.into(),
+            repo_root: None,
+            branch: "feat".into(),
+            dir: format!("/w/{name}--feat").into(),
+            health: Some(MemberHealth::Ok {
+                branch: Some("feat".into()),
+            }),
+        }
+    }
+
+    /// An agent for member `id`, in `state` for `secs` seconds.
+    fn agent_in(id: &str, state: AgentState, secs: u64, detail: AgentDetail) -> AgentInfo {
+        AgentInfo {
+            id: id.into(),
+            provider: "claude".into(),
+            dir: "/w".into(),
+            state,
+            pid: Some(1),
+            uptime_secs: 600,
+            viewers: 0,
+            context_percent: None,
+            task: Some("feat".into()),
+            detail: Box::new(detail),
+            state_since: Some(crate::task::now() - secs),
+        }
+    }
+
+    /// A screen showing `rows` lines (cursor hidden).
+    fn agent_screen(id: &str, rows: &[&str]) -> Peek {
+        let size = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut vt = vt100::Parser::new(size(24), size(80), 0);
+        vt.process(format!("\x1b[?25l{}", rows.join("\r\n")).as_bytes());
+        let mut peek = Peek {
+            agent: Some(id.into()),
+            ..Default::default()
+        };
+        peek.set_screen(&tam_proto::ScreenInfo {
+            cols: 80,
+            rows: 24,
+            contents: vt.screen().contents_formatted(),
+            top: 0,
+            oldest: 0,
+            live: 0,
+        });
+        peek
+    }
+
+    const PERMISSION_DIALOG: &[&str] = &[
+        "> run the tests",
+        "",
+        "● Bash(cargo test --workspace)",
+        "",
+        " Bash command",
+        "   cargo test --workspace -- --nocapture",
+        " Do you want to proceed?",
+        " > 1. Yes",
+        "   2. No, and tell Claude what to do differently",
+    ];
+
+    /// The dashboard showing task `feat` (members `members`, agents
+    /// `agents`), its pane open on the focused member's screen.
+    fn triage_app(members: Vec<MemberInfo>, agents: Vec<AgentInfo>) -> App {
+        let info = TaskInfo {
+            name: "feat".into(),
+            members,
+            created_at: 0,
+            run_count: 1,
+            last_activity: Some(crate::task::now()),
+        };
+        let mut app = App::new();
+        app.set_tasks(vec![Task::from_info(info, &agents)]);
+        app.sync_focus();
+        let focused = app.peek_agent();
+        app.peek = Some(match focused {
+            Some(id) => agent_screen(&id, PERMISSION_DIALOG),
+            None => Peek::default(),
+        });
+        app
+    }
+
+    fn message(id: &str, from: Option<&str>, to: &str, text: &str, ago: u64) -> MessageInfo {
+        MessageInfo {
+            id: id.into(),
+            from: from.map(str::to_string),
+            from_label: from.map_or("user".into(), |f| format!("feat/{f}")),
+            to: to.into(),
+            to_label: format!("feat/{to}"),
+            text: text.into(),
+            hop: 0,
+            reply_to: None,
+            sent_at: crate::task::now() - ago,
+            delivered_at: Some(crate::task::now() - ago),
+        }
+    }
+
+    fn observed(state: BranchState) -> Observation {
+        Observation {
+            state: Some(Ok(state)),
+            at: Some(std::time::Instant::now()),
+            running: false,
+        }
+    }
+
+    fn blocked() -> AgentDetail {
+        AgentDetail {
+            pending: Some(Pending {
+                tool: Some("Bash".into()),
+                summary: "cargo test --workspace -- --nocapture".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn triage_shows_a_permission_request_with_its_input_and_the_screen_below() {
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", AgentState::Blocked, 190, blocked())],
+        );
+        app.detail = Some(TaskDetail {
+            task: "feat".into(),
+            messages: vec![
+                message("msg-1", None, "m-1", "please also run clippy", 600),
+                message("msg-2", Some("m-1"), "m-9", "done, see the\nbranch", 300),
+            ],
+            ..Default::default()
+        });
+        app.branches.insert(
+            "m-1".into(),
+            observed(BranchState {
+                base: Some("origin/main".into()),
+                ahead: 2,
+                behind: 1,
+                files: 3,
+                insertions: 40,
+                deletions: 2,
+                uncommitted: 1,
+            }),
+        );
+        let s = screen(&mut app, 100, 34);
+        assert!(s.contains("┌ feat ─"), "{s}");
+        assert!(s.contains("triage │ terminal"), "{s}");
+        assert!(
+            s.contains("│▲ blocked for 3m · permission for Bash  (claude)"),
+            "{s}"
+        );
+        assert!(
+            s.contains("│  cargo test --workspace -- --nocapture"),
+            "{s}"
+        );
+        assert!(
+            s.contains(
+                "│branch feat · 2 ahead, 1 behind origin/main · 3 files +40 -2 · 1 uncommitted"
+            ),
+            "{s}"
+        );
+        assert!(s.contains("│ 10m ← user: please also run clippy"), "{s}");
+        assert!(s.contains("│  5m → feat/m-9: done, see the branch"), "{s}");
+        // The screen, below a rule: the dialog's choices.
+        assert!(s.contains("│──────"), "{s}");
+        assert!(s.contains("│ > 1. Yes"), "{s}");
+        assert!(s.contains("tab:terminal"), "{s}");
+
+        // The tab shown is the bold one.
+        let tab_styles = |app: &mut App| {
+            let backend = ratatui::backend::TestBackend::new(100, 34);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let row = (0..34)
+                .find(|&y| (0..100).any(|x| buf[(x, y)].symbol() == "┌"))
+                .unwrap();
+            let text: String = (0..100).map(|x| buf[(x, row)].symbol()).collect();
+            let at = |word: &str| {
+                let x = text[..text.find(word).unwrap()].chars().count() as u16;
+                buf[(x, row)].modifier.contains(Modifier::BOLD)
+            };
+            (at("triage"), at("terminal"))
+        };
+        assert_eq!(tab_styles(&mut app), (true, false));
+
+        // The terminal tab: the screen alone, what it waits on below.
+        app.tab = PaneTab::Terminal;
+        assert_eq!(tab_styles(&mut app), (false, true));
+        let s = screen(&mut app, 100, 34);
+        assert!(!s.contains("blocked for"), "{s}");
+        assert!(s.contains("│> run the tests"), "{s}");
+        assert!(
+            s.contains("permission · Bash: cargo test --workspace -- --nocapture"),
+            "{s}"
+        );
+        assert!(s.contains("tab:triage"), "{s}");
+    }
+
+    #[test]
+    fn triage_shows_a_question_an_error_and_auto_mode_refusals() {
+        let question = AgentDetail {
+            pending: Some(Pending {
+                tool: Some("AskUserQuestion".into()),
+                summary: "Which database should the cache use? (+1 more)".into(),
+            }),
+            ..Default::default()
+        };
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", AgentState::Question, 45, question)],
+        );
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("? question for 45s  (claude)"), "{s}");
+        assert!(
+            s.contains("│  Which database should the cache use? (+1 more)"),
+            "{s}"
+        );
+        // Git not asked yet.
+        assert!(s.contains("│branch feat · …"), "{s}");
+
+        let error = AgentDetail {
+            error: Some(AgentError {
+                kind: "rate_limit".into(),
+                message: Some("API Error: Rate limit reached".into()),
+            }),
+            ..Default::default()
+        };
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", AgentState::Error, 7200, error)],
+        );
+        let s = screen(&mut app, 100, 30);
+        assert!(
+            s.contains("✗ error for 2h · turn failed: rate_limit"),
+            "{s}"
+        );
+        assert!(s.contains("│  API Error: Rate limit reached"), "{s}");
+
+        let denied = AgentDetail {
+            denied: Some(DeniedTool {
+                tool: "Bash".into(),
+                summary: Some("rm -rf build".into()),
+                reason: Some("destructive".into()),
+            }),
+            ..Default::default()
+        };
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", AgentState::Working, 20, denied)],
+        );
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("● working for 20s  (claude)"), "{s}");
+        assert!(
+            s.contains("│  auto mode refused Bash: rm -rf build (destructive)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn triage_shows_the_last_message_cut_to_leave_the_screen_room() {
+        let paragraph = "The cache now expires entries after their TTL, and the tests \
+                         cover eviction under memory pressure as well.";
+        let last = format!(
+            "Done. Summary:\n\n{}\n\nShall I open the pull request?",
+            [paragraph; 12].join("\n")
+        );
+        let detail = AgentDetail {
+            last_message: Some(last),
+            ..Default::default()
+        };
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", AgentState::Input, 750, detail)],
+        );
+        let s = screen(&mut app, 100, 34);
+        assert!(s.contains("▲ input for 12m · turn finished"), "{s}");
+        assert!(s.contains("│  Done. Summary:"), "{s}");
+        // Cut, with the branch still shown and the screen kept below.
+        assert!(s.contains("…"), "{s}");
+        assert!(s.contains("│branch feat"), "{s}");
+        assert!(s.contains("│ > 1. Yes"), "{s}");
+
+        // 80x24: the pane is short, the screen still has half of it.
+        let s = screen(&mut app, 80, 24);
+        assert!(s.contains("▲ input for 12m · turn finished"), "{s}");
+        assert!(s.contains("│──────"), "{s}");
+    }
+
+    #[test]
+    fn triage_of_a_member_without_agent_says_how_its_last_run_ended() {
+        let mut app = triage_app(vec![member_info("m-1", "app")], vec![]);
+        app.detail = Some(TaskDetail {
+            task: "feat".into(),
+            runs: vec![RunInfo {
+                member: "m-1".into(),
+                provider: "claude".into(),
+                session_id: None,
+                started_at: crate::task::now() - 7300,
+                ended_at: Some(crate::task::now() - 3700),
+                exit_code: Some(1),
+            }],
+            messages: vec![{
+                let mut m = message("msg-1", None, "m-1", "rebase on main", 60);
+                m.delivered_at = None;
+                m
+            }],
+            stale: false,
+        });
+        let s = screen(&mut app, 100, 30);
+        assert!(
+            s.contains("○ idle · no agent · claude ended 1h ago, exit 1"),
+            "{s}"
+        );
+        assert!(s.contains("1m ← user: (queued) rebase on main"), "{s}");
+        // No screen to show.
+        assert!(!s.contains("no agent running"), "{s}");
+        assert!(s.contains("r:run"), "{s}");
+
+        // Its worktree gone: what is wrong, and what to do.
+        let mut gone = member_info("m-1", "app");
+        gone.health = Some(MemberHealth::Gone {
+            cannot_repair: None,
+        });
+        let mut app = triage_app(vec![gone], vec![]);
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("✗ gone · no agent"), "{s}");
+        assert!(
+            s.contains("worktree /w/app--feat is gone, branch 'feat' is still there"),
+            "{s}"
+        );
+        assert!(
+            s.contains("d: recreate the worktree, or drop the task"),
+            "{s}"
+        );
+        assert!(!s.contains("│branch feat"), "{s}");
+    }
+
+    #[test]
+    fn triage_of_two_members_shows_the_one_that_needs_the_user() {
+        let mut app = triage_app(
+            vec![member_info("m-1", "app"), member_info("m-2", "web")],
+            vec![
+                agent_in("m-1", AgentState::Working, 30, AgentDetail::default()),
+                agent_in("m-2", AgentState::Blocked, 190, blocked()),
+            ],
+        );
+        let s = screen(&mut app, 100, 34);
+        // Both members, the blocked one focused: named in the title.
+        assert!(s.contains("┌ feat/web ─"), "{s}");
+        assert!(s.contains("│  ● app  working 30s"), "{s}");
+        assert!(
+            s.contains("│▸ ▲ web  blocked 3m  permission · Bash: cargo test"),
+            "{s}"
+        );
+        assert!(s.contains("│▲ blocked for 3m · permission for Bash"), "{s}");
+        assert!(s.contains("←/→:member"), "{s}");
+
+        // → shows the other one (and enter would attach to it).
+        app.cycle_member(1);
+        app.sync_focus();
+        assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
+        app.peek.as_mut().unwrap().agent = Some("m-1".into());
+        let s = screen(&mut app, 100, 34);
+        assert!(s.contains("┌ feat/app ─"), "{s}");
+        assert!(s.contains("│▸ ● app  working 30s"), "{s}");
+        assert!(s.contains("│● working for 30s  (claude)"), "{s}");
     }
 }

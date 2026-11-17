@@ -10,7 +10,7 @@ use tam_proto::{AgentDetail, AgentState};
 
 use crate::task::{Task, TaskStatus};
 
-use super::app::{App, Mode, PaneTab, PickerState};
+use super::app::{App, MemberChoice, Mode, PaneTab, PickerState};
 use super::peek::{Peek, ScreenView};
 use super::triage;
 
@@ -72,11 +72,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::SpawnEnterPath(path) => {
             render_enter_path_popup(frame, path);
         }
-        Mode::ConfirmDropTask { name } => {
-            render_confirm_drop_popup(frame, name);
+        Mode::ConfirmDropTask { name, member } => {
+            render_confirm_drop_popup(frame, name, member.as_ref());
         }
-        Mode::ConfirmForceDrop { name, report, .. } => {
-            render_force_drop_popup(frame, name, report);
+        Mode::ConfirmForceDrop {
+            name,
+            target,
+            report,
+            ..
+        } => {
+            render_force_drop_popup(frame, name, name != target, report);
         }
         Mode::Notice { title, lines } => {
             render_notice_popup(frame, title, lines);
@@ -86,8 +91,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             lines,
             repairable,
             in_place,
+            member,
         } => {
-            render_repair_or_drop_popup(frame, name, lines, *repairable, *in_place);
+            render_repair_or_drop_popup(
+                frame,
+                name,
+                lines,
+                *repairable,
+                *in_place,
+                member.as_ref(),
+            );
         }
     }
 }
@@ -302,16 +315,29 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled("esc", Style::new().bold()),
                 Span::raw(":cancel"),
             ],
-            Mode::ConfirmDropTask { .. } => vec![
-                Span::styled(" y", Style::new().bold()),
-                Span::raw("/"),
-                Span::styled("enter", Style::new().bold()),
-                Span::raw(":drop  "),
-                Span::styled("b", Style::new().bold()),
-                Span::raw(":drop + delete branch  "),
-                Span::styled("any", Style::new().bold()),
-                Span::raw(":cancel"),
-            ],
+            Mode::ConfirmDropTask { ref member, .. } => {
+                let mut hints = vec![
+                    Span::styled(" y", Style::new().bold()),
+                    Span::raw("/"),
+                    Span::styled("enter", Style::new().bold()),
+                    Span::raw(":drop  "),
+                    Span::styled("b", Style::new().bold()),
+                    Span::raw(":drop + delete branch  "),
+                ];
+                if member.is_some() {
+                    hints.extend([
+                        Span::styled("m", Style::new().bold()),
+                        Span::raw("/"),
+                        Span::styled("M", Style::new().bold()),
+                        Span::raw(":member only  "),
+                    ]);
+                }
+                hints.extend([
+                    Span::styled("any", Style::new().bold()),
+                    Span::raw(":cancel"),
+                ]);
+                hints
+            }
             Mode::ConfirmForceDrop { .. } => vec![
                 Span::styled(" y", Style::new().bold()),
                 Span::raw(":drop anyway  "),
@@ -325,6 +351,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
             Mode::ConfirmRepairOrDrop {
                 repairable,
                 in_place,
+                ref member,
                 ..
             } => {
                 let mut hints = Vec::new();
@@ -342,6 +369,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                     hints.extend([
                         Span::styled("b", Style::new().bold()),
                         Span::raw(":drop + delete branch  "),
+                    ]);
+                }
+                if member.is_some() {
+                    hints.extend([
+                        Span::styled("m", Style::new().bold()),
+                        Span::raw(":member only  "),
                     ]);
                 }
                 hints.extend([
@@ -632,16 +665,52 @@ fn render_enter_path_popup(frame: &mut Frame, path: &str) {
     frame.render_widget(input_line, inner);
 }
 
-const DROP_KEYS: &str = "y drop · b drop + delete branch · n cancel";
+/// Asks to drop a task, or (with `member`, the focused member of a task
+/// with several) that member alone.
+fn render_confirm_drop_popup(frame: &mut Frame, name: &str, member: Option<&MemberChoice>) {
+    let red = |key: &'static str| Span::styled(key, Style::new().bold().fg(Color::Red));
+    let mut lines = match member {
+        None => vec![Line::from(vec![
+            Span::raw("Drop task "),
+            Span::styled(name, Style::new().bold()),
+            Span::raw("?"),
+        ])],
+        Some(m) => vec![
+            Line::from(vec![
+                Span::raw("Drop task "),
+                Span::styled(name, Style::new().bold()),
+                Span::raw(", or "),
+                Span::styled(m.label.as_str(), Style::new().bold()),
+                Span::raw(" only?"),
+            ]),
+            Line::from(vec![
+                red("m"),
+                Span::raw(format!(" drop {} only · ", m.label)),
+                red("M"),
+                Span::raw(" + delete its branch"),
+            ]),
+        ],
+    };
+    lines.push(Line::from(vec![
+        red("y"),
+        Span::raw(if member.is_some() {
+            " drop task · "
+        } else {
+            " drop · "
+        }),
+        red("b"),
+        Span::raw(" drop + delete branch · "),
+        Span::styled("n", Style::new().bold()),
+        Span::raw(" cancel"),
+    ]));
 
-fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
-    // Size to content: question and key line + padding + border
-    let content_width = ("Drop task ".len() + name.len() + 1).max(DROP_KEYS.chars().count());
-    // +8 for padding + border, 2 content rows + 2 border + 2 vertical padding = 6
+    // Size to content: +8 for padding + border, +4 rows for border + padding
+    let content_width = lines.iter().map(Line::width).max().unwrap_or(0);
     let width = (content_width as u16 + 8).max(30);
+    let height = lines.len() as u16 + 4;
     let area = frame
         .area()
-        .centered(Constraint::Length(width), Constraint::Length(6));
+        .centered(Constraint::Length(width), Constraint::Length(height));
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -655,27 +724,15 @@ fn render_confirm_drop_popup(frame: &mut Frame, name: &str) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let msg = Line::from(vec![
-        Span::raw("Drop task "),
-        Span::styled(name, Style::new().bold()),
-        Span::raw("?"),
-    ]);
-    let keys = Line::from(vec![
-        Span::styled("y", Style::new().bold().fg(Color::Red)),
-        Span::raw(" drop · "),
-        Span::styled("b", Style::new().bold().fg(Color::Red)),
-        Span::raw(" drop + delete branch · "),
-        Span::styled("n", Style::new().bold()),
-        Span::raw(" cancel"),
-    ]);
-    frame.render_widget(Paragraph::new(vec![msg, keys]), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The daemon refused a drop: show why (what it would lose), ask to force.
-fn render_force_drop_popup(frame: &mut Frame, name: &str, report: &[String]) {
+/// The daemon refused a drop (of a task, or of one `member`): show why
+/// (what it would lose), ask to force.
+fn render_force_drop_popup(frame: &mut Frame, name: &str, member: bool, report: &[String]) {
     let mut lines = vec![
         Line::from(vec![
-            Span::raw("Task "),
+            Span::raw(if member { "" } else { "Task " }),
             Span::styled(name, Style::new().bold()),
             Span::raw(" not dropped:"),
         ]),
@@ -722,6 +779,7 @@ fn render_repair_or_drop_popup(
     problems: &[String],
     repairable: bool,
     in_place: bool,
+    member: Option<&MemberChoice>,
 ) {
     let mut lines = vec![
         Line::from(vec![
@@ -748,6 +806,12 @@ fn render_repair_or_drop_popup(
         keys.extend([
             Span::styled("b", Style::new().bold().fg(Color::Red)),
             Span::raw(" drop + delete branch · "),
+        ]);
+    }
+    if let Some(m) = member {
+        keys.extend([
+            Span::styled("m", Style::new().bold().fg(Color::Red)),
+            Span::raw(format!(" drop {} only · ", m.label)),
         ]);
     }
     keys.extend([Span::styled("n", Style::new().bold()), Span::raw(" cancel")]);
@@ -908,13 +972,18 @@ mod tests {
         let mut app = App::new();
         app.mode = Mode::ConfirmDropTask {
             name: "feat".into(),
+            member: None,
         };
         let s = screen(&mut app, 80, 20);
         assert!(s.contains("Drop task feat?"), "{s}");
-        assert!(s.contains(DROP_KEYS), "{s}");
+        assert!(
+            s.contains("y drop · b drop + delete branch · n cancel"),
+            "{s}"
+        );
 
         app.mode = Mode::ConfirmForceDrop {
             name: "feat".into(),
+            target: "feat".into(),
             delete_branch: false,
             report: vec![
                 "/wt/app--feat (branch feat)".into(),
@@ -936,6 +1005,7 @@ mod tests {
             lines: vec!["worktree /w/app--feat is gone, branch 'feat' is still there".into()],
             repairable: true,
             in_place: false,
+            member: None,
         };
         let s = screen(&mut app, 100, 20);
         assert!(s.contains("Worktree Gone"), "{s}");
@@ -949,6 +1019,7 @@ mod tests {
                 .into()],
             repairable: false,
             in_place: true,
+            member: None,
         };
         let s = screen(&mut app, 60, 20);
         assert!(!s.contains("recreate ·"), "{s}");
@@ -1449,5 +1520,40 @@ mod tests {
         assert!(s.contains("│ 1 web"), "{s}");
         assert!(s.contains("│   docs"), "{s}");
         assert!(s.contains("tab:pick several"), "{s}");
+    }
+
+    #[test]
+    fn member_drop_dialogs_name_the_member() {
+        let mut app = App::new();
+        app.mode = Mode::ConfirmDropTask {
+            name: "feat".into(),
+            member: Some(MemberChoice {
+                id: "m-2".into(),
+                label: "feat/web".into(),
+            }),
+        };
+        let s = screen(&mut app, 100, 20);
+        if std::env::var_os("TAM_SHOW_SCREEN").is_some() {
+            println!("{s}");
+        }
+        assert!(s.contains("Drop task feat, or feat/web only?"), "{s}");
+        assert!(
+            s.contains("m drop feat/web only · M + delete its branch"),
+            "{s}"
+        );
+        assert!(
+            s.contains("y drop task · b drop + delete branch · n cancel"),
+            "{s}"
+        );
+        assert!(s.contains("m/M:member only"), "{s}");
+
+        app.mode = Mode::ConfirmForceDrop {
+            name: "feat/web".into(),
+            target: "m-2".into(),
+            delete_branch: false,
+            report: vec!["    ?? notes.txt".into()],
+        };
+        let s = screen(&mut app, 100, 20);
+        assert!(s.contains("│  feat/web not dropped:"), "{s}");
     }
 }

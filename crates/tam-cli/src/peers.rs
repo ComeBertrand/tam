@@ -4,8 +4,8 @@
 //!
 //! The caller is the member of `$TAM_AGENT_ID` (an agent tam started, any
 //! provider), else the member whose worktree holds the current directory.
-//! Everything is asked of the daemon when the command runs: membership can
-//! change while a session runs.
+//! Everything is asked of the daemon when the command runs: membership and
+//! the task's brief can change while a session runs.
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -77,6 +77,11 @@ pub async fn peers(all: bool, json: bool, from: Option<String>) -> Result<()> {
         let task = tasks.iter().find(|t| t.name == c.task)?;
         Some((c, task, task.member(&c.member)?))
     });
+    // The caller's task's brief, as the daemon has it now.
+    let brief = match &caller {
+        Some(caller) => client.get_brief(&caller.member).await.ok(),
+        None => None,
+    };
 
     if json {
         let out = json!({
@@ -86,6 +91,9 @@ pub async fn peers(all: bool, json: bool, from: Option<String>) -> Result<()> {
                 .iter()
                 .map(|r| member_json(r.task, r.member, Some(&r.address)))
                 .collect::<Vec<_>>(),
+            "brief": brief
+                .as_ref()
+                .map(|(task, brief)| crate::brief::BriefView::new(task, brief)),
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
@@ -102,6 +110,11 @@ pub async fn peers(all: bool, json: bool, from: Option<String>) -> Result<()> {
             member.id(),
             task.name
         );
+    }
+    if let Some((task, brief)) = &brief {
+        for line in crate::brief::lines(task, brief) {
+            println!("{line}");
+        }
     }
     if rows.is_empty() {
         match me {

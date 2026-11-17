@@ -23,6 +23,7 @@ macro_rules! eprintln {
     };
 }
 
+mod brief;
 mod cli;
 mod client;
 mod config;
@@ -77,11 +78,22 @@ async fn run(cli: Cli) -> Result<()> {
             json,
             repo,
             join,
+            brief,
         } => {
+            // A pattern may expand the brief, and give the start prompt.
+            let brief = match brief {
+                Some(brief) => Some(brief::expand(&brief::load_patterns()?, &brief)),
+                None => None,
+            };
+            let prompt = prompt.or_else(|| brief.as_ref().and_then(|b| b.prompt.clone()));
             let mut client = client::Client::connect().await?;
             // A task owns its worktrees: branch NAME of each repository.
             let (task, members) =
                 new_members(&mut client, &name, source.as_deref(), &repo, join, json).await?;
+            // Before the agents start: they are told it.
+            if let Some(brief) = &brief {
+                brief::set_new(&mut client, &task.name, &brief.reference).await?;
+            }
 
             let start = (!no_start).then_some(Start {
                 agent: None,
@@ -479,6 +491,14 @@ async fn run(cli: Cli) -> Result<()> {
         } => script::wait(name, until, timeout, json).await?,
 
         Commands::Result { name, json } => script::result(name, json).await?,
+
+        Commands::Brief {
+            name,
+            set,
+            local,
+            json,
+            from,
+        } => brief::brief(name, set, local, json, from).await?,
     }
 
     Ok(())

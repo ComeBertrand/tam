@@ -113,7 +113,8 @@ pub fn json_output(command: &Commands) -> bool {
         | Commands::History { json, .. }
         | Commands::Peers { json, .. }
         | Commands::Wait { json, .. }
-        | Commands::Result { json, .. } => *json,
+        | Commands::Result { json, .. }
+        | Commands::Brief { json, .. } => *json,
         _ => false,
     }
 }

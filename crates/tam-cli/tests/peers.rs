@@ -255,6 +255,31 @@ async fn agents_know_their_task_and_peers() {
         "{note}"
     );
     assert!(note.contains("tam msg frontend \"<text>\""), "{note}");
+    // ... its brief (the local file by default) and scratch directory, and
+    // that it can read its peer's worktree.
+    let task_dir = root.join("tasks").join("feat");
+    assert!(
+        note.contains(&format!(
+            "brief, what its members work from: the file {}.",
+            task_dir.join("brief.md").display()
+        )),
+        "{note}"
+    );
+    assert!(
+        note.contains(&format!("\"## backend ({backend})\"")),
+        "{note}"
+    );
+    assert!(
+        note.contains(&format!(
+            "shared by its members: {}.",
+            task_dir.join("scratch").display()
+        )),
+        "{note}"
+    );
+    assert!(
+        note.contains("\nYou can read the other members' worktrees, not edit them.\n"),
+        "{note}"
+    );
     // Other events print nothing: Claude reads a hook's stdout.
     let quiet = hook_notify(
         root,
@@ -290,6 +315,11 @@ async fn agents_know_their_task_and_peers() {
         note.contains(&format!("\n- docs ({docs}): repo docs")),
         "{note}"
     );
+    // Its agent started before docs joined: it was not given docs' worktree.
+    assert!(
+        note.contains("\nYou can read the worktrees of frontend, not edit them.\n"),
+        "{note}"
+    );
 
     let out = ok({
         let mut cmd = tam_as(root, &backend);
@@ -303,16 +333,29 @@ async fn agents_know_their_task_and_peers() {
         format!("You are backend ({backend}) in task feat."),
         "{out}"
     );
-    assert!(lines[1].starts_with("NAME "), "{out}");
+    assert_eq!(
+        lines[1],
+        format!(
+            "Brief of task feat: {}",
+            task_dir.join("brief.md").display()
+        ),
+        "{out}"
+    );
+    assert_eq!(
+        lines[2],
+        format!("Scratch: {}", task_dir.join("scratch").display()),
+        "{out}"
+    );
+    assert!(lines[3].starts_with("NAME "), "{out}");
     assert!(
-        lines[2].starts_with(&format!("frontend  {frontend}  idle ")),
+        lines[4].starts_with(&format!("frontend  {frontend}  idle ")),
         "{out}"
     );
     assert!(
-        lines[3].starts_with(&format!("docs      {docs}  idle ")),
+        lines[5].starts_with(&format!("docs      {docs}  idle ")),
         "{out}"
     );
-    assert_eq!(lines[4], "To message one: tam msg NAME \"<text>\"", "{out}");
+    assert_eq!(lines[6], "To message one: tam msg NAME \"<text>\"", "{out}");
 
     let json = peers_json(tam_as(root, &backend), &[]).await;
     assert_eq!(json["schema_version"], 1);
@@ -325,6 +368,16 @@ async fn agents_know_their_task_and_peers() {
     assert_eq!(json["peers"][0]["dir"], frontend_dir.to_str().unwrap());
     assert_eq!(json["peers"][0]["status"], "idle");
     assert_eq!(json["peers"][0]["agent"], Value::Null);
+    assert_eq!(json["brief"]["task"], "feat");
+    assert_eq!(json["brief"]["reference"], Value::Null);
+    assert_eq!(
+        json["brief"]["file"],
+        task_dir.join("brief.md").to_str().unwrap()
+    );
+    assert_eq!(
+        json["brief"]["scratch"],
+        task_dir.join("scratch").to_str().unwrap()
+    );
     assert_eq!(
         addresses(&json),
         [

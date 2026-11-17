@@ -53,6 +53,12 @@ pub enum Commands {
         /// Add the worktrees to the existing task NAME instead
         #[arg(long)]
         join: bool,
+
+        /// What the task's members work from: a URL, a ticket id or a path
+        /// (expanded by [[brief.patterns]] in the config; default: the file
+        /// brief.md in the task's directory, see tam brief)
+        #[arg(long, value_name = "REF", conflicts_with = "join")]
+        brief: Option<String>,
     },
 
     /// Start an agent in a task, resuming its current session
@@ -338,6 +344,36 @@ pub enum Commands {
         /// Output as JSON (see README, Scripting)
         #[arg(long)]
         json: bool,
+    },
+
+    /// Show or change a task's brief: what its members work from
+    ///
+    /// The brief is a reference you give (a URL, a ticket id, a path: tam
+    /// neither fetches nor reads it), else the file brief.md in the task's
+    /// directory, next to scratch/, a directory its members share for
+    /// transient notes. The members' agents are told at session start (a
+    /// change too: at their next one), and tam peers shows it. Dropping the
+    /// task removes the directory; a brief.md its members wrote in is kept.
+    Brief {
+        /// Task name, TASK/MEMBER or member id (default: the task of the
+        /// agent tam started, else of the current directory)
+        name: Option<String>,
+
+        /// Make REF the brief (expanded by [[brief.patterns]] in the config)
+        #[arg(short, long, value_name = "REF", conflicts_with = "local")]
+        set: Option<String>,
+
+        /// Make the file brief.md the brief again
+        #[arg(long)]
+        local: bool,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+
+        /// Agent id of the caller (set by tam in the agents it starts)
+        #[arg(long, env = "TAM_AGENT_ID", hide = true)]
+        from: Option<String>,
     },
 }
 

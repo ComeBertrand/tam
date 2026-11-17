@@ -125,7 +125,8 @@ The daemon checks every task's worktree against git (`git worktree list`) when i
 ### Observing
 
 ```
-tam ps                         Task table with computed status
+tam ps                         Task table with computed status, a row per member
+                               of a task with several
 tam ps --json                  Machine-readable output
 
 tam ls                         Discover projects and worktrees

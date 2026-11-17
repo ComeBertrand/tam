@@ -36,6 +36,7 @@ mod task;
 mod tui;
 
 mod output;
+mod ps;
 mod schema;
 mod script;
 
@@ -322,50 +323,8 @@ async fn run(cli: Cli) -> Result<()> {
 
             tasks.sort_by_key(|t| (t.status().sort_priority(), t.name.clone()));
 
-            if tasks.is_empty() {
-                println!("No tasks.");
-            } else {
-                println!(
-                    "{:<12} {:<15} {:<10} {:>5} {:>5} {:<30} {:>5}",
-                    "STATUS", "TASK", "AGENT", "RUNS", "LAST", "DIR", "CTX"
-                );
-                for t in &tasks {
-                    let dir = t
-                        .dir()
-                        .map(|d| shorten_home(&d.display().to_string()))
-                        .unwrap_or_else(|| "-".into());
-                    let agent = t.agent_info().map(|a| a.provider.as_str()).unwrap_or("-");
-                    let ctx = t
-                        .agent_info()
-                        .and_then(|a| a.context_percent)
-                        .map(|p| format!("{}%", p))
-                        .unwrap_or_else(|| "-".into());
-                    println!(
-                        "{:<12} {:<15} {:<10} {:>5} {:>5} {:<30} {:>5}",
-                        t.status().indicator(),
-                        t.name,
-                        agent,
-                        t.run_count,
-                        format_age(t.last_activity),
-                        dir,
-                        ctx,
-                    );
-                }
-                // What is wrong with the worktrees, and what to do about it.
-                let notes: Vec<String> = tasks
-                    .iter()
-                    .flat_map(|t| {
-                        t.members
-                            .iter()
-                            .filter_map(|m| health::ps_note(&t.member_label(m), &t.name, &m.info))
-                    })
-                    .collect();
-                if !notes.is_empty() {
-                    println!();
-                    for note in notes {
-                        println!("{note}");
-                    }
-                }
+            for line in ps::lines(&tasks) {
+                println!("{line}");
             }
         }
 

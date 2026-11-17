@@ -22,10 +22,16 @@ pub enum Mode {
     SpawnEnterPath(String),
     ConfirmDropTask {
         name: String,
+        /// The focused member, when the task has others: it can be dropped
+        /// alone.
+        member: Option<MemberChoice>,
     },
     /// The daemon refused the drop: `report` tells why (work it would lose).
     ConfirmForceDrop {
+        /// What is dropped, as shown: the task name or a member label.
         name: String,
+        /// What `DropTask` names: the task, or the member's id.
+        target: String,
         delete_branch: bool,
         report: Vec<String>,
     },
@@ -44,7 +50,18 @@ pub enum Mode {
         lines: Vec<String>,
         repairable: bool,
         in_place: bool,
+        /// The focused member, when the task has others: it can be dropped
+        /// alone.
+        member: Option<MemberChoice>,
     },
+}
+
+/// A member a drop dialog offers to drop alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberChoice {
+    pub id: String,
+    /// How to name it (`<task>/<member>`).
+    pub label: String,
 }
 
 /// Which view of the focused member the detail pane shows.

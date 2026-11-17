@@ -262,7 +262,10 @@ adopt). `tam-cli` depends on all three.
   (`MemberDropped`: the member leaves the folded state, so compaction drops
   its history; remaining members' short names are derived again). A task's
   last member takes the task (a warning says so), also when another drop took
-  the others meanwhile (counted again under the claim).
+  the others meanwhile (counted again under the claim). In the dashboard, the
+  drop dialogs of a task with several members offer the focused member alone
+  (`m`, `M` with its branch; `MemberChoice`), sent by member id: `<task>/<member>`
+  could name another task.
 
 ## Build & check
 

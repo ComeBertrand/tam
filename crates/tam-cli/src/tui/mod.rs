@@ -22,7 +22,7 @@ use crate::repos;
 use crate::task::{Member, Task};
 use tam_proto::SessionChoice;
 
-use self::app::{App, Mode, PaneTab, PickerItem, PickerState, TaskDetail};
+use self::app::{App, MemberChoice, Mode, PaneTab, PickerItem, PickerState, TaskDetail};
 use self::peek::{Peek, Scroll};
 
 /// Actions returned from the event loop.
@@ -40,8 +40,11 @@ enum Action {
         id: String,
         label: String,
     },
+    /// Drop a task, or one member of it (`name`: the member's id).
     DropTask {
         name: String,
+        /// How to name what is dropped: the task name, or the member label.
+        label: String,
         force: bool,
         delete_branch: bool,
     },
@@ -281,10 +284,11 @@ async fn run_loop(
             }
             Action::DropTask {
                 name,
+                label,
                 force,
                 delete_branch,
             } => {
-                drop_task(client, app, &name, force, delete_branch).await;
+                drop_task(client, app, &name, &label, force, delete_branch).await;
                 refresh_peek(client, app).await;
             }
             Action::NewTask => {
@@ -418,13 +422,16 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
                 .selected_task()
                 .is_some_and(|t| t.unhealthy_members().next().is_some()) =>
         {
-            app.mode = repair_or_drop_dialog(app.selected_task().expect("selected"));
+            let member = member_choice(app);
+            app.mode = repair_or_drop_dialog(app.selected_task().expect("selected"), member);
             Action::None
         }
         (KeyCode::Char('d'), _) => {
+            let member = member_choice(app);
             if let Some(task) = app.selected_task() {
                 app.mode = Mode::ConfirmDropTask {
                     name: task.name.clone(),
+                    member,
                 };
             }
             Action::None
@@ -606,25 +613,42 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
 /// `y`/enter: drop, keeping the branch; `b`: drop and delete the branch;
 /// anything else cancels.
 fn handle_confirm_drop_key(key: KeyEvent, app: &mut App) -> Action {
-    let Mode::ConfirmDropTask { name } = std::mem::replace(&mut app.mode, Mode::Normal) else {
+    let Mode::ConfirmDropTask { name, member } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
         return Action::None;
     };
-    let delete_branch = match key.code {
-        KeyCode::Char('y') | KeyCode::Enter => false,
-        KeyCode::Char('b') => true,
+    let (target, label, delete_branch) = match (key.code, member) {
+        (KeyCode::Char('y') | KeyCode::Enter, _) => (name.clone(), name, false),
+        (KeyCode::Char('b'), _) => (name.clone(), name, true),
+        // The focused member alone.
+        (KeyCode::Char('m'), Some(m)) => (m.id, m.label, false),
+        (KeyCode::Char('M'), Some(m)) => (m.id, m.label, true),
         _ => return Action::None,
     };
     Action::DropTask {
-        name,
+        name: target,
+        label,
         force: false,
         delete_branch,
     }
+}
+
+/// The member a drop dialog offers to drop alone: the focused one (the one
+/// the pane shows, else the one the task's status is about), when its task
+/// has others.
+fn member_choice(app: &App) -> Option<MemberChoice> {
+    let (task, member) = app.focused_member()?;
+    (task.members.len() > 1).then(|| MemberChoice {
+        id: member.id().to_string(),
+        label: task.member_label(member),
+    })
 }
 
 /// `y`: drop anyway, losing the reported work; anything else cancels.
 fn handle_confirm_force_drop_key(key: KeyEvent, app: &mut App) -> Action {
     let Mode::ConfirmForceDrop {
         name,
+        target,
         delete_branch,
         ..
     } = std::mem::replace(&mut app.mode, Mode::Normal)
@@ -636,7 +660,8 @@ fn handle_confirm_force_drop_key(key: KeyEvent, app: &mut App) -> Action {
         return Action::None;
     }
     Action::DropTask {
-        name,
+        name: target,
+        label: name,
         force: true,
         delete_branch,
     }
@@ -644,7 +669,7 @@ fn handle_confirm_force_drop_key(key: KeyEvent, app: &mut App) -> Action {
 
 /// The dialog for a task with gone or unusable worktrees: what is wrong with
 /// each, and whether any can be recreated.
-fn repair_or_drop_dialog(task: &Task) -> Mode {
+fn repair_or_drop_dialog(task: &Task, member: Option<MemberChoice>) -> Mode {
     let lines = task
         .unhealthy_members()
         .filter_map(|m| {
@@ -663,30 +688,35 @@ fn repair_or_drop_dialog(task: &Task) -> Mode {
             .unhealthy_members()
             .any(|m| crate::health::repairable(&m.info)),
         in_place: task.members.iter().any(|m| !m.is_unhealthy()),
+        member,
     }
 }
 
 /// `r`: recreate the worktrees that can be; `y`: drop, keeping the branches;
-/// `b` (with a worktree in place): drop and delete the branches; anything
-/// else, enter included, cancels.
+/// `b` (with a worktree in place): drop and delete the branches; `m` (in a
+/// task with several members): drop the focused member alone, keeping its
+/// branch; anything else, enter included, cancels.
 fn handle_repair_or_drop_key(key: KeyEvent, app: &mut App) -> Action {
     let Mode::ConfirmRepairOrDrop {
         name,
         repairable,
         in_place,
+        member,
         ..
     } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
         return Action::None;
     };
-    let delete_branch = match key.code {
-        KeyCode::Char('r') if repairable => return Action::RepairTask { name },
-        KeyCode::Char('y') => false,
-        KeyCode::Char('b') if in_place => true,
+    let (target, label, delete_branch) = match (key.code, member) {
+        (KeyCode::Char('r'), _) if repairable => return Action::RepairTask { name },
+        (KeyCode::Char('y'), _) => (name.clone(), name, false),
+        (KeyCode::Char('b'), _) if in_place => (name.clone(), name, true),
+        (KeyCode::Char('m'), Some(m)) => (m.id, m.label, false),
         _ => return Action::None,
     };
     Action::DropTask {
-        name,
+        name: target,
+        label,
         force: false,
         delete_branch,
     }
@@ -1111,17 +1141,19 @@ async fn stop_agent(client: &mut Client, app: &mut App, id: &str, label: &str) -
     Ok(())
 }
 
-/// Ask the daemon to drop a task. A refusal opens the force dialog with what
-/// would be lost, a failure or warnings a notice; the task list follows the
-/// daemon's events.
+/// Ask the daemon to drop a task, or one member of it (`target`: the
+/// member's id; `name` says what is dropped). A refusal opens the force
+/// dialog with what would be lost, a failure or warnings a notice; the task
+/// list follows the daemon's events.
 async fn drop_task(
     client: &mut Client,
     app: &mut App,
+    target: &str,
     name: &str,
     force: bool,
     delete_branch: bool,
 ) {
-    match client.drop_task(name, force, delete_branch).await {
+    match client.drop_task(target, force, delete_branch).await {
         Ok(DropOutcome::Dropped { warnings }) if warnings.is_empty() => {
             app.set_status(format!("Dropped '{name}'"), Duration::from_secs(3));
         }
@@ -1136,6 +1168,7 @@ async fn drop_task(
         Ok(DropOutcome::Refused { worktrees }) => {
             app.mode = Mode::ConfirmForceDrop {
                 name: name.into(),
+                target: target.into(),
                 delete_branch,
                 report: crate::drop_report::lines(&worktrees),
             };
@@ -1253,7 +1286,10 @@ mod tests {
 
     fn confirming(name: &str) -> App {
         let mut app = App::new();
-        app.mode = Mode::ConfirmDropTask { name: name.into() };
+        app.mode = Mode::ConfirmDropTask {
+            name: name.into(),
+            member: None,
+        };
         app
     }
 
@@ -1263,7 +1299,7 @@ mod tests {
         let action = handle_confirm_drop_key(press('y'), &mut app);
         assert!(matches!(
             action,
-            Action::DropTask { ref name, force: false, delete_branch: false } if name == "feat"
+            Action::DropTask { ref name, force: false, delete_branch: false, .. } if name == "feat"
         ));
         assert!(matches!(app.mode, Mode::Normal));
 
@@ -1292,6 +1328,7 @@ mod tests {
             let mut app = App::new();
             app.mode = Mode::ConfirmForceDrop {
                 name: "feat".into(),
+                target: "feat".into(),
                 delete_branch: true,
                 report: vec![],
             };
@@ -1381,8 +1418,11 @@ mod tests {
                 lines,
                 repairable,
                 in_place,
+                member,
             } => {
                 assert_eq!(name, "feat");
+                // A single member: nothing to drop alone.
+                assert!(member.is_none());
                 assert!(*repairable);
                 assert!(!*in_place);
                 assert_eq!(
@@ -1404,13 +1444,13 @@ mod tests {
             press('b'),
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         ] {
-            app.mode = repair_or_drop_dialog(&app.tasks[0]);
+            app.mode = repair_or_drop_dialog(&app.tasks[0], None);
             assert!(matches!(
                 handle_key_event(key, &mut app, &config),
                 Action::None
             ));
         }
-        app.mode = repair_or_drop_dialog(&app.tasks[0]);
+        app.mode = repair_or_drop_dialog(&app.tasks[0], None);
         assert!(matches!(
             handle_key_event(press('y'), &mut app, &config),
             Action::DropTask {
@@ -1824,5 +1864,106 @@ mod tests {
         assert!(
             matches!(action, Action::DoNewTask { ref name, ref dirs } if name == "feat" && *dirs == expected)
         );
+    }
+
+    /// An app showing task `feat` with members `api` (m-1) and `web` (m-2),
+    /// web's worktree with `web_health`.
+    fn app_with_two(web_health: Option<tam_proto::MemberHealth>) -> App {
+        let info: tam_proto::TaskInfo = serde_json::from_value(serde_json::json!({
+            "name": "feat",
+            "members": [
+                {"id": "m-1", "name": "api", "repo": "api", "branch": "feat", "dir": "/w/api--feat"},
+                {"id": "m-2", "name": "web", "repo": "web", "branch": "feat", "dir": "/w/web--feat",
+                 "health": web_health},
+            ],
+            "created_at": 0,
+        }))
+        .unwrap();
+        let mut app = App::new();
+        app.set_tasks(vec![Task::from_info(info, &[])]);
+        app
+    }
+
+    #[test]
+    fn drop_dialog_offers_the_focused_member_alone() {
+        let config = Config::default();
+        let open = || {
+            let mut app = app_with_two(None);
+            handle_normal_key(press('d'), &mut app, &config);
+            let Mode::ConfirmDropTask { name, member } = &app.mode else {
+                panic!("expected the drop dialog");
+            };
+            assert_eq!(name, "feat");
+            let member = member.clone().expect("a member to drop alone");
+            assert!(["feat/api", "feat/web"].contains(&member.label.as_str()));
+            (app, member)
+        };
+
+        // `m`: that member, by id, keeping its branch; `M`: and its branch.
+        let (mut app, member) = open();
+        let action = handle_key_event(press('m'), &mut app, &config);
+        assert!(matches!(
+            action,
+            Action::DropTask { ref name, ref label, force: false, delete_branch: false }
+                if *name == member.id && *label == member.label
+        ));
+        let (mut app, member) = open();
+        let shift_m = KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT);
+        assert!(matches!(
+            handle_key_event(shift_m, &mut app, &config),
+            Action::DropTask { ref name, delete_branch: true, .. } if *name == member.id
+        ));
+        // `y` still drops the task.
+        let (mut app, _) = open();
+        assert!(matches!(
+            handle_key_event(press('y'), &mut app, &config),
+            Action::DropTask { ref name, ref label, .. } if name == "feat" && label == "feat"
+        ));
+
+        // A single member: nothing to drop alone, `m` cancels.
+        let mut app = app_with(None);
+        handle_normal_key(press('d'), &mut app, &config);
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDropTask { member: None, .. }
+        ));
+        assert!(matches!(
+            handle_key_event(press('m'), &mut app, &config),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn a_gone_member_can_be_dropped_alone() {
+        let config = Config::default();
+        let gone = tam_proto::MemberHealth::Gone {
+            cannot_repair: Some("branch 'feat' no longer exists".into()),
+        };
+        let mut app = app_with_two(Some(gone));
+        handle_normal_key(press('d'), &mut app, &config);
+        let Mode::ConfirmRepairOrDrop { member, .. } = &app.mode else {
+            panic!("expected the repair-or-drop dialog");
+        };
+        let member = member.clone().expect("a member to drop alone");
+        assert!(matches!(
+            handle_key_event(press('m'), &mut app, &config),
+            Action::DropTask { ref name, delete_branch: false, .. } if *name == member.id
+        ));
+    }
+
+    #[test]
+    fn a_forced_member_drop_names_the_member() {
+        let mut app = App::new();
+        app.mode = Mode::ConfirmForceDrop {
+            name: "feat/web".into(),
+            target: "m-2".into(),
+            delete_branch: false,
+            report: vec![],
+        };
+        assert!(matches!(
+            handle_confirm_force_drop_key(press('y'), &mut app),
+            Action::DropTask { ref name, ref label, force: true, .. }
+                if name == "m-2" && label == "feat/web"
+        ));
     }
 }

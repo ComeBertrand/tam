@@ -32,7 +32,8 @@ pub enum Commands {
         #[arg(long)]
         no_start: bool,
 
-        /// Start the agent on this prompt
+        /// Start the agent on this prompt (each agent, with several
+        /// repositories)
         #[arg(short, long, value_name = "TEXT", conflicts_with = "no_start")]
         prompt: Option<String>,
 

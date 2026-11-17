@@ -286,24 +286,29 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
 Running `tam` with no arguments opens the dashboard:
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│  tam — 4 tasks (1 needs input)                                             │
-├────────────────────────────────────────────────────────────────────────────┤
-│  STATUS    REPO     TASK          AGENT   DIR                        CTX   │
-│  ● run     myapp    feat          claude  ~/wt/myapp--feat           34%   │
-│▸ ▲ input   myapp    fix-nav       claude  ~/wt/myapp--fix-nav        67%   │
-│  ○ idle    myapp    refactor      -       ~/wt/myapp--refactor       -     │
-│  ◌ stale   other    old-thing     -       ~/wt/other--old-thing      -     │
-├────────────────────────────────────────────────────────────────────────────┤
-│  enter:attach  n:new  r:run  R:new session  s:stop  d:drop  p:peek  q:quit │
-└────────────────────────────────────────────────────────────────────────────┘
+ tam — 7 tasks · 3 need you                                       by repository
+STATUS          TASK                   BRANCH AGENT  CTX
+backend
+▲ block      3m fix-allotment-rounding ↑2 *1  claude 67%
+● run       20s perf                   =      claude 31%
+◌ stale     45d spike-cache            ↑5 ↓12 -
+backend + frontend
+? question   5m unit-pricing
+● run        1m  ├ backend             ↑1 *3  claude 12%
+? question   5m  └ frontend            ↑1     claude 40%
+frontend
+○ idle       2d nav                    =      -
+✗ gone       3d old-banner                    -
+rustpallet
+▲ input     12m offload-explain        ↑3 ↓1  claude 55%
+ enter:attach  s:stop  d:drop  n:new  p:peek  /:filter  g:attention first  q:quit
 ```
 
-Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task (`tab` picks several repositories; an existing task's name adds them to it), `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; in a task with several members, `m` drops the focused member only, `M` with its branch; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), `p` toggles peek (the agent's screen, kept by the daemon at the agent's terminal size; `PgUp`/`PgDn` scroll through its history, `Home` goes to the oldest line, `End` back to live), `/` filters, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard.
+Tasks are grouped by repository (a task in several under one header naming them, e.g. `backend + frontend`), the most urgent first in each (blocked/question → error → input → running → idle → stale → gone), then by name. `g` lists them most urgent first across repositories instead, with a REPO column. A task with several members has a row per member below its own, which shows the most urgent member's status; `▸` marks the member the keys act on. Next to the status, how long it has been in it (without an agent: since the task's last activity). BRANCH compares each worktree with the default branch: `↑` commits ahead, `↓` behind, `*` paths with uncommitted changes, `=` none of them (`…` until git was asked). Git is asked, read-only and one worktree at a time, about every worktree once a minute and after its agent's state changes, and every 10 seconds about the one the pane shows. From 100 columns a last column says what each member waits on. Columns the width cannot hold go first (AGENT, then CTX), task names last.
 
-The pane `p` opens tells what the selected task needs from you, without attaching: its agent's state and since when, the permission it waits on (the tool and its input), its question, its last message, why its turn failed, what auto mode refused, its branch against the default branch with its diff stat, its latest messages, and the agent's screen below. `tab` shows the screen on the whole pane. In a task with several members it shows the one that needs you; `←`/`→` show another, and the member keys (`enter`, `s`, `r`, `R`) act on the member shown.
+Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task (`tab` picks several repositories; an existing task's name adds them to it), `r` runs the agent in its current session, `R` in a new session, `s` stops, `d` drops (then `y` keeps the branch, `b` deletes it; in a task with several members, `m` drops the focused member only, `M` with its branch; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), `p` toggles peek (the agent's screen, kept by the daemon at the agent's terminal size; `PgUp`/`PgDn` scroll through its history, `Home` goes to the oldest line, `End` back to live), `/` filters, `g` switches between grouped by repository and attention first, `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard. The footer shows the keys that fit.
 
-Tasks are sorted by repository name, then by status priority (blocked/question → error → input → running → idle → stale → gone), then by task name.
+The pane `p` opens tells what the selected task needs from you, without attaching: its agent's state and since when, the permission it waits on (the tool and its input), its question, its last message, why its turn failed, what auto mode refused, its branch against the default branch with its diff stat, its latest messages, and the agent's screen below. `tab` shows the screen on the whole pane. In a task with several members it shows the one that needs you; `←`/`→` show another, and the member keys (`enter`, `s`, `r`, `R`) act on the member shown. From 136 columns the pane opens beside the list (wide enough for an agent's 80-column screen), else below it.
 
 ### Setup
 

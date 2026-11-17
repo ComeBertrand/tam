@@ -155,7 +155,7 @@ pub fn run_custom_command(
     Ok(())
 }
 
-const RESERVED_KEYS: &[char] = &['q', 'j', 'k', 'n', 'r', 'R', 's', 'p', 'd', '/'];
+const RESERVED_KEYS: &[char] = &['q', 'j', 'k', 'n', 'r', 'R', 's', 'p', 'd', '/', 'g'];
 
 fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();

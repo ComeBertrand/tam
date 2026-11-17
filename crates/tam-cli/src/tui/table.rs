@@ -1,0 +1,443 @@
+//! The task list: a row per task, under a header row per repository (or
+//! the most urgent first), and a row per member below a task with several.
+//! Its columns fit the width: the least useful go first when it is narrow.
+
+use ratatui::layout::{Constraint, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Cell, Row as TableRow, Table, TableState};
+use ratatui::Frame;
+use tam_proto::AgentState;
+
+use crate::task::{Member, Task};
+
+use super::app::{self, App, Order, Row};
+use super::branch::Observation;
+use super::triage::{age, one_line};
+use super::ui::{agent_detail_line, context_display, first_line, status_display};
+
+/// From this width on, a column says what each member waits on.
+const NOTE_FROM: u16 = 100;
+/// The note column's narrowest.
+const NOTE_MIN: u16 = 20;
+/// Task names this long are not cut while other columns can make room.
+const TASK_WANTED: u16 = 20;
+/// Between columns.
+const SPACING: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Col {
+    Status,
+    /// Time in state.
+    Age,
+    Task,
+    /// Shown when the list is not grouped by repository.
+    Repo,
+    /// Ahead, behind, uncommitted.
+    Branch,
+    Agent,
+    Ctx,
+    /// What the member waits on.
+    Note,
+}
+
+/// Columns dropped first when the list is too narrow for them all.
+const DROP_ORDER: [Col; 6] = [
+    Col::Note,
+    Col::Agent,
+    Col::Ctx,
+    Col::Branch,
+    Col::Repo,
+    Col::Age,
+];
+
+impl Col {
+    fn header(self) -> &'static str {
+        match self {
+            Col::Status => "STATUS",
+            Col::Age | Col::Note => "",
+            Col::Task => "TASK",
+            Col::Repo => "REPO",
+            Col::Branch => "BRANCH",
+            Col::Agent => "AGENT",
+            Col::Ctx => "CTX",
+        }
+    }
+
+    /// Fixed widths, so that the columns do not move as states change.
+    fn fixed_width(self) -> Option<u16> {
+        match self {
+            Col::Status => Some(10), // "? question"
+            Col::Age => Some(4),     // "999d"
+            Col::Ctx => Some(4),     // "100%"
+            _ => None,
+        }
+    }
+}
+
+/// Draw the rows of `app` (at least one) in `area`, keeping the selected
+/// task's rows (its group's header when it is the first in it, its
+/// members') in view.
+pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
+    let now = crate::task::now();
+    let rows = app.rows();
+    let focused = app.focused_member().map(|(_, m)| m.id().to_string());
+    let selected = app.selected_task().map(|t| t.name.clone());
+
+    let mut cols = vec![Col::Status, Col::Age, Col::Task];
+    if app.order == Order::Attention {
+        cols.push(Col::Repo);
+    }
+    cols.extend([Col::Branch, Col::Agent, Col::Ctx]);
+    if area.width >= NOTE_FROM {
+        cols.push(Col::Note);
+    }
+    let cell = |row: &Row, col| match *row {
+        Row::Group(_) => Line::default(),
+        Row::Task(task) => task_cell(col, task, app, now),
+        Row::Member { task, member, last } => {
+            let marked = focused.as_deref() == Some(member.id());
+            member_cell(col, task, member, last, marked, app, now)
+        }
+    };
+    let mut cells: Vec<Vec<Line<'static>>> = rows
+        .iter()
+        .map(|row| cols.iter().map(|&col| cell(row, col)).collect())
+        .collect();
+
+    let widths = fit(&mut cols, &mut cells, area.width);
+    let task_width = cols
+        .iter()
+        .position(|&c| c == Col::Task)
+        .map_or(0, |i| widths[i]);
+    let note_width = area.width.saturating_sub(
+        widths.iter().sum::<u16>() + SPACING * (cols.len() as u16).saturating_sub(1),
+    );
+
+    let header = TableRow::new(cols.iter().map(|c| Cell::from(c.header())))
+        .style(Style::new().fg(Color::DarkGray));
+    let table_rows: Vec<TableRow> = rows
+        .iter()
+        .zip(cells)
+        .map(|(row, cells)| match row {
+            Row::Group(task) => TableRow::new([Cell::from(Line::from(vec![Span::styled(
+                app::repo_group(task),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]))
+            .column_span(cols.len() as u16)]),
+            _ => TableRow::new(cols.iter().zip(cells).map(|(&col, line)| {
+                Cell::from(match col {
+                    Col::Task => ellipsize(line, task_width),
+                    Col::Note => ellipsize(line, note_width),
+                    _ => line,
+                })
+            })),
+        })
+        .collect();
+
+    let constraints: Vec<Constraint> = cols
+        .iter()
+        .zip(&widths)
+        .map(|(&col, &w)| match col {
+            Col::Note => Constraint::Fill(1),
+            _ => Constraint::Length(w),
+        })
+        .collect();
+
+    // The selected task's rows, from its group's header when it is the
+    // first in it.
+    let selected_row = rows
+        .iter()
+        .position(|r| matches!(r, Row::Task(t) if Some(&t.name) == selected.as_ref()));
+    let block = selected_row.map(|i| {
+        let start = if i > 0 && matches!(rows[i - 1], Row::Group(_)) {
+            i - 1
+        } else {
+            i
+        };
+        let members = rows[i + 1..]
+            .iter()
+            .take_while(|r| matches!(r, Row::Member { .. }))
+            .count();
+        (start, i, i + 1 + members)
+    });
+    let height = area.height.saturating_sub(1) as usize;
+    let mut offset = app.table_offset.min(rows.len().saturating_sub(height));
+    if let Some((start, row, end)) = block {
+        if start < offset {
+            offset = start;
+        } else if end > offset + height {
+            // Taller than the list: from the task's row.
+            offset = (end - height).min(row);
+        }
+    }
+    drop(rows);
+
+    let table = Table::new(table_rows, constraints)
+        .header(header)
+        .column_spacing(SPACING)
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = TableState::new()
+        .with_offset(offset)
+        .with_selected(selected_row);
+    frame.render_stateful_widget(table, area, &mut state);
+    app.table_offset = state.offset();
+}
+
+/// Column widths for `width` columns: drops the columns that do not fit
+/// (from `cols` and each row of `cells`), the task column as wide as its
+/// longest name while there is room.
+fn fit(cols: &mut Vec<Col>, cells: &mut [Vec<Line<'static>>], width: u16) -> Vec<u16> {
+    let natural = |cols: &[Col], cells: &[Vec<Line>], i: usize| {
+        cols[i].fixed_width().unwrap_or_else(|| {
+            cells
+                .iter()
+                .map(|row| row[i].width() as u16)
+                .chain([cols[i].header().len() as u16])
+                .max()
+                .unwrap_or(0)
+        })
+    };
+    let others = |cols: &[Col], cells: &[Vec<Line>]| {
+        let mut sum = SPACING * (cols.len() as u16).saturating_sub(1);
+        for (i, col) in cols.iter().enumerate() {
+            sum += match col {
+                Col::Task => 0,
+                Col::Note => NOTE_MIN,
+                _ => natural(cols, cells, i),
+            };
+        }
+        sum
+    };
+    let task = cols
+        .iter()
+        .position(|&c| c == Col::Task)
+        .expect("task column");
+    let wanted = natural(cols, cells, task).min(TASK_WANTED);
+    for drop in DROP_ORDER {
+        if others(cols, cells) + wanted <= width {
+            break;
+        }
+        if let Some(i) = cols.iter().position(|&c| c == drop) {
+            cols.remove(i);
+            for row in cells.iter_mut() {
+                row.remove(i);
+            }
+        }
+    }
+    let task_width = natural(
+        cols,
+        cells,
+        cols.iter().position(|&c| c == Col::Task).unwrap(),
+    )
+    .min(width.saturating_sub(others(cols, cells)));
+    (0..cols.len())
+        .map(|i| match cols[i] {
+            Col::Task => task_width,
+            Col::Note => 0,
+            _ => natural(cols, cells, i),
+        })
+        .collect()
+}
+
+/// A task's row: its only member's, or for a task with several, its status
+/// (the most urgent member's) and name, the members' rows below saying the
+/// rest.
+fn task_cell(col: Col, task: &Task, app: &App, now: u64) -> Line<'static> {
+    if let [member] = &task.members[..] {
+        return match col {
+            Col::Task => Line::raw(task.name.clone()),
+            Col::Repo => Line::raw(member.info.repo.clone()),
+            _ => member_cell(col, task, member, false, false, app, now),
+        };
+    }
+    match col {
+        Col::Status => status_cell(task.status()),
+        Col::Age => app::most_urgent(task)
+            .map(|m| age_cell(task, m, now))
+            .unwrap_or_default(),
+        Col::Task => Line::styled(task.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+        Col::Repo => Line::raw(app::repo_group(task)),
+        _ => Line::default(),
+    }
+}
+
+/// A member's cells. `last`: the last of its task's members' rows;
+/// `marked`: the member the keys act on.
+fn member_cell(
+    col: Col,
+    task: &Task,
+    member: &Member,
+    last: bool,
+    marked: bool,
+    app: &App,
+    now: u64,
+) -> Line<'static> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let agent = member.agent_info.as_ref();
+    match col {
+        Col::Status => status_cell(task.member_status(member)),
+        Col::Age => age_cell(task, member, now),
+        Col::Task => {
+            let tree = if last { "└" } else { "├" };
+            let (mark, style) = if marked {
+                ("▸", Style::new().add_modifier(Modifier::BOLD))
+            } else {
+                (" ", Style::new())
+            };
+            Line::from(vec![
+                Span::styled(format!(" {tree}"), dim),
+                Span::styled(mark, style),
+                Span::styled(member.info.name.clone(), style),
+            ])
+        }
+        Col::Repo => Line::default(),
+        Col::Branch => branch_cell(member, app.branches.get(member.id())),
+        Col::Agent => match agent {
+            Some(a) => Line::raw(a.provider.clone()),
+            None => Line::styled("-", dim),
+        },
+        Col::Ctx => agent
+            .and_then(|a| a.context_percent)
+            .map(|p| Line::from(context_display(p)))
+            .unwrap_or_default(),
+        Col::Note => note_cell(member),
+    }
+}
+
+fn status_cell(status: crate::task::TaskStatus) -> Line<'static> {
+    let (text, color) = status_display(&status);
+    Line::styled(text, Style::new().fg(color))
+}
+
+/// How long the member has been in its state: its agent's, else since the
+/// task's last activity (idle for so long).
+fn age_cell(task: &Task, member: &Member, now: u64) -> Line<'static> {
+    let since = match &member.agent_info {
+        Some(agent) => agent.state_since,
+        None => task.last_activity,
+    };
+    match since {
+        Some(since) => Line::styled(
+            age(now.saturating_sub(since)),
+            Style::new().fg(Color::DarkGray),
+        )
+        .right_aligned(),
+        None => Line::default(),
+    }
+}
+
+/// The member's branch against the default branch: `↑` commits ahead, `↓`
+/// behind, `*` paths with uncommitted changes, `=` none of them; `…` until
+/// git was asked, `?` when it could not tell. Nothing for a gone worktree
+/// (its status says so).
+fn branch_cell(member: &Member, observation: Option<&Observation>) -> Line<'static> {
+    let dim = Style::new().fg(Color::DarkGray);
+    if member.is_unhealthy() {
+        return Line::default();
+    }
+    let state = match observation.and_then(|o| o.state.as_ref()) {
+        None => return Line::styled("…", dim),
+        Some(Err(_)) => return Line::styled("?", dim),
+        Some(Ok(state)) => state,
+    };
+    let mut parts = Vec::new();
+    if state.ahead > 0 {
+        parts.push(Span::raw(format!("↑{}", state.ahead)));
+    }
+    if state.behind > 0 {
+        parts.push(Span::styled(format!("↓{}", state.behind), dim));
+    }
+    if state.uncommitted > 0 {
+        parts.push(Span::styled(
+            format!("*{}", state.uncommitted),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if parts.is_empty() {
+        return Line::styled("=", dim);
+    }
+    let mut spans = Vec::new();
+    for part in parts {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(part);
+    }
+    Line::from(spans)
+}
+
+/// What the member waits on, on one line: the permission or question, why
+/// its turn failed or what auto mode refused, the start of its last
+/// message; what is wrong with its worktree.
+fn note_cell(member: &Member) -> Line<'static> {
+    let dim = Style::new().fg(Color::DarkGray);
+    match &member.agent_info {
+        Some(agent) => {
+            if let Some((text, color)) = agent_detail_line(agent.state, &agent.detail) {
+                return Line::styled(one_line(&text), Style::new().fg(color));
+            }
+            match (&agent.detail.last_message, agent.state) {
+                (Some(message), AgentState::Input) => {
+                    Line::styled(one_line(first_line(message)), dim)
+                }
+                _ => Line::default(),
+            }
+        }
+        None => match crate::health::problem(&member.info) {
+            Some(problem) => Line::styled(problem, Style::new().fg(Color::Red)),
+            None => Line::default(),
+        },
+    }
+}
+
+/// `line` cut to `width` columns, ending with `…` when cut.
+fn ellipsize(line: Line<'static>, width: u16) -> Line<'static> {
+    let width = width as usize;
+    if line.width() <= width {
+        return line;
+    }
+    let mut left = width.saturating_sub(1);
+    let mut spans = Vec::new();
+    let mut last_style = Style::new();
+    for span in line.spans {
+        last_style = span.style;
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = Span::raw(c.to_string()).width();
+            if w > left {
+                left = 0;
+                break;
+            }
+            left -= w;
+            text.push(c);
+        }
+        spans.push(Span::styled(text, span.style));
+        if left == 0 {
+            break;
+        }
+    }
+    if width > 0 {
+        spans.push(Span::styled("…", last_style));
+    }
+    Line::from(spans).style(line.style)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ellipsizing_keeps_styles_and_width() {
+        let line = Line::from(vec![
+            Span::raw("ab"),
+            Span::styled("cdef", Style::new().fg(Color::Red)),
+        ]);
+        let cut = ellipsize(line.clone(), 4);
+        assert_eq!(cut.width(), 4);
+        assert_eq!(cut.to_string(), "abc…");
+        assert_eq!(cut.spans.last().unwrap().style.fg, Some(Color::Red));
+        assert_eq!(ellipsize(line.clone(), 6).to_string(), "abcdef");
+        assert_eq!(ellipsize(Line::raw("漢字漢字"), 5).to_string(), "漢字…");
+    }
+}

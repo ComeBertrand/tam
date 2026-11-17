@@ -405,7 +405,7 @@ fn clean(text: &str) -> String {
 }
 
 /// The text on one line, spaces collapsed.
-fn one_line(text: &str) -> String {
+pub(super) fn one_line(text: &str) -> String {
     clean(text).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

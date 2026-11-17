@@ -283,30 +283,34 @@ Without `-a`, the agent is the member's last one, else the configured default. A
 Running `tam` with no arguments opens the TUI. It connects to the daemon (starting it if needed), fetches the task list from the ledger, and subscribes to daemon events for real-time updates.
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  tam ─ 4 tasks (1 needs input)                                   │
-├──────────────────────────────────────────────────────────────────┤
-│  STATUS   TASK          AGENT    DIR                      CTX    │
-│  ● run    feat          claude   ~/wt/myapp--feat         34%    │
-│▸ ▲ input  fix-nav       claude   ~/wt/myapp--fix-nav      67%    │
-│  ○ idle   refactor      -        ~/wt/myapp--refac        -      │
-│  ✓ merged old-thing     -        ~/wt/myapp--old          -      │
-├──────────────────────────────────────────────────────────────────┤
-│  enter:attach  n:new  r:run  s:stop  d:drop  p:peek  q:quit     │
-└──────────────────────────────────────────────────────────────────┘
+ tam — 5 tasks · 2 need you                                       by repository
+STATUS          TASK                   BRANCH AGENT  CTX
+myapp
+▲ input     12m fix-nav                ↑3 *1  claude 67%
+● run       20s feat                   =      claude 34%
+◌ stale     45d old-thing              ↑5 ↓12 -
+myapp + web
+? question   5m unit-pricing
+● run        1m  ├ myapp               ↑1 *3  claude 12%
+? question   5m  └ web                 …      claude 40%
+ enter:attach  s:stop  d:drop  n:new  p:peek  /:filter  g:attention first  q:quit
 ```
 
-The header shows total task count and how many need attention (input or blocked status). The table shows one row per task, sorted by priority: blocked first, then input, then running, then idle, then merged. The footer shows available keys, updated based on the selected task's state.
+The header shows the task count and how many need the user (input, blocked, question or error), and how the list is ordered. Tasks are grouped under a header row per repository (a task in several under one header naming them), the most urgent first in each (blocked/question, error, input, running, idle, stale, gone); `g` switches to attention first, one list across repositories with a REPO column. A task with several members has a row per member below its own (which shows the most urgent member's status); `▸` marks the member the keys act on. Single-member tasks stay one row. The footer shows the keys that fit, the most useful first, updated for the selected task.
 
 ### Task table columns
 
 | Column | Content |
 |---|---|
-| STATUS | Derived status indicator (see status table) |
-| TASK | Task name |
+| STATUS | Derived status indicator (see status table), then how long in it: the agent's state, else since the task's last activity |
+| TASK | Task name (a member's name on its rows), cut only when the terminal is too narrow |
+| REPO | Repositories, when not grouped by them (`g`) |
+| BRANCH | Against the default branch: `↑` ahead, `↓` behind, `*` uncommitted paths, `=` none (git asked once a minute per worktree, every 10s for the one the pane shows) |
 | AGENT | Provider name if agent is running, `-` otherwise |
-| DIR | Working directory (with `~` shortening) |
 | CTX | Context window usage percentage (agent running only) |
+| (last) | From 100 columns: what the member waits on (permission, question, error, last message, worktree problem) |
+
+Narrow terminals drop AGENT, then CTX, then BRANCH before cutting task names.
 
 ### Status indicators
 
@@ -333,6 +337,7 @@ The header shows total task count and how many need attention (input or blocked 
 | `d` | Drop task: `y` keeps the branch, `b` deletes it; asks again if work would be lost | Always |
 | `p` | Toggle peek panel | Always |
 | `/` | Enter filter mode | Always |
+| `g` | Group by repository, or attention first | Always |
 | `q` | Quit TUI | Always |
 | Config keys | Custom commands | Always |
 
@@ -340,7 +345,7 @@ The footer only shows keys applicable to the currently selected task. If the sel
 
 ### Peek mode
 
-Pressing `p` splits the view. The left panel shows a compressed task list (fewer columns). The right panel renders the selected task's agent screen, as the daemon's terminal emulator keeps it at the agent's own size (scrollable through its history). As the user navigates with `j`/`k`, the right panel updates to show the selected task's output.
+Pressing `p` splits the view: from 136 columns side by side (the pane at least 82 wide, for an agent's 80-column screen), the left panel a compressed task list (fewer columns); below that, the pane under a list as tall as its rows (up to two fifths of the height). The pane renders the selected task's agent screen, as the daemon's terminal emulator keeps it at the agent's own size (scrollable through its history). As the user navigates with `j`/`k`, the pane updates to show the selected task's output.
 
 ```
 ┌──────────────────────────────────┬───────────────────────────────┐
@@ -421,7 +426,7 @@ The TUI maintains a persistent daemon connection and receives pushed events:
 - `AgentSpawned`: row updates to show running agent.
 - `ContextUpdate`: CTX column updates.
 
-Git branch state (merged status) is refreshed periodically (every ~30 seconds) since it changes externally.
+Git branch state (ahead, behind, uncommitted) is looked at off the UI thread, one worktree at a time: every minute per worktree and after its agent's state changes, every 10 seconds for the one the pane shows.
 
 ---
 

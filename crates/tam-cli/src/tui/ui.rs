@@ -2,62 +2,52 @@ use ratatui::layout::{Constraint, HorizontalAlignment, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table,
-    TableState, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap,
 };
 use ratatui::Frame;
 use tam_proto::{AgentDetail, AgentState};
 
-use crate::task::{Task, TaskStatus};
+use crate::task::TaskStatus;
 
-use super::app::{App, MemberChoice, Mode, PaneTab, PickerState};
+use super::app::{App, MemberChoice, Mode, Order, PaneTab, PickerState};
 use super::peek::{Peek, ScreenView};
-use super::triage;
+use super::{table, triage};
+
+/// The task list's narrowest and widest beside the pane.
+const LIST_MIN: u16 = 50;
+const LIST_MAX: u16 = 72;
+/// The pane's narrowest beside the list: an agent's screen is 80 columns
+/// until someone attaches to it.
+const PANE_MIN: u16 = 82;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let show_filter = app.filter_active || !app.filter.is_empty();
-    let filter_height = if show_filter { 1 } else { 0 };
+    let [header_area, body, footer_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
 
-    if app.peek.is_some() {
-        let [header_area, filter_area, table_area, preview_area, footer_area] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(filter_height),
-            Constraint::Percentage(35),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-
-        render_header(frame, header_area, app);
-        if show_filter {
-            render_filter(frame, filter_area, app);
-        }
-        render_tasks(frame, table_area, app);
-
+    render_header(frame, header_area, app);
+    let (list, pane) = split(body, app, show_filter);
+    let [filter_area, table_area] = Layout::vertical([
+        Constraint::Length(u16::from(show_filter)),
+        Constraint::Fill(1),
+    ])
+    .areas(list);
+    if show_filter {
+        render_filter(frame, filter_area, app);
+    }
+    render_tasks(frame, table_area, app);
+    if let Some(pane) = pane {
         // Out of the app while drawn: the pane reads the rest of it.
         if let Some(mut peek) = app.peek.take() {
-            render_pane(frame, preview_area, app, &mut peek);
+            render_pane(frame, pane, app, &mut peek);
             app.peek = Some(peek);
         }
-
-        render_footer(frame, footer_area, app);
-    } else {
-        let [header_area, filter_area, table_area, footer_area] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(filter_height),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-
-        render_header(frame, header_area, app);
-        if show_filter {
-            render_filter(frame, filter_area, app);
-        }
-        render_tasks(frame, table_area, app);
-
-        render_footer(frame, footer_area, app);
     }
+    render_footer(frame, footer_area, app);
 
     // Overlay popups
     match &app.mode {
@@ -105,6 +95,28 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// Where the task list and the detail pane go (`None`: the pane is
+/// closed). Side by side when the pane has room for an agent's screen next
+/// to a list of useful width; else the list above the pane, as tall as its
+/// rows up to two fifths of the height.
+fn split(area: Rect, app: &App, filter: bool) -> (Rect, Option<Rect>) {
+    if app.peek.is_none() {
+        return (area, None);
+    }
+    let list = (area.width / 5 * 2).clamp(LIST_MIN, LIST_MAX);
+    if area.width >= list + PANE_MIN {
+        let [list, pane] =
+            Layout::horizontal([Constraint::Length(list), Constraint::Fill(1)]).areas(area);
+        return (list, Some(pane));
+    }
+    // Header, rows, filter.
+    let wanted = app.rows().len() as u16 + 1 + u16::from(filter);
+    let height = wanted.max(3).min((area.height / 5 * 2).max(5));
+    let [list, pane] =
+        Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(area);
+    (list, Some(pane))
+}
+
 fn render_filter(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(" /", Style::new().fg(Color::Cyan))];
     spans.push(Span::raw(&app.filter));
@@ -114,27 +126,24 @@ fn render_filter(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Line::from(spans), area);
 }
 
-fn render_tasks(frame: &mut Frame, area: Rect, app: &App) {
-    let visible = app.visible_tasks();
-    if visible.is_empty() {
-        if app.filter.is_empty() {
-            let text = Paragraph::new("No tasks. Press n to create one.")
-                .alignment(HorizontalAlignment::Center)
-                .fg(Color::DarkGray);
-            let y = area.y + area.height / 2;
-            frame.render_widget(text, Rect::new(area.x, y, area.width, 1));
-        } else {
-            let text = Paragraph::new("No matching tasks.")
-                .alignment(HorizontalAlignment::Center)
-                .fg(Color::DarkGray);
-            let y = area.y + area.height / 2;
-            frame.render_widget(text, Rect::new(area.x, y, area.width, 1));
-        }
-    } else {
-        render_table(frame, area, &visible, app.selected);
+fn render_tasks(frame: &mut Frame, area: Rect, app: &mut App) {
+    if !app.visible_tasks().is_empty() {
+        table::render(frame, area, app);
+        return;
     }
+    let text = if app.filter.is_empty() {
+        "No tasks. Press n to create one."
+    } else {
+        "No matching tasks."
+    };
+    let text = Paragraph::new(text)
+        .alignment(HorizontalAlignment::Center)
+        .fg(Color::DarkGray);
+    let y = area.y + area.height / 2;
+    frame.render_widget(text, Rect::new(area.x, y, area.width, 1));
 }
 
+/// The task count, how many need the user, and how the list is ordered.
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let total = app.tasks.len();
     let needs = app.needs_attention_count();
@@ -150,77 +159,24 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         )));
         if needs > 0 {
             spans.push(Span::styled(
-                format!(" ({needs} needs input)"),
+                format!(" · {needs} need{} you", if needs == 1 { "s" } else { "" }),
                 Style::new().fg(Color::Yellow),
             ));
         }
     }
-
-    frame.render_widget(Line::from(spans), area);
-}
-
-fn render_table(frame: &mut Frame, area: Rect, tasks: &[&Task], selected: usize) {
-    let header = Row::new([
-        Cell::from("STATUS"),
-        Cell::from("REPO"),
-        Cell::from("TASK"),
-        Cell::from("AGENT"),
-        Cell::from("DIR"),
-        Cell::from("CTX"),
-    ])
-    .style(Style::new().fg(Color::DarkGray))
-    .bottom_margin(0);
-
-    let rows: Vec<Row> = tasks
-        .iter()
-        .map(|task| {
-            let status = task.status();
-            let (icon, color) = status_display(&status);
-            let dir = task
-                .dir()
-                .map(|d| shorten_home(&d.display().to_string()))
-                .unwrap_or_default();
-            let agent = task
-                .agent_info()
-                .map(|a| a.provider.as_str())
-                .unwrap_or("-");
-            let ctx = task
-                .agent_info()
-                .and_then(|a| a.context_percent)
-                .map(|p| context_display(p))
-                .unwrap_or_else(|| Span::raw(""));
-
-            Row::new([
-                Cell::from(Span::styled(icon, Style::new().fg(color))),
-                Cell::from(task.repo_name()),
-                Cell::from(task.name.as_str()),
-                Cell::from(agent),
-                Cell::from(dir),
-                Cell::from(ctx),
-            ])
-        })
-        .collect();
-
-    let widths = [
-        Constraint::Length(10), // STATUS
-        Constraint::Length(15), // REPO
-        Constraint::Length(15), // TASK
-        Constraint::Length(10), // AGENT
-        Constraint::Fill(1),    // DIR
-        Constraint::Length(6),  // CTX
-    ];
-
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::NONE))
-        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-
-    let mut table_state = TableState::default();
-    if !tasks.is_empty() {
-        table_state.select(Some(selected));
+    let line = Line::from(spans);
+    let used = line.width();
+    frame.render_widget(line, area);
+    let order = match app.order {
+        Order::Repo => "by repository ",
+        Order::Attention => "attention first ",
+    };
+    if total > 0 && used + 1 + order.len() <= area.width as usize {
+        frame.render_widget(
+            Line::styled(order, Style::new().fg(Color::DarkGray)).right_aligned(),
+            area,
+        );
     }
-
-    frame.render_stateful_widget(table, area, &mut table_state);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -230,76 +186,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         let hints = match app.mode {
             Mode::Normal => {
-                let selected = app.selected_task();
-                let has_agent = app
-                    .focused_member()
-                    .is_some_and(|(_, m)| m.agent_info.is_some());
-
-                let mut hints = Vec::new();
-                if has_agent {
-                    hints.extend([
-                        Span::styled(" enter", Style::new().bold()),
-                        Span::raw(":attach  "),
-                        Span::styled("s", Style::new().bold()),
-                        Span::raw(":stop  "),
-                    ]);
-                } else if selected.is_some() {
-                    hints.extend([
-                        Span::styled(" r", Style::new().bold()),
-                        Span::raw(":run  "),
-                        Span::styled("R", Style::new().bold()),
-                        Span::raw(":new session  "),
-                    ]);
-                }
-                hints.extend([
-                    Span::styled("n", Style::new().bold()),
-                    Span::raw(":new  "),
-                    Span::styled("/", Style::new().bold()),
-                    Span::raw(":filter  "),
-                    Span::styled("p", Style::new().bold()),
-                    Span::raw(":peek  "),
-                ]);
-                if let Some(peek) = &app.peek {
-                    hints.extend([
-                        Span::styled("tab", Style::new().bold()),
-                        Span::raw(match app.tab {
-                            PaneTab::Triage => ":terminal  ",
-                            PaneTab::Terminal => ":triage  ",
-                        }),
-                    ]);
-                    if selected.is_some_and(|t| t.members.len() > 1) {
-                        hints.extend([
-                            Span::styled("←/→", Style::new().bold()),
-                            Span::raw(":member  "),
-                        ]);
-                    }
-                    hints.extend([
-                        Span::styled("pgup/pgdn", Style::new().bold()),
-                        Span::raw(":scroll  "),
-                    ]);
-                    if peek.from.is_some() {
-                        hints.extend([
-                            Span::styled("end", Style::new().bold()),
-                            Span::raw(":live  "),
-                        ]);
-                    }
-                }
-                for cmd in &app.commands {
-                    hints.push(Span::styled(cmd.key.clone(), Style::new().bold()));
-                    hints.push(Span::raw(format!(":{} ", cmd.name)));
-                }
-                // A gone worktree: `d` offers to recreate it too.
-                let gone = selected.is_some_and(|t| {
-                    t.unhealthy_members()
-                        .any(|m| crate::health::repairable(&m.info))
-                });
-                hints.extend([
-                    Span::styled("d", Style::new().bold()),
-                    Span::raw(if gone { ":recreate/drop  " } else { ":drop  " }),
-                    Span::styled("q", Style::new().bold()),
-                    Span::raw(":quit"),
-                ]);
-                hints
+                let hints = normal_hints(app);
+                frame.render_widget(fit_hints(hints, area.width).fg(Color::DarkGray), area);
+                return;
             }
             Mode::NewTaskEnterName { .. } => vec![
                 Span::styled(" enter", Style::new().bold()),
@@ -394,6 +283,90 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// A key hint in the footer: the key, what it does, and how much it
+/// matters (0 most: kept when the footer cannot show them all).
+type Hint<'a> = (&'a str, String, u8);
+
+/// The task list's keys, for the selection.
+fn normal_hints(app: &App) -> Vec<Hint<'_>> {
+    let selected = app.selected_task();
+    let has_agent = app
+        .focused_member()
+        .is_some_and(|(_, m)| m.agent_info.is_some());
+    let mut hints = Vec::new();
+    if has_agent {
+        hints.push(("enter", "attach".into(), 0));
+        hints.push(("s", "stop".into(), 1));
+    } else if selected.is_some() {
+        hints.push(("r", "run".into(), 0));
+        hints.push(("R", "new session".into(), 2));
+    }
+    if let Some(peek) = &app.peek {
+        if selected.is_some_and(|t| t.members.len() > 1) {
+            hints.push(("←/→", "member".into(), 1));
+        }
+        let other = match app.tab {
+            PaneTab::Triage => "terminal",
+            PaneTab::Terminal => "triage",
+        };
+        hints.push(("tab", other.into(), 2));
+        hints.push(("pgup/pgdn", "scroll".into(), 3));
+        if peek.from.is_some() {
+            hints.push(("end", "live".into(), 1));
+        }
+    }
+    // A gone worktree: `d` offers to recreate it too.
+    let gone = selected.is_some_and(|t| {
+        t.unhealthy_members()
+            .any(|m| crate::health::repairable(&m.info))
+    });
+    if selected.is_some() {
+        let drop = if gone { "recreate/drop" } else { "drop" };
+        hints.push(("d", drop.into(), 1));
+    }
+    hints.push(("n", "new".into(), 2));
+    hints.push(("p", "peek".into(), 1));
+    hints.push(("/", "filter".into(), 3));
+    let order = match app.order {
+        Order::Repo => "attention first",
+        Order::Attention => "by repository",
+    };
+    hints.push(("g", order.into(), 4));
+    for cmd in &app.commands {
+        hints.push((cmd.key.as_str(), cmd.name.clone(), 5));
+    }
+    hints.push(("q", "quit".into(), 0));
+    hints
+}
+
+/// The hints that fit in `width` columns, in order: the least important
+/// (the last of them first) are left out.
+fn fit_hints(mut hints: Vec<Hint<'_>>, width: u16) -> Line<'static> {
+    let shown = |hints: &[Hint]| -> usize {
+        hints
+            .iter()
+            .map(|(key, what, _)| Span::raw(*key).width() + 1 + Span::raw(what.as_str()).width())
+            .sum::<usize>()
+            + 2 * hints.len().saturating_sub(1)
+            + 1
+    };
+    while !hints.is_empty() && shown(&hints) > width as usize {
+        let least = (0..hints.len())
+            .max_by_key(|&i| (hints[i].2, i))
+            .expect("not empty");
+        hints.remove(least);
+    }
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, what, _)) in hints.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(key.to_string(), Style::new().bold()));
+        spans.push(Span::raw(format!(":{what}")));
+    }
+    Line::from(spans)
+}
+
 /// What the agent waits on or reported, on one line: the pending
 /// permission or question, the error, or a tool call refused by auto mode.
 pub(super) fn agent_detail_line(
@@ -431,7 +404,7 @@ pub(super) fn agent_detail_line(
     }
 }
 
-fn first_line(s: &str) -> &str {
+pub(super) fn first_line(s: &str) -> &str {
     s.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -889,7 +862,7 @@ pub(super) fn status_display(status: &TaskStatus) -> (&'static str, Color) {
     }
 }
 
-fn context_display(pct: u8) -> Span<'static> {
+pub(super) fn context_display(pct: u8) -> Span<'static> {
     let color = if pct >= 90 {
         Color::Red
     } else if pct >= 70 {
@@ -1555,5 +1528,307 @@ mod tests {
         };
         let s = screen(&mut app, 100, 20);
         assert!(s.contains("│  feat/web not dropped:"), "{s}");
+    }
+
+    // -- The task list -----------------------------------------------------
+
+    /// Print a screen when `TAM_SHOW_SCREEN` is set (to look at a layout).
+    fn show(label: &str, s: &str) {
+        if std::env::var_os("TAM_SHOW_SCREEN").is_some() {
+            println!("--- {label}\n{s}");
+        }
+    }
+
+    /// A member `name` (repository `repo`) of a task on branch `branch`.
+    fn member_in(id: &str, name: &str, repo: &str, branch: &str) -> MemberInfo {
+        MemberInfo {
+            id: id.into(),
+            name: name.into(),
+            repo: repo.into(),
+            repo_root: None,
+            branch: branch.into(),
+            dir: format!("/w/{repo}--{branch}").into(),
+            health: Some(MemberHealth::Ok {
+                branch: Some(branch.into()),
+            }),
+        }
+    }
+
+    fn task_of(name: &str, members: Vec<MemberInfo>, idle_for: u64) -> TaskInfo {
+        TaskInfo {
+            name: name.into(),
+            members,
+            created_at: 0,
+            run_count: 1,
+            last_activity: Some(crate::task::now() - idle_for),
+        }
+    }
+
+    fn branch_of(ahead: u32, behind: u32, uncommitted: usize) -> Observation {
+        observed(BranchState {
+            base: Some("origin/main".into()),
+            ahead,
+            behind,
+            uncommitted,
+            ..Default::default()
+        })
+    }
+
+    /// A day's dashboard: tasks in three repositories, one in two of them.
+    fn dashboard() -> App {
+        let question = AgentDetail {
+            pending: Some(Pending {
+                tool: Some("AskUserQuestion".into()),
+                summary: "Keep the old endpoint for a release?".into(),
+            }),
+            ..Default::default()
+        };
+        let finished = AgentDetail {
+            last_message: Some("Done: rounding now happens once, at the end.\n\nMore.".into()),
+            ..Default::default()
+        };
+        let mut gone = member_in("m-7", "frontend", "frontend", "old-banner");
+        gone.health = Some(MemberHealth::Gone {
+            cannot_repair: None,
+        });
+        let tasks = vec![
+            task_of(
+                "fix-allotment-rounding",
+                vec![member_in(
+                    "m-1",
+                    "backend",
+                    "backend",
+                    "fix-allotment-rounding",
+                )],
+                600,
+            ),
+            task_of(
+                "perf",
+                vec![member_in("m-2", "backend", "backend", "perf")],
+                60,
+            ),
+            task_of(
+                "spike-cache",
+                vec![member_in("m-3", "backend", "backend", "spike-cache")],
+                45 * 86400,
+            ),
+            task_of(
+                "unit-pricing",
+                vec![
+                    member_in("m-4", "backend", "backend", "unit-pricing"),
+                    member_in("m-5", "frontend", "frontend", "unit-pricing"),
+                ],
+                30,
+            ),
+            task_of(
+                "offload-explain",
+                vec![member_in(
+                    "m-6",
+                    "rustpallet",
+                    "rustpallet",
+                    "offload-explain",
+                )],
+                900,
+            ),
+            task_of("old-banner", vec![gone], 3 * 86400),
+            task_of(
+                "nav",
+                vec![member_in("m-8", "frontend", "frontend", "nav")],
+                2 * 86400,
+            ),
+        ];
+        let agents = vec![
+            agent_in("m-1", AgentState::Blocked, 190, blocked()),
+            agent_in("m-2", AgentState::Working, 20, AgentDetail::default()),
+            agent_in("m-4", AgentState::Working, 75, AgentDetail::default()),
+            agent_in("m-5", AgentState::Question, 300, question),
+            agent_in("m-6", AgentState::Input, 750, finished),
+        ];
+        let mut agents = agents;
+        agents[0].context_percent = Some(67);
+        agents[2].context_percent = Some(12);
+        let mut app = App::new();
+        app.set_tasks(
+            tasks
+                .into_iter()
+                .map(|t| Task::from_info(t, &agents))
+                .collect(),
+        );
+        for (id, (ahead, behind, dirty)) in [
+            ("m-1", (2, 0, 1)),
+            ("m-2", (0, 0, 0)),
+            ("m-3", (5, 12, 0)),
+            ("m-4", (1, 0, 3)),
+            ("m-6", (3, 1, 0)),
+        ] {
+            app.branches
+                .insert(id.into(), branch_of(ahead, behind, dirty));
+        }
+        app
+    }
+
+    /// The dashboard with its pane open on the selected task.
+    fn with_pane(mut app: App) -> App {
+        app.sync_focus();
+        app.peek = Some(match app.peek_agent() {
+            Some(id) => agent_screen(&id, PERMISSION_DIALOG),
+            None => Peek::default(),
+        });
+        app
+    }
+
+    fn select(app: &mut App, task: &str) {
+        app.selected = app
+            .visible_tasks()
+            .iter()
+            .position(|t| t.name == task)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_list_groups_tasks_by_repository_with_member_rows() {
+        let mut app = dashboard();
+        let s = screen(&mut app, 80, 24);
+        show("80x24", &s);
+        // A header per repository, the task in two under both.
+        for group in ["backend", "backend + frontend", "frontend", "rustpallet"] {
+            assert!(s.lines().any(|l| l.trim_end() == group), "{group}: {s}");
+        }
+        assert!(!s.contains("DIR"), "{s}");
+        // The task name is not cut at 15 columns; time in state and branch.
+        assert!(
+            s.contains("▲ block      3m fix-allotment-rounding ↑2 *1  claude 67%"),
+            "{s}"
+        );
+        assert!(s.contains("◌ stale     45d spike-cache"), "{s}");
+        assert!(s.contains("↑5 ↓12"), "{s}");
+        assert!(s.contains("○ idle       2d nav"), "{s}");
+        // A task in two repositories: its status is its most urgent
+        // member's, a row per member says the rest.
+        assert!(s.contains("? question   5m unit-pricing"), "{s}");
+        assert!(
+            s.contains("● run        1m  ├ backend             ↑1 *3  claude 12%"),
+            "{s}"
+        );
+        assert!(s.contains("? question   5m  └ frontend"), "{s}");
+
+        let s = screen(&mut app, 140, 30);
+        show("140x30", &s);
+        // Wide: what each member waits on.
+        assert!(s.contains("permission · Bash: cargo test"), "{s}");
+        assert!(s.contains("question: Keep the old endpoint"), "{s}");
+        assert!(s.contains("Done: rounding now happens once"), "{s}");
+        assert!(
+            s.contains("worktree /w/frontend--old-banner is gone"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn attention_first_puts_who_needs_the_user_on_top() {
+        let mut app = dashboard();
+        select(&mut app, "nav");
+        app.toggle_order();
+        assert_eq!(app.selected_task().unwrap().name, "nav", "selection kept");
+        let s = screen(&mut app, 80, 24);
+        show("attention 80x24", &s);
+        assert!(s.contains("attention first"), "{s}");
+        let rows: Vec<&str> = s.lines().skip(2).collect();
+        assert!(rows[0].starts_with("▲ block"), "{s}");
+        assert!(rows[1].starts_with("? question"), "{s}");
+        assert!(s.contains("REPO"), "{s}");
+        assert!(s.contains("backend + frontend"), "{s}");
+    }
+
+    #[test]
+    fn a_wide_terminal_puts_the_pane_beside_the_list() {
+        let mut app = dashboard();
+        select(&mut app, "unit-pricing");
+        let mut app = with_pane(app);
+        let s = screen(&mut app, 200, 40);
+        show("200x40 pane", &s);
+        // The list on the left, the pane on the right from the top.
+        let first = s.lines().nth(1).unwrap();
+        assert!(first.starts_with("STATUS"), "{s}");
+        assert!(first.contains("┌ unit-pricing/frontend"), "{s}");
+        // The member the keys act on is marked.
+        assert!(s.contains("└▸frontend"), "{s}");
+
+        // Narrower: the pane below a list as tall as its rows allow.
+        let s = screen(&mut app, 120, 40);
+        show("120x40 pane", &s);
+        assert!(s.lines().nth(1).unwrap().starts_with("STATUS"), "{s}");
+        assert!(!s.lines().nth(1).unwrap().contains('┌'), "{s}");
+        let s = screen(&mut app, 80, 24);
+        show("80x24 pane", &s);
+        // The selected task's members stay in view.
+        assert!(s.contains("├ backend"), "{s}");
+        assert!(s.contains("└▸frontend"), "{s}");
+    }
+
+    #[test]
+    fn narrow_lists_drop_columns_before_cutting_names() {
+        let mut app = dashboard();
+        let s = screen(&mut app, 50, 20);
+        show("50x20", &s);
+        // The agent column goes first, then context.
+        assert!(!s.contains("AGENT"), "{s}");
+        assert!(s.contains("fix-allotment-rounding"), "{s}");
+        let s = screen(&mut app, 36, 20);
+        show("36x20", &s);
+        assert!(s.contains("fix-allotment-round…"), "{s}");
+        assert!(s.contains(" tam — 7 tasks · 3 need you "), "{s}");
+
+        // Just wide enough for the pane beside the list, and just not.
+        let mut app = with_pane(dashboard());
+        let s = screen(&mut app, 136, 30);
+        show("136x30 pane", &s);
+        assert!(s.lines().nth(1).unwrap().contains('┌'), "{s}");
+        let s = screen(&mut app, 135, 30);
+        show("135x30 pane", &s);
+        assert!(!s.lines().nth(1).unwrap().contains('┌'), "{s}");
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_show_the_selected_task_and_its_members() {
+        let mut tasks: Vec<TaskInfo> = (0..12)
+            .map(|i| {
+                let name = format!("task-{i:02}");
+                task_of(
+                    &name,
+                    vec![member_in(&format!("m-{i}"), "api", "api", &name)],
+                    60,
+                )
+            })
+            .collect();
+        tasks.push(task_of(
+            "zz-both",
+            vec![
+                member_in("m-a", "api", "api", "zz-both"),
+                member_in("m-w", "web", "web", "zz-both"),
+            ],
+            60,
+        ));
+        let mut app = App::new();
+        app.set_tasks(tasks.into_iter().map(|t| Task::from_info(t, &[])).collect());
+        // 10 rows: header, footer, the column names and 7 rows.
+        let s = screen(&mut app, 80, 10);
+        assert!(s.lines().nth(2).unwrap().starts_with("api"), "{s}");
+        select(&mut app, "zz-both");
+        let s = screen(&mut app, 80, 10);
+        show("scrolled", &s);
+        // The task in both repositories, its header and both members.
+        assert!(s.contains("api + web"), "{s}");
+        // The member keys would act on is marked.
+        assert!(s.contains("├▸api"), "{s}");
+        assert!(s.contains("└ web"), "{s}");
+        // Back up one: the list moves only as far as it must.
+        app.select_prev();
+        let s = screen(&mut app, 80, 10);
+        assert!(s.contains("task-11"), "{s}");
+        assert!(s.contains("└ web"), "kept in view: {s}");
+        app.selected = 0;
+        let s = screen(&mut app, 80, 10);
+        assert!(s.lines().nth(2).unwrap().starts_with("api"), "{s}");
     }
 }

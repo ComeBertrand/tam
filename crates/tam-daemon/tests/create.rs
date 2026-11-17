@@ -1,5 +1,6 @@
 //! Creating a task's worktrees in several repositories (`CreateMembers`):
-//! all or nothing, against real git repositories.
+//! all or nothing; and dropping one of them (`DropTask` of a member). Against
+//! real git repositories.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -545,4 +546,87 @@ async fn joining_a_task_being_dropped_is_undone() {
     assert!(!branch_exists(&web, "feat"));
     assert!(!fx.worktree(&api, "feat").exists());
     assert!(cmd.tasks().await.is_empty());
+}
+
+#[tokio::test]
+async fn one_member_is_dropped_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let fx = Fixture::new(dir.path());
+    let (api, web) = (fx.repo("api"), fx.repo("web"));
+    let mut watcher = Conn::subscribed(&sock).await;
+    let mut cmd = Conn::connect(&sock).await;
+    let members = [fx.member(&api, "feat"), fx.member(&web, "feat")];
+    let task = created(cmd.create("feat", &members, false).await);
+    let web_id = task.members[1].id.clone();
+    let resp = cmd
+        .request(&Request::Spawn {
+            provider: "sleep".into(),
+            dir: PathBuf::new(),
+            id: None,
+            args: vec!["3600".into()],
+            resume_session: None,
+            prompt: None,
+            member: Some(web_id.clone()),
+        })
+        .await;
+    assert!(matches!(resp, Response::Spawned { .. }), "{resp:?}");
+    std::fs::write(members[1].dir.join("notes.txt"), "work").unwrap();
+    watcher.events_within(100).await;
+
+    let drop = |name: &str, force: bool| Request::DropTask {
+        name: name.into(),
+        force,
+        delete_branch: false,
+    };
+    // Work would be lost: nothing happens.
+    match cmd.request(&drop("feat/web", false)).await {
+        Response::DropRefused { worktrees } => {
+            assert_eq!(worktrees.len(), 1);
+            assert_eq!(worktrees[0].path, members[1].dir);
+        }
+        other => panic!("expected DropRefused, got {other:?}"),
+    }
+    assert!(members[1].dir.exists());
+
+    // Forced: web's agent and worktree go, api stays, the task too.
+    let resp = cmd.request(&drop("feat/web", true)).await;
+    assert!(matches!(resp, Response::Dropped { .. }), "{resp:?}");
+    assert!(!members[1].dir.exists());
+    assert!(branch_exists(&web, "feat"));
+    assert!(members[0].dir.exists());
+    let tasks = cmd.tasks().await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].members.len(), 1);
+    assert_eq!(tasks[0].members[0].name, "api");
+    match cmd.request(&Request::List).await {
+        Response::Agents { agents } => assert!(agents.iter().all(|a| a.id != web_id)),
+        other => panic!("expected Agents, got {other:?}"),
+    }
+    let events = watcher.events_within(300).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::TaskUpdated { task } if task.members.len() == 1)),
+        "{events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::TaskDropped { .. })));
+
+    let err = error_message(cmd.request(&drop("feat/nope", false)).await);
+    assert!(err.contains("no member 'nope'"), "{err}");
+
+    // The last member takes the task with it.
+    match cmd.request(&drop("feat/api", false)).await {
+        Response::Dropped { warnings } => {
+            assert!(
+                warnings.iter().any(|w| w.contains("last member")),
+                "{warnings:?}"
+            );
+        }
+        other => panic!("expected Dropped, got {other:?}"),
+    }
+    assert!(cmd.tasks().await.is_empty());
+    assert!(!members[0].dir.exists());
 }

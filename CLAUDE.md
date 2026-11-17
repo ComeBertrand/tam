@@ -248,6 +248,14 @@ adopt). `tam-cli` depends on all three.
   multi-member task name refuse and list `TASK/MEMBER` names. `CreateTask`
   (record worktrees the client made) stays for tests and the TUI's new-task
   flow. Tests: `crates/tam-daemon/tests/create.rs`, `crates/tam-cli/tests/new_task.rs`.
+- **Dropping one member** — `DropTask` of `<task>/<member>` or a member id
+  (`handle_drop` routes; plain `Ledger::resolve`, never a peer's short name)
+  drops that member alone as a task drop does for all (`handle_drop_member`,
+  `stop_and_remove_member`: check, stop its agent, check again, remove; the
+  task is claimed in `dropping` meanwhile), then `Ledger::drop_member`
+  (`MemberDropped`: the member leaves the folded state, so compaction drops
+  its history; remaining members' short names are derived again). A task's
+  last member takes the task (a warning says so).
 
 ## Build & check
 

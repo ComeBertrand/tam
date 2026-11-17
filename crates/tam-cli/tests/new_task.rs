@@ -211,4 +211,19 @@ async fn new_task_across_repositories() {
     assert!(stderr.contains("Nothing was left behind"), "{stderr}");
     assert!(!wt.join("api--half").exists() && !wt.join("docs--half").exists());
     assert_eq!(tasks(&mut stream).await.len(), 1);
+
+    // One member dropped alone; the last one takes the task.
+    let out = output(tam(&root, &src, &["drop", "feat/docs"])).await;
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "Dropped 'feat/docs'\n");
+    assert!(!wt.join("docs--feat").exists() && wt.join("api--feat").exists());
+    let names: Vec<String> = tasks(&mut stream).await[0]
+        .members
+        .iter()
+        .map(|m| m.name.clone())
+        .collect();
+    assert_eq!(names, ["api", "web"]);
+    let out = output(tam(&root, &src, &["drop", "feat"])).await;
+    assert_eq!(text(&out.stdout), "Dropped task 'feat'\n");
+    assert!(tasks(&mut stream).await.is_empty());
 }

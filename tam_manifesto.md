@@ -210,6 +210,7 @@ tam attach                          # resolve from cwd
 tam drop NAME                       # stop agent + remove worktree + forget task
 tam drop NAME -b                    # also delete the git branch
 tam drop NAME -f                    # drop even if work would be lost
+tam drop TASK/MEMBER                # drop one member only; the last one takes the task
 
 tam gc                              # drop all tasks whose branch is merged
 tam gc --dry-run                    # show what would be dropped

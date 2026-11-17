@@ -199,14 +199,19 @@ async fn run(cli: Cli) -> Result<()> {
             force,
         } => {
             let mut client = client::Client::connect().await?;
+            // A task, or one member of a task (TASK/MEMBER).
+            let what = match client.get_task(&name).await {
+                Ok(_) => format!("Task '{name}'"),
+                Err(_) => format!("'{name}'"),
+            };
             let mut outcome = client.drop_task(&name, force, branch).await?;
             if let client::DropOutcome::Refused { worktrees } = &outcome {
-                eprintln!("Task '{name}' not dropped:");
+                eprintln!("{what} not dropped:");
                 for line in drop_report::lines(worktrees) {
                     eprintln!("  {line}");
                 }
                 if !confirm("Drop anyway? [y/N] ")? {
-                    eprintln!("Task '{name}' kept (pass --force to drop anyway).");
+                    eprintln!("{what} kept (pass --force to drop anyway).");
                     std::process::exit(1);
                 }
                 outcome = client.drop_task(&name, true, branch).await?;
@@ -216,7 +221,7 @@ async fn run(cli: Cli) -> Result<()> {
                     for warning in warnings {
                         eprintln!("warning: {warning}");
                     }
-                    println!("Dropped task '{name}'");
+                    println!("Dropped {}", what.replacen("Task", "task", 1));
                 }
                 client::DropOutcome::Refused { .. } => {
                     anyhow::bail!("the daemon refused a forced drop")

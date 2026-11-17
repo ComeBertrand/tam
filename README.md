@@ -104,6 +104,7 @@ tam attach                     Resolve from current directory
 tam drop NAME                  Stop agents + remove worktrees + forget task
 tam drop NAME -b               Also delete the git branches
 tam drop NAME -f               Drop even if work would be lost
+tam drop TASK/MEMBER           Drop one member only (its agent, its worktree)
 
 tam adopt [PATH]               Make a worktree created outside tam a task
 tam adopt PATH -n NAME         ... named NAME (default: its branch)

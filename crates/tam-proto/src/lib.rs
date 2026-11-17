@@ -583,6 +583,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
     },
+    /// A task's brief and directory (see `TaskBrief`), which the daemon
+    /// creates if missing. Replies `Brief`.
+    GetBrief {
+        /// A task name, or what `ResolveMember` takes as a target (the
+        /// member's task).
+        task: String,
+    },
+    /// Change a task's brief: a reference (`None`: back to the local file
+    /// `brief.md`). Members' agents learn it at their next session start,
+    /// and from `tam peers`. Replies `Brief`.
+    SetBrief {
+        /// As `GetBrief` takes it.
+        task: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brief: Option<String>,
+    },
 }
 
 /// What the agent of a task member is doing: its state, or `Exit` when no
@@ -798,6 +814,11 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         timed_out: bool,
     },
+    /// A task's brief (`GetBrief`, `SetBrief`).
+    Brief {
+        task: String,
+        brief: TaskBrief,
+    },
 }
 
 /// Daemon -> Client pushed event (unsolicited).
@@ -868,6 +889,40 @@ pub fn default_socket_path() -> PathBuf {
     } else {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         PathBuf::from(home).join(".tam").join("sock")
+    }
+}
+
+/// What a task's members work from, and where they keep notes: the task's
+/// brief and its directory, outside the worktrees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskBrief {
+    /// The brief the user gave: a URL, a ticket id, a path. tam neither
+    /// fetches nor interprets it. `None`: the local file `brief.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// The task's directory: `brief.md` (the brief without a reference) and
+    /// `scratch/`.
+    pub dir: PathBuf,
+}
+
+impl TaskBrief {
+    /// The local brief, `brief.md` in the task's directory; `None` while the
+    /// brief is a reference.
+    pub fn file(&self) -> Option<PathBuf> {
+        self.reference.is_none().then(|| self.dir.join("brief.md"))
+    }
+
+    /// The members' scratch directory, for transient notes.
+    pub fn scratch(&self) -> PathBuf {
+        self.dir.join("scratch")
+    }
+
+    /// Where the brief is: its reference, else the local file's path.
+    pub fn location(&self) -> String {
+        match (&self.reference, self.file()) {
+            (Some(reference), _) => reference.clone(),
+            (None, file) => file.unwrap_or_default().display().to_string(),
+        }
     }
 }
 
@@ -1993,5 +2048,46 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn brief_wire_format() {
+        let json = serde_json::to_string(&Request::SetBrief {
+            task: "feat".into(),
+            brief: Some("CS-12".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"set_brief","task":"feat","brief":"CS-12"}"#
+        );
+        let req: Request = serde_json::from_str(r#"{"type":"set_brief","task":"feat"}"#).unwrap();
+        assert!(matches!(req, Request::SetBrief { brief: None, .. }));
+
+        let local = TaskBrief {
+            reference: None,
+            dir: PathBuf::from("/data/tasks/feat"),
+        };
+        let json = serde_json::to_string(&Response::Brief {
+            task: "feat".into(),
+            brief: local.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"brief","task":"feat","brief":{"dir":"/data/tasks/feat"}}"#
+        );
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::Brief { brief, .. }) => assert_eq!(brief, local),
+            other => panic!("wrong message: {other:?}"),
+        }
+        assert_eq!(local.location(), "/data/tasks/feat/brief.md");
+        assert_eq!(local.scratch(), PathBuf::from("/data/tasks/feat/scratch"));
+        let linked = TaskBrief {
+            reference: Some("https://tickets/CS-12".into()),
+            ..local
+        };
+        assert_eq!(linked.file(), None);
+        assert_eq!(linked.location(), "https://tickets/CS-12");
     }
 }

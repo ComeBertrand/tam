@@ -156,6 +156,8 @@ pub struct ClaudeProvider {
     /// Shell command the injected inbox hooks run (`tam inbox-wait`), with
     /// `hook_command`. `None`: messages are typed into the PTY instead.
     inbox_command: Option<String>,
+    /// Directories the agent may reach outside its worktree.
+    access: Option<TaskAccess>,
 }
 
 /// How long a working Claude agent's PTY may stay silent before the turn is
@@ -176,6 +178,7 @@ impl ClaudeProvider {
         Self {
             hook_command,
             inbox_command: None,
+            access: None,
         }
     }
 
@@ -288,9 +291,12 @@ impl Provider for ClaudeProvider {
     ) -> Command {
         let mut cmd = Command::new("claude");
         cmd.current_dir(dir);
-        if let Some(hook_command) = &self.hook_command {
-            cmd.arg("--settings")
-                .arg(claude_settings(hook_command, self.inbox_command.as_deref()));
+        let settings = self
+            .hook_command
+            .as_ref()
+            .map(|hook_command| claude_settings(hook_command, self.inbox_command.as_deref()));
+        if let Some(settings) = claude_access_settings(settings, self.access.as_ref()) {
+            cmd.arg("--settings").arg(settings);
         }
         if let Some(id) = resume_session {
             cmd.arg("--resume").arg(id);
@@ -943,6 +949,67 @@ pub fn resolve(name: &str) -> Box<dyn Provider> {
         "codex" => Box::new(CodexProvider),
         other => Box::new(GenericProvider::new(other)),
     }
+}
+
+/// Directories a member's agent may reach outside its worktree: its task's
+/// directory (brief, scratch), and the other members' worktrees, read only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskAccess {
+    /// Read, and written as the agent's permission mode allows.
+    pub dirs: Vec<PathBuf>,
+    /// Read, never written.
+    pub read_only: Vec<PathBuf>,
+}
+
+/// Whether the agent `name` is given a member's `TaskAccess` (Claude only:
+/// codex and other programs get nothing more than their worktree).
+pub fn grants_access(name: &str) -> bool {
+    name == "claude"
+}
+
+/// Like [`resolve`], for the agent of a member that may reach `access`
+/// (see [`grants_access`]).
+pub fn resolve_with(name: &str, access: Option<TaskAccess>) -> Box<dyn Provider> {
+    match name {
+        "claude" => Box::new(ClaudeProvider {
+            access,
+            ..ClaudeProvider::with_current_exe()
+        }),
+        other => resolve(other),
+    }
+}
+
+/// `settings` (the `--settings` JSON, if any) with `access` added: Claude's
+/// additional working directories, which it reads without asking, and a
+/// rule denying edits to the read-only ones (its file tools, and the file
+/// commands it recognises in Bash). Paths in rules are absolute: `//path`.
+pub fn claude_access_settings(
+    settings: Option<String>,
+    access: Option<&TaskAccess>,
+) -> Option<String> {
+    let Some(access) = access.filter(|a| !a.dirs.is_empty() || !a.read_only.is_empty()) else {
+        return settings;
+    };
+    let mut settings: Value = match settings {
+        Some(json) => serde_json::from_str(&json).expect("settings are JSON"),
+        None => serde_json::json!({}),
+    };
+    let dirs: Vec<String> = access
+        .dirs
+        .iter()
+        .chain(&access.read_only)
+        .map(|d| d.display().to_string())
+        .collect();
+    let deny: Vec<String> = access
+        .read_only
+        .iter()
+        .map(|d| format!("Edit(/{}/**)", d.display()))
+        .collect();
+    settings["permissions"] = serde_json::json!({ "additionalDirectories": dirs });
+    if !deny.is_empty() {
+        settings["permissions"]["deny"] = serde_json::json!(deny);
+    }
+    Some(settings.to_string())
 }
 
 #[cfg(test)]
@@ -1705,5 +1772,51 @@ mod tests {
             &mut d,
         );
         assert!(d.response.is_none());
+    }
+
+    #[test]
+    fn claude_reaches_its_task_directory_and_reads_its_peers() {
+        let access = TaskAccess {
+            dirs: vec![PathBuf::from("/data/tasks/feat")],
+            read_only: vec![PathBuf::from("/w/web--feat")],
+        };
+        let p = ClaudeProvider {
+            access: Some(access.clone()),
+            ..ClaudeProvider::new(Some("'/bin/tam' hook-notify".into()))
+        };
+        // The prompt stays last: --add-dir would take it as a directory.
+        let cmd = p.build_command(&PathBuf::from("/tmp"), &[], None, Some("go"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.len(), 3, "{args:?}");
+        assert_eq!((args[0].as_str(), args[2].as_str()), ("--settings", "go"));
+        let settings: Value = serde_json::from_str(&args[1]).unwrap();
+        assert!(settings["hooks"]["SessionStart"].is_array(), "{settings}");
+        assert_eq!(
+            settings["permissions"],
+            serde_json::json!({
+                "additionalDirectories": ["/data/tasks/feat", "/w/web--feat"],
+                "deny": ["Edit(//w/web--feat/**)"],
+            })
+        );
+
+        // Without hooks, the access alone; with nothing to reach, nothing.
+        let alone = claude_access_settings(None, Some(&access)).unwrap();
+        let alone: Value = serde_json::from_str(&alone).unwrap();
+        assert!(alone.get("hooks").is_none());
+        assert_eq!(
+            alone["permissions"]["additionalDirectories"],
+            serde_json::json!(["/data/tasks/feat", "/w/web--feat"])
+        );
+        assert_eq!(claude_access_settings(None, None), None);
+        let none = TaskAccess::default();
+        assert_eq!(
+            claude_access_settings(Some("{}".into()), Some(&none)).as_deref(),
+            Some("{}")
+        );
+        assert!(grants_access("claude"));
+        assert!(!grants_access("codex"));
     }
 }

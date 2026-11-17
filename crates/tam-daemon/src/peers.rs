@@ -5,20 +5,24 @@
 //! The note is written when it is asked for, from the ledger as it is then:
 //! at every session start, resume, `/clear` and compaction. It holds what
 //! an agent needs before its first step and what rarely changes: its task,
-//! its name, its peers' names, ids, repositories and worktrees, and how to
-//! reach them. What changes by the second (what the peers' agents are
-//! doing) and membership changes in between are for `tam peers`.
+//! its name, its peers' names, ids, repositories and worktrees, how to
+//! reach them, which of their worktrees it can read, the task's brief and
+//! its scratch directory. What changes by the second (what the peers'
+//! agents are doing) and changes in between are for `tam peers`.
 
-use tam_proto::{MemberInfo, TaskInfo};
+use std::path::PathBuf;
+
+use tam_proto::{MemberInfo, TaskBrief, TaskInfo};
 
 use crate::ledger::Ledger;
 
 /// Most peers the note lists; `tam peers` lists them all.
 const MAX_LISTED: usize = 8;
 
-/// The note for the agent of member `id`, as the ledger is now. `None` for
-/// an unknown member.
-pub fn session_note(ledger: &Ledger, id: &str) -> Option<String> {
+/// The note for the agent of member `id`, as the ledger is now; `readable`
+/// are the other members' worktrees the agent was given read access to.
+/// `None` for an unknown member.
+pub fn session_note(ledger: &Ledger, id: &str, readable: &[PathBuf]) -> Option<String> {
     let (task, member) = ledger.member(id)?;
     let peers: Vec<(String, &MemberInfo)> = task
         .members
@@ -26,7 +30,52 @@ pub fn session_note(ledger: &Ledger, id: &str) -> Option<String> {
         .filter(|m| m.id != id)
         .map(|m| (ledger.address(id, &task, m), m))
         .collect();
-    Some(note(&task, &member, &peers))
+    let root = crate::brief::tasks_root(ledger.path());
+    let brief = crate::brief::info(&root, &task.name, ledger.brief(&task.name));
+    let mut out = note(&task, &member, &peers);
+    out.push_str(&access_note(&peers, readable));
+    out.push_str(&brief_note(&brief, &member));
+    Some(out)
+}
+
+/// Which of the peers' worktrees the agent can read: those it was given
+/// when it started (a member that joined since is not among them).
+fn access_note(peers: &[(String, &MemberInfo)], readable: &[PathBuf]) -> String {
+    let names: Vec<&str> = peers
+        .iter()
+        .filter(|(_, p)| readable.contains(&p.dir))
+        .map(|(address, _)| address.as_str())
+        .collect();
+    if names.is_empty() {
+        String::new()
+    } else if names.len() == peers.len() {
+        "\nYou can read the other members' worktrees, not edit them.".into()
+    } else {
+        format!(
+            "\nYou can read the worktrees of {}, not edit them.",
+            names.join(", ")
+        )
+    }
+}
+
+/// Where the task's brief is, how to write in it, and the scratch
+/// directory.
+fn brief_note(brief: &TaskBrief, member: &MemberInfo) -> String {
+    let location = match &brief.reference {
+        Some(reference) => {
+            format!("{reference} (tam does not fetch it: open it with your own tools)")
+        }
+        None => format!("the file {}", brief.location()),
+    };
+    format!(
+        "\nThe task's brief, what its members work from: {location}. Write in it under your \
+         own heading, \"{heading}\", and what the members agree on (an API shape, a name) under \
+         \"## Shared\"; leave the other headings to their members. Transient notes go in the \
+         task's scratch directory, shared by its members: {scratch}. tam peers shows the brief \
+         if it changes.",
+        heading = crate::brief::heading(&member.name, &member.id),
+        scratch = brief.scratch().display(),
+    )
 }
 
 /// The note for `member` of `task`; `peers` are the other members, each
@@ -118,6 +167,48 @@ mod tests {
         let note = note(&task(vec![api.clone()]), &api, &[]);
         assert!(note.starts_with("[tam] This session is the agent of task feat (member m-1), its only member for now."), "{note}");
         assert!(note.contains("tam peers"), "{note}");
+    }
+
+    #[test]
+    fn a_member_learns_the_brief_and_what_it_can_read() {
+        let api = member("m-1", "api", "backend");
+        let web = member("m-2", "web", "frontend");
+        let docs = member("m-3", "docs", "docs");
+        let peers = [("web".to_string(), &web), ("docs".to_string(), &docs)];
+        assert_eq!(access_note(&peers, &[]), "");
+        assert_eq!(
+            access_note(&peers, std::slice::from_ref(&web.dir)),
+            "\nYou can read the worktrees of web, not edit them."
+        );
+        assert_eq!(
+            access_note(&peers, &[web.dir.clone(), docs.dir.clone()]),
+            "\nYou can read the other members' worktrees, not edit them."
+        );
+
+        let local = TaskBrief {
+            reference: None,
+            dir: PathBuf::from("/d/tasks/feat"),
+        };
+        assert_eq!(
+            brief_note(&local, &api),
+            "\nThe task's brief, what its members work from: the file /d/tasks/feat/brief.md. \
+             Write in it under your own heading, \"## api (m-1)\", and what the members agree \
+             on (an API shape, a name) under \"## Shared\"; leave the other headings to their \
+             members. Transient notes go in the task's scratch directory, shared by its members: \
+             /d/tasks/feat/scratch. tam peers shows the brief if it changes."
+        );
+        let linked = TaskBrief {
+            reference: Some("https://t/CS-1".into()),
+            ..local
+        };
+        let note = brief_note(&linked, &api);
+        assert!(
+            note.starts_with(
+                "\nThe task's brief, what its members work from: https://t/CS-1 (tam does not \
+                 fetch it: open it with your own tools). Write in it"
+            ),
+            "{note}"
+        );
     }
 
     #[test]

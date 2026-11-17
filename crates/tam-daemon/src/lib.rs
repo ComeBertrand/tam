@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod brief;
 pub mod daemon;
 pub mod inbox;
 pub mod ledger;

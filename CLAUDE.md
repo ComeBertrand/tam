@@ -150,6 +150,26 @@ adopt). `tam-cli` depends on all three.
   agent's turn, never shown again: two agents waiting on each other each
   get a reply). Loop guard: hop count (at most 6, reset when the user prompts the
   agent) and 20 messages per 10 minutes per agent.
+- **Peers and discovery** — an agent knows its task from its environment:
+  `$TAM_AGENT_ID` (its member id, the only stable handle) and `$TAM_SOCKET`;
+  never a task name or peer list, which change (a member joins; a merge,
+  #27, moves members). Claude agents are also told at every `SessionStart`
+  (startup, resume, `/clear`, compaction): the daemon replies
+  `HookContext` to that `HookEvent` with `peers::session_note` (task, own
+  name and id, each peer's address, id, repo, branch and worktree, how to
+  reach them), and `tam hook-notify` prints it as `additionalContext`
+  (nothing else ever goes to its stdout). The note is a snapshot that says
+  so; what changes by the second (what peers' agents are doing) and later
+  membership changes are for `tam peers [--all] [--json]` (`peers.rs` in
+  `tam-cli`: the caller is the member of `$TAM_AGENT_ID`, else of the cwd;
+  JSON has `schema_version`). Codex and generic agents get no note (nothing
+  is typed into their PTY): the environment and `tam peers`. Short names:
+  `Ledger::resolve_from` (`SendMessage`, `ResolveMember { from }`, which
+  `Client::resolve_member` fills from `$TAM_AGENT_ID`) takes a member's
+  short name from an agent of its task, after everything `resolve` takes,
+  so no existing name changes meaning (reply hints use labels). Printed
+  addresses are checked: `Ledger::address` (and `tam peers`) give the short
+  name only when it resolves to that member from the reader, else the label.
 - **Testing hooks by hand** — run the dev daemon with temp `XDG_RUNTIME_DIR`
   (short path: Unix socket limit), `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
@@ -172,7 +192,8 @@ cargo test
   against a daemon, session resume with a fake `claude`; one test per file:
   they set process environment; `tam msg`/`inbox-wait`/`history` against a
   daemon, child processes with temp XDG dirs and no
-  `TAM_AGENT_ID`/`TAM_SOCKET`)
+  `TAM_AGENT_ID`/`TAM_SOCKET`; `tam peers` and the start note on real git
+  worktrees, with a fake `claude` and an `sh` agent running `tam peers`)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

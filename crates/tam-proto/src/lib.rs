@@ -395,13 +395,18 @@ pub enum Request {
     /// Find one task member. Replies `Member`.
     ///
     /// `target` is a task name (the task's only member), `<task>/<member>`
-    /// (member short name) or a member id. Without a target, `dir` picks the
-    /// member whose worktree contains it.
+    /// (member short name) or a member id; for a caller `from` a task, also
+    /// the short name of a member of that task. Without a target, `dir`
+    /// picks the member whose worktree contains it.
     ResolveMember {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dir: Option<PathBuf>,
+        /// The caller's agent id (`$TAM_AGENT_ID`): a target that names no
+        /// task and no member id may be a short name in its member's task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
     },
     /// Drop a task: stop its agents, remove its members' worktrees and
     /// forget it. Replies `Dropped` and pushes `TaskDropped`; or replies
@@ -483,7 +488,8 @@ pub enum Request {
     /// with no running agent gets it when its next agent starts.
     SendMessage {
         /// Recipient: a task name (its only member), `<task>/<member>` or a
-        /// member id.
+        /// member id; from a member's agent, also the short name of another
+        /// member of its task.
         to: String,
         text: String,
         /// The caller's agent id (`$TAM_AGENT_ID`): the message comes from
@@ -608,6 +614,12 @@ pub enum Response {
     },
     Messages {
         messages: Vec<MessageInfo>,
+    },
+    /// Text for the agent's model, which the hook that sent the `HookEvent`
+    /// adds to its context (Claude: `additionalContext`). Replied to the
+    /// `SessionStart` of a member's agent: its task and the other members.
+    HookContext {
+        context: String,
     },
 }
 
@@ -1120,9 +1132,10 @@ mod tests {
         let req: Request =
             serde_json::from_str(r#"{"type":"resolve_member","target":"feat/app"}"#).unwrap();
         match req {
-            Request::ResolveMember { target, dir } => {
+            Request::ResolveMember { target, dir, from } => {
                 assert_eq!(target.as_deref(), Some("feat/app"));
                 assert!(dir.is_none());
+                assert!(from.is_none());
             }
             _ => panic!("wrong variant"),
         }
@@ -1635,5 +1648,26 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    #[test]
+    fn peers_wire_format() {
+        let json = serde_json::to_string(&Response::HookContext {
+            context: "[tam] note".into(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"hook_context","context":"[tam] note"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            ServerMessage::Response(Response::HookContext { .. })
+        ));
+        let req: Request =
+            serde_json::from_str(r#"{"type":"resolve_member","target":"web","from":"m-00000001"}"#)
+                .unwrap();
+        assert!(matches!(
+            req,
+            Request::ResolveMember { target: Some(t), dir: None, from: Some(f) }
+                if t == "web" && f == "m-00000001"
+        ));
     }
 }

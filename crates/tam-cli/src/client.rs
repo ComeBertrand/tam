@@ -234,8 +234,9 @@ impl Client {
     }
 
     /// Find one task member: from a task name, `<task>/<member>` or a member
-    /// id, else from the member whose worktree contains `dir`. Returns the
-    /// member's task and runs too.
+    /// id, else from the member whose worktree contains `dir`. Run from an
+    /// agent tam started (`$TAM_AGENT_ID`), also from the short name of a
+    /// member of its task. Returns the member's task and runs too.
     pub async fn resolve_member(
         &mut self,
         target: Option<&str>,
@@ -244,6 +245,9 @@ impl Client {
         let request = Request::ResolveMember {
             target: target.map(str::to_string),
             dir: dir.map(Path::to_path_buf),
+            from: std::env::var("TAM_AGENT_ID")
+                .ok()
+                .filter(|id| !id.is_empty()),
         };
         match self.send(request).await? {
             Response::Member { task, member, runs } => Ok((task, *member, runs)),

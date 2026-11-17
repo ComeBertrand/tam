@@ -1,6 +1,6 @@
 //! `tam hook-notify`: forward an agent hook's JSON input to the daemon.
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -49,14 +49,36 @@ pub async fn notify(agent: Option<String>, socket: Option<PathBuf>, legacy_event
     // Only the daemon that spawned the agent: never start one.
     let socket = socket.unwrap_or_else(tam_proto::default_socket_path);
     if let Ok(Some(mut client)) = Client::try_connect_at(&socket).await {
-        let _ = client
+        let reply = client
             .send(tam_proto::Request::HookEvent {
                 agent_id,
-                event,
+                event: event.clone(),
                 payload: Some(payload),
             })
             .await;
+        // Nothing else goes to stdout: Claude reads it (as context for some
+        // events, as a decision for others). Not println!: it panics when
+        // stdout is closed.
+        if let Ok(tam_proto::Response::HookContext { context }) = reply {
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "{}",
+                hook_output(&event, &context)
+            );
+        }
     }
+}
+
+/// What a hook prints for Claude to add `context` to the session's
+/// context.
+pub fn hook_output(event: &str, context: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": context,
+        }
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -71,6 +93,18 @@ mod tests {
         assert_eq!(payload["session_id"], "s");
         assert_eq!(payload["tool_name"], "Read");
         assert!(payload.get("tool_response").is_none());
+    }
+
+    #[test]
+    fn context_is_hook_specific_output() {
+        let out: Value = serde_json::from_str(&hook_output("SessionStart", "a \"b\"\nc")).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "a \"b\"\nc",
+            }})
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod drop_report;
 mod health;
 mod hook;
 mod msg;
+mod peers;
 mod task;
 mod tui;
 
@@ -486,6 +487,8 @@ async fn main() -> Result<()> {
         Commands::InboxWait { agent, socket } => {
             std::process::exit(msg::inbox_wait(agent, socket).await)
         }
+
+        Commands::Peers { all, json, from } => peers::peers(all, json, from).await?,
     }
 
     Ok(())

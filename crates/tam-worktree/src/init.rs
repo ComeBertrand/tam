@@ -125,6 +125,8 @@ fn copy_include_files(source: &Path, target: &Path, patterns: &[String]) -> Resu
 }
 
 /// Run commands sequentially in the target directory. Stops on first failure.
+/// Their output goes to stderr, with the rest of what init reports: stdout
+/// is the caller's (e.g. `tam new --json`).
 fn run_commands(target: &Path, commands: &[String]) -> Result<()> {
     for cmd in commands {
         eprintln!("running: {}", cmd);
@@ -132,6 +134,7 @@ fn run_commands(target: &Path, commands: &[String]) -> Result<()> {
             .arg("-c")
             .arg(cmd)
             .current_dir(target)
+            .stdout(std::io::stderr())
             .status()
             .with_context(|| format!("failed to run: {}", cmd))?;
         if !status.success() {

@@ -194,6 +194,26 @@ adopt). `tam-cli` depends on all three.
   selection landed on the task, pinned while the task stays selected (a key
   never acts on a member the pane did not show), and `←`/`→` move it. The
   dashboard redraws every second (times in state).
+- **Non-interactive CLI** (`tam-cli/src/script.rs`, `schema.rs`) — `tam new`/`run`
+  attach only when stdin and stdout are terminals (`script::attaching`), else start
+  the agents and print what started (`--detach`; `--json`, a receipt). Failures carry
+  a `script::ErrorKind` in the anyhow chain (`CliError`; `client.rs` marks daemon and
+  not-found errors): exit 1 failed, 2 usage (clap), 3 not found, 4 timeout, 5 daemon.
+  `main` wraps `run` and reports the error, as a JSON document on stdout with
+  `--json` unless the command printed it inside its own (`reported`). The JSON
+  documents are view structs in `schema.rs`, never wire types: `schema_version` 1,
+  every key present (`null`), documented in the README (Scripting); a key removed
+  or retyped bumps the version, `ps --json` keeps its pre-version keys. `tam wait`
+  is `WaitAgents` (a `dispatch` arm like `WaitReply`: events plus a 1s recheck,
+  gives up on `exit`/`error` not waited for; `MemberState::satisfies`: `input`
+  takes `idle`); `tam result` is `GetOutcomes`. A task name means all its members
+  there. `MemberOutcome.response` is the Stop hook's `last_assistant_message` in
+  full (`HookData::response`, up to 100k chars, cleared at `UserPromptSubmit`;
+  `AgentDetail::last_message` stays the 2000-char excerpt every `AgentInfo`
+  carries), recorded in `AgentRunEnded.response` when the run ends
+  (`Ledger::last_response`): it outlives the agent and the daemon, and a new run
+  starts with none (never a stale one). `.tam.toml` init commands print to
+  stderr (stdout is the caller's).
 - **Printing** — every `tam-cli` module prints through `println!`/`eprintln!`
   redefined at the crate root (`output.rs`, #38): a closed stdout (`tam ps |
   head -1`) exits 0 quietly instead of panicking. Not `SIGPIPE`'s default: it
@@ -217,7 +237,9 @@ cargo test
   daemon, child processes with temp XDG dirs and no
   `TAM_AGENT_ID`/`TAM_SOCKET`; `tam peers` and the start note on real git
   worktrees, with a fake `claude` and an `sh` agent running `tam peers`;
-  `exit_status.rs`: a closed stdout)
+  `noninteractive.rs`:
+  new/wait/result/ps --json with no terminal and a fake `claude`;
+  `exit_status.rs`: exit statuses and a closed stdout)
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

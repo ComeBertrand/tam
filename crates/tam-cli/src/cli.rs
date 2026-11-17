@@ -27,6 +27,18 @@ pub enum Commands {
         /// Don't start an agent after creating the task
         #[arg(long)]
         no_start: bool,
+
+        /// Start the agent on this prompt
+        #[arg(short, long, value_name = "TEXT", conflicts_with = "no_start")]
+        prompt: Option<String>,
+
+        /// Don't attach to the agent (never attaches without a terminal)
+        #[arg(short, long)]
+        detach: bool,
+
+        /// Print a JSON receipt instead of attaching (see README, Scripting)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Start an agent in a task, resuming its current session
@@ -51,12 +63,29 @@ pub enum Commands {
         #[arg(short, long)]
         agent: Option<String>,
 
-        /// Initial prompt text
+        /// Initial prompt text (same as --prompt)
         prompt: Option<String>,
 
         /// Extra arguments passed to the agent command
         #[arg(last = true)]
         args: Vec<String>,
+
+        /// Start the agent on this prompt
+        #[arg(
+            short = 'p',
+            long = "prompt",
+            value_name = "TEXT",
+            conflicts_with = "prompt"
+        )]
+        prompt_option: Option<String>,
+
+        /// Don't attach to the agent (never attaches without a terminal)
+        #[arg(short, long)]
+        detach: bool,
+
+        /// Print a JSON receipt instead of attaching (see README, Scripting)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Stop the agents of a task (or of one member: TASK/MEMBER)
@@ -252,4 +281,76 @@ pub enum Commands {
         #[arg(long, env = "TAM_AGENT_ID", hide = true)]
         from: Option<String>,
     },
+
+    /// Wait until the agents of a task (or of one member) stop working
+    ///
+    /// Done once each agent is in one of the --until states (default: any
+    /// but working; input also takes idle, the state of agents without
+    /// hooks). Gives up at once when an agent exits or its turn fails,
+    /// unless --until takes exit or error. Exit status: 0 done, 1 gave up,
+    /// 3 no such task or member, 4 timed out, 5 daemon unreachable.
+    Wait {
+        /// Task name (all its members), TASK/MEMBER or member id (resolved
+        /// from current directory if omitted)
+        name: Option<String>,
+
+        /// States to wait for, comma-separated
+        #[arg(short, long, value_enum, value_delimiter = ',', value_name = "STATE")]
+        until: Vec<Until>,
+
+        /// Give up after this long: 90 (seconds), 90s, 15m, 2h (default: no
+        /// limit)
+        #[arg(short, long, value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<std::time::Duration>,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print the last response of a task's agents (or of one member's)
+    ///
+    /// The text that ended the agent's last turn, in full, kept once the
+    /// agent exits. There is none while a turn runs, before the first one
+    /// ends, after a failed or interrupted turn, and for agents that report
+    /// none (only Claude reports them). Exit status: 0 printed, 1 no
+    /// response, 3 no such task or member, 5 daemon unreachable.
+    Result {
+        /// Task name (all its members), TASK/MEMBER or member id (resolved
+        /// from current directory if omitted)
+        name: Option<String>,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// A state `tam wait` waits for: an agent state, or `exit` (no agent runs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Until {
+    Working,
+    Blocked,
+    Input,
+    Idle,
+    Question,
+    Error,
+    Exit,
+}
+
+/// A duration: whole seconds (`90`), or a number followed by `s`, `m` or `h`.
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let invalid = || format!("invalid duration '{s}': use e.g. 90, 90s, 15m or 2h");
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let n: u64 = number.parse().map_err(|_| invalid())?;
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return Err(invalid()),
+    };
+    let secs = n.checked_mul(scale).ok_or_else(invalid)?;
+    Ok(std::time::Duration::from_secs(secs))
 }

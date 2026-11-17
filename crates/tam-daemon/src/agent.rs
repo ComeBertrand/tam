@@ -58,6 +58,9 @@ pub struct Agent {
     /// What the agent's hooks reported (session, pending action, …).
     hook_data: HookData,
     _reader_handle: JoinHandle<()>,
+    /// Other members' worktrees the agent was given read access to when
+    /// it started (see `provider::TaskAccess`).
+    readable: Vec<PathBuf>,
 }
 
 impl Agent {
@@ -162,6 +165,7 @@ impl Agent {
             member: None,
             hook_data: HookData::default(),
             _reader_handle: reader_handle,
+            readable: Vec::new(),
         })
     }
 
@@ -218,6 +222,17 @@ impl Agent {
 
     pub fn member(&self) -> Option<&str> {
         self.member.as_deref()
+    }
+
+    /// Record the other members' worktrees the agent can read.
+    pub fn set_readable(&mut self, dirs: Vec<PathBuf>) {
+        self.readable = dirs;
+    }
+
+    /// The other members' worktrees the agent can read, as granted when it
+    /// started: members that joined since are not among them.
+    pub fn readable(&self) -> &[PathBuf] {
+        &self.readable
     }
 
     pub fn pid(&self) -> u32 {

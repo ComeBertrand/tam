@@ -128,6 +128,15 @@ pub enum LedgerEvent {
         member: String,
         timestamp: u64,
     },
+    /// The task's brief changed: a reference the user gave (a URL, a ticket
+    /// id, a path), or `None` for the local file `brief.md` (the default).
+    /// Only the latest is kept.
+    BriefSet {
+        task: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brief: Option<String>,
+        timestamp: u64,
+    },
 }
 
 /// Ledger lines written before tasks had members (tam <= 0.3.6): a task had
@@ -1035,6 +1044,16 @@ impl State {
                     self.observed.remove(member);
                 }
             }
+            LedgerEvent::BriefSet { task, .. } => {
+                let Some(record) = self.tasks.get_mut(task) else {
+                    return; // an unknown or dropped task
+                };
+                // The latest replaces the earlier ones (see `Ledger::brief`).
+                record
+                    .events
+                    .retain(|(_, e)| !matches!(e, LedgerEvent::BriefSet { .. }));
+                record.events.push((seq, event));
+            }
         }
     }
 
@@ -1218,6 +1237,40 @@ impl Ledger {
             Ok((_, found)) if found.id == member.id => member.name.clone(),
             _ => task.member_label(member),
         }
+    }
+}
+
+/// Tasks' briefs: what their members work from.
+impl Ledger {
+    /// The task's brief: the reference the user gave, `None` for the local
+    /// file (no reference given, or changed back to it). Kept with the
+    /// task's events, so a re-created name starts with none.
+    pub fn brief(&self, task: &str) -> Option<String> {
+        let record = self.state.tasks.get(task)?;
+        record.events.iter().rev().find_map(|(_, e)| match e {
+            LedgerEvent::BriefSet { brief, .. } => brief.clone(),
+            _ => None,
+        })
+    }
+
+    /// Change the task's brief (`None`: back to the local file). Returns
+    /// whether it changed.
+    pub fn set_brief(&mut self, task: &str, brief: Option<&str>) -> Result<bool> {
+        self.require(task)?;
+        if let Some(brief) = brief {
+            if brief.trim().is_empty() {
+                bail!("a brief cannot be empty");
+            }
+        }
+        if self.brief(task).as_deref() == brief {
+            return Ok(false);
+        }
+        self.append(LedgerEvent::BriefSet {
+            task: task.into(),
+            brief: brief.map(str::to_string),
+            timestamp: now(),
+        })?;
+        Ok(true)
     }
 }
 
@@ -2636,5 +2689,42 @@ mod tests {
         let ended = std::fs::read_to_string(&path).unwrap();
         let last = ended.lines().last().unwrap();
         assert!(!last.contains("response"), "{last}");
+    }
+
+    #[test]
+    fn a_brief_is_kept_until_changed_and_goes_with_its_task() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        {
+            let mut ledger = open(&tmp);
+            create(&mut ledger, "feat", "/w/feat");
+            // The local file until a reference is given.
+            assert_eq!(ledger.brief("feat"), None);
+            assert!(ledger.set_brief("feat", Some("CS-1")).unwrap());
+            assert!(ledger.set_brief("feat", Some("https://t/CS-2")).unwrap());
+            assert!(!ledger.set_brief("feat", Some("https://t/CS-2")).unwrap());
+            assert_eq!(ledger.brief("feat").as_deref(), Some("https://t/CS-2"));
+            assert!(ledger.set_brief("feat", Some("  ")).is_err());
+            assert!(ledger.set_brief("nope", Some("CS-1")).is_err());
+        }
+        // Read back; compaction keeps the latest only.
+        let mut ledger = open(&tmp);
+        assert_eq!(ledger.brief("feat").as_deref(), Some("https://t/CS-2"));
+        let types = event_types(&path);
+        assert_eq!(types.iter().filter(|t| *t == "brief_set").count(), 1);
+
+        // Back to the local file, also after a reopen.
+        assert!(ledger.set_brief("feat", None).unwrap());
+        assert_eq!(ledger.brief("feat"), None);
+        drop(ledger);
+        let mut ledger = open(&tmp);
+        assert_eq!(ledger.brief("feat"), None);
+
+        // A re-created name starts with the local file.
+        ledger.set_brief("feat", Some("CS-3")).unwrap();
+        ledger.drop_task("feat", true).unwrap();
+        assert_eq!(ledger.brief("feat"), None);
+        create(&mut ledger, "feat", "/w/feat");
+        assert_eq!(ledger.brief("feat"), None);
     }
 }

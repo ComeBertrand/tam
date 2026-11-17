@@ -902,6 +902,8 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             join,
             env,
         } => handle_create_members(state, &task, members, source, join, env).await,
+        Request::GetBrief { task } => handle_get_brief(state, &task).await,
+        Request::SetBrief { task, brief } => handle_set_brief(state, &task, brief).await,
     }
 }
 
@@ -983,7 +985,18 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         ("TAM_SOCKET", socket_path.as_str()),
     ];
 
-    let resolved = Arc::from(provider::resolve(&provider));
+    // A member's task directory is there for any agent; a Claude agent
+    // also reaches it and reads the other members' worktrees (see
+    // `brief::access`).
+    let access = member
+        .as_deref()
+        .and_then(|member| state.member_access(member))
+        .filter(|_| provider::grants_access(&provider));
+    let readable = access
+        .as_ref()
+        .map(|a| a.read_only.clone())
+        .unwrap_or_default();
+    let resolved = Arc::from(provider::resolve_with(&provider, access));
     match Agent::spawn(
         resolved,
         &dir,
@@ -995,6 +1008,7 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         Ok(mut agent) => {
             info!(id = %id, provider = %provider, dir = %dir.display(), "spawned agent");
             agent.set_member(member.clone());
+            agent.set_readable(readable);
             state.agents.insert(id.clone(), agent);
             let info = state.agent_info(&id).expect("agent just inserted");
             state.broadcast(Event::AgentSpawned {
@@ -1214,11 +1228,9 @@ async fn handle_hook_event(
     // Whenever a session starts (resumed, cleared, compacted too): what its
     // task is now, and its peers.
     if event == "SessionStart" {
-        let note = state
-            .agents
-            .get(agent_id)
-            .and_then(Agent::member)
-            .and_then(|member| crate::peers::session_note(&state.ledger, member));
+        let note = state.agents.get(agent_id).and_then(|agent| {
+            crate::peers::session_note(&state.ledger, agent.member()?, agent.readable())
+        });
         if let Some(context) = note {
             return Response::HookContext { context };
         }
@@ -1313,7 +1325,7 @@ async fn handle_drop_task(
 
     let mut state = state.lock().await;
     state.dropping.remove(name);
-    let removal = match removal {
+    let mut removal = match removal {
         Ok(removal) => removal,
         Err(response) => return response,
     };
@@ -1322,6 +1334,7 @@ async fn handle_drop_task(
             message: format!("cannot record the drop of '{name}': {e:#}; drop it again to finish"),
         };
     }
+    removal.warnings.extend(state.retire_task_dir(name));
     for warning in &removal.warnings {
         warn!(task = %name, "{warning}");
     }
@@ -2550,5 +2563,110 @@ async fn handle_wait_agents(
                 };
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Briefs (see `brief.rs`)
+// ---------------------------------------------------------------------------
+
+impl DaemonState {
+    fn tasks_root(&self) -> PathBuf {
+        crate::brief::tasks_root(self.ledger.path())
+    }
+
+    /// The task a brief request names: a task, else a member's task.
+    fn brief_task(&self, target: &str) -> Result<TaskInfo, String> {
+        if let Some(task) = self.ledger.task(target) {
+            return Ok(task);
+        }
+        match self.ledger.resolve(target) {
+            Ok((task, _)) => Ok(task),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
+    /// The task's brief, its directory made if missing.
+    fn ensure_brief(&self, task: &TaskInfo) -> Result<tam_proto::TaskBrief> {
+        let reference = self.ledger.brief(&task.name);
+        crate::brief::ensure(&self.tasks_root(), task, reference)
+    }
+
+    /// What the agent of `member` may reach outside its worktree (see
+    /// `brief::access`), its task's directory made if missing. `None` when
+    /// that fails: the agent starts anyway, with its worktree only.
+    fn member_access(&self, member: &str) -> Option<provider::TaskAccess> {
+        let (task, _) = self.ledger.member(member)?;
+        match self.ensure_brief(&task) {
+            Ok(brief) => Some(crate::brief::access(&brief, &task, member)),
+            Err(e) => {
+                warn!(task = %task.name, "cannot make the task's directory: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Remove the directory of a task just dropped (see `brief::retire`);
+    /// what to tell the user.
+    fn retire_task_dir(&self, name: &str) -> Option<String> {
+        match crate::brief::retire(&self.tasks_root(), name, crate::ledger::now()) {
+            Ok(Some(kept)) => Some(format!(
+                "the brief of task '{name}' is kept at {}",
+                kept.display()
+            )),
+            Ok(None) => None,
+            Err(e) => Some(format!(
+                "cannot remove the directory of task '{name}': {e:#}"
+            )),
+        }
+    }
+}
+
+async fn handle_get_brief(state: &Arc<Mutex<DaemonState>>, target: &str) -> Response {
+    let state = state.lock().await;
+    let task = match state.brief_task(target) {
+        Ok(task) => task,
+        Err(message) => return Response::Error { message },
+    };
+    match state.ensure_brief(&task) {
+        Ok(brief) => Response::Brief {
+            task: task.name,
+            brief,
+        },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
+}
+
+async fn handle_set_brief(
+    state: &Arc<Mutex<DaemonState>>,
+    target: &str,
+    brief: Option<String>,
+) -> Response {
+    let mut state = state.lock().await;
+    let task = match state.brief_task(target) {
+        Ok(task) => task,
+        Err(message) => return Response::Error { message },
+    };
+    if state.dropping.contains(&task.name) {
+        return Response::Error {
+            message: format!("task '{}' is being dropped", task.name),
+        };
+    }
+    if let Err(e) = state.ledger.set_brief(&task.name, brief.as_deref()) {
+        return Response::Error {
+            message: format!("{e:#}"),
+        };
+    }
+    info!(task = %task.name, brief = ?brief, "brief set");
+    match state.ensure_brief(&task) {
+        Ok(brief) => Response::Brief {
+            task: task.name,
+            brief,
+        },
+        Err(e) => Response::Error {
+            message: format!("the brief is set, but {e:#}"),
+        },
     }
 }

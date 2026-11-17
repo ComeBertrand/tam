@@ -1,5 +1,7 @@
 mod app;
 mod branch;
+mod fuzzy;
+mod input;
 mod peek;
 mod table;
 mod triage;
@@ -10,7 +12,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -24,6 +29,7 @@ use crate::task::{Member, Task};
 use tam_proto::SessionChoice;
 
 use self::app::{App, MemberChoice, Mode, PaneTab, PickerItem, PickerState, TaskDetail};
+use self::input::TextInput;
 use self::peek::{Peek, Scroll};
 
 /// Actions returned from the event loop.
@@ -68,7 +74,6 @@ enum Action {
         provider: String,
     },
     TogglePeek,
-    RefreshPeek,
     /// Start a member's agent in a new session.
     RunNewSession {
         member: String,
@@ -100,6 +105,7 @@ pub async fn run() -> Result<()> {
         .context("failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    mouse_capture(true);
 
     let mut app = App::new();
     app.commands = config.commands.clone();
@@ -107,10 +113,26 @@ pub async fn run() -> Result<()> {
 
     let result = run_loop(&mut terminal, &mut app, &mut client, &config).await;
 
+    mouse_capture(false);
     terminal::disable_raw_mode()?;
     std::io::stdout().execute(LeaveAlternateScreen)?;
 
     result
+}
+
+/// Have the terminal report mouse clicks and the wheel (`?1000`: no
+/// motion), with SGR coordinates (`?1006`), or stop. Off while attached:
+/// the agent would get the reports as typed text.
+fn mouse_capture(on: bool) {
+    use std::io::Write;
+    let seq = if on {
+        "\x1b[?1000h\x1b[?1006h"
+    } else {
+        "\x1b[?1006l\x1b[?1000l"
+    };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 enum ReaderCtl {
@@ -201,12 +223,16 @@ async fn run_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // What git said of a member's worktree (looked at off this thread).
     let (branch_tx, mut branch_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The projects found under $HOME (looked for off this thread).
+    let (projects_tx, mut projects_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The agent's screen changed, or the pane scrolled: fetch it again.
+    let mut screen_moved = false;
 
     loop {
         app.sync_focus();
         // Whatever moved the selection (a key, a re-sort, an agent starting
         // or exiting), the preview follows.
-        if app.peek_stale() {
+        if app.peek_stale() || std::mem::take(&mut screen_moved) {
             refresh_peek(client, app).await;
         }
         if app.detail_stale() {
@@ -222,120 +248,134 @@ async fn run_loop(
         }
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        let action = tokio::select! {
+        let events = tokio::select! {
             Some(ev) = input.events.recv() => {
-                match ev {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        handle_key_event(key, app, config)
-                    }
-                    _ => Action::None,
+                // And whatever came meanwhile (a wheel spun fast, a paste):
+                // handled before the next draw.
+                let mut events = vec![ev];
+                while let Ok(ev) = input.events.try_recv() {
+                    events.push(ev);
                 }
+                events
             }
             msg = client.read_message() => {
                 match msg? {
                     ServerMessage::Event(tam_proto::Event::ScreenUpdated { id }) => {
                         let watched = app.peek.as_ref().and_then(|p| p.watching.as_ref());
-                        if watched == Some(&id) {
-                            Action::RefreshPeek
-                        } else {
-                            Action::None
-                        }
+                        screen_moved |= watched == Some(&id);
                     }
-                    ServerMessage::Event(event) => {
-                        apply_event(app, event);
-                        Action::None
-                    }
-                    ServerMessage::Response(_) => Action::None,
+                    ServerMessage::Event(event) => apply_event(app, event),
+                    ServerMessage::Response(_) => {}
                 }
+                Vec::new()
             }
             Some((id, state)) = branch_rx.recv() => {
                 app.set_branch(id, state);
-                Action::None
+                Vec::new()
             }
-            _ = tick.tick() => Action::None,
+            Some(projects) = projects_rx.recv() => {
+                app.set_projects(projects);
+                Vec::new()
+            }
+            _ = tick.tick() => Vec::new(),
         };
 
-        match action {
-            Action::Quit => return Ok(()),
-            Action::SelectNext => {
-                app.select_next();
-                refresh_peek(client, app).await;
-            }
-            Action::SelectPrev => {
-                app.select_prev();
-                refresh_peek(client, app).await;
-            }
-            Action::Attach { id, label } => {
-                // The dashboard reads nothing while attached.
-                unwatch_screen(client, app).await;
-                input.pause().await;
-                let provider = app
-                    .find_member(&id)
-                    .and_then(|(_, m)| m.agent_info.as_ref())
-                    .map(|a| a.provider.clone())
-                    .unwrap_or_default();
-                let attached = attach_agent(terminal, app, &id, &label, &provider).await;
-                input.resume();
-                attached?;
-                refresh_peek(client, app).await;
-            }
-            Action::StopAgent { id, label } => {
-                stop_agent(client, app, &id, &label).await?;
-                refresh_peek(client, app).await;
-            }
-            Action::DropTask {
-                name,
-                label,
-                force,
-                delete_branch,
-            } => {
-                drop_task(client, app, &name, &label, force, delete_branch).await;
-                refresh_peek(client, app).await;
-            }
-            Action::NewTask => {
-                start_new_task_flow(app, config);
-            }
-            Action::RunAgent { member } => {
-                do_run(client, app, config, &member, SessionChoice::Current).await?;
-            }
-            Action::DoNewTask { name, dirs } => {
-                do_new_task(client, app, &name, &dirs, config).await?;
-            }
-            Action::CustomCommand {
-                name,
-                command,
-                task,
-                dir,
-                provider,
-            } => match config::run_custom_command(&command, &task, &dir, &provider) {
-                Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
-                Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
-            },
-            Action::TogglePeek => {
-                if app.peek.is_some() {
+        for ev in events {
+            // As if drawn between them: keys act on the member the pane
+            // would show.
+            app.sync_focus();
+            let action = match ev {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key_event(key, app, config)
+                }
+                Event::Mouse(mouse) => handle_mouse(mouse, app),
+                _ => Action::None,
+            };
+            match action {
+                Action::Quit => return Ok(()),
+                Action::SelectNext => app.select_next(),
+                Action::SelectPrev => app.select_prev(),
+                Action::Attach { id, label } => {
+                    // Before the reader stops: no report may reach the agent.
+                    mouse_capture(false);
+                    // The dashboard reads nothing while attached.
                     unwatch_screen(client, app).await;
-                    app.peek = None;
-                } else {
-                    app.peek = Some(Peek::default());
-                    refresh_peek(client, app).await;
+                    input.pause().await;
+                    let provider = app
+                        .find_member(&id)
+                        .and_then(|(_, m)| m.agent_info.as_ref())
+                        .map(|a| a.provider.clone())
+                        .unwrap_or_default();
+                    let attached = attach_agent(terminal, app, &id, &label, &provider).await;
+                    mouse_capture(true);
+                    input.resume();
+                    attached?;
+                    screen_moved = true;
+                    // What came before attaching is not for the dashboard.
+                    break;
                 }
-            }
-            Action::RefreshPeek => {
-                refresh_peek(client, app).await;
-            }
-            Action::RunNewSession { member } => {
-                do_run(client, app, config, &member, SessionChoice::New).await?;
-            }
-            Action::RepairTask { name } => {
-                repair_task(client, app, &name).await;
-            }
-            Action::ScrollPeek(scroll) => {
-                if let Some(peek) = app.peek.as_mut() {
-                    peek.scroll(scroll);
+                Action::StopAgent { id, label } => {
+                    stop_agent(client, app, &id, &label).await?;
+                    screen_moved = true;
                 }
-                refresh_peek(client, app).await;
+                Action::DropTask {
+                    name,
+                    label,
+                    force,
+                    delete_branch,
+                } => {
+                    drop_task(client, app, &name, &label, force, delete_branch).await;
+                    screen_moved = true;
+                }
+                Action::NewTask => {
+                    start_new_task_flow(app);
+                    if !app.discovering {
+                        app.discovering = true;
+                        let tx = projects_tx.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(discover_projects());
+                        });
+                    }
+                }
+                Action::RunAgent { member } => {
+                    do_run(client, app, config, &member, SessionChoice::Current).await?;
+                }
+                Action::DoNewTask { name, dirs } => {
+                    do_new_task(client, app, &name, &dirs, config).await?;
+                }
+                Action::CustomCommand {
+                    name,
+                    command,
+                    task,
+                    dir,
+                    provider,
+                } => match config::run_custom_command(&command, &task, &dir, &provider) {
+                    Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
+                    Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
+                },
+                Action::TogglePeek => {
+                    if app.peek.is_some() {
+                        unwatch_screen(client, app).await;
+                        app.peek = None;
+                    } else {
+                        app.peek = Some(Peek::default());
+                        screen_moved = true;
+                    }
+                }
+                Action::RunNewSession { member } => {
+                    do_run(client, app, config, &member, SessionChoice::New).await?;
+                }
+                Action::RepairTask { name } => {
+                    repair_task(client, app, &name).await;
+                }
+                Action::ScrollPeek(scroll) => {
+                    if let Some(peek) = app.peek.as_mut() {
+                        peek.scroll(scroll);
+                    }
+                    screen_moved = true;
+                }
+                Action::None => {}
             }
-            Action::None => {}
         }
     }
 }
@@ -355,11 +395,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::ConfirmDropTask { .. } => handle_confirm_drop_key(key, app),
         Mode::ConfirmForceDrop { .. } => handle_confirm_force_drop_key(key, app),
         Mode::ConfirmRepairOrDrop { .. } => handle_repair_or_drop_key(key, app),
-        Mode::Notice { .. } => {
+        Mode::Notice { .. } | Mode::Help => {
             app.mode = Mode::Normal;
             Action::None
         }
-        _ => handle_picker_key(key, app, config),
+        Mode::NewTaskPickProject(_) => handle_picker_key(key, app, config),
     }
 }
 
@@ -400,6 +440,10 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             _ => Action::None,
         },
         (KeyCode::Char('p'), _) => Action::TogglePeek,
+        (KeyCode::Char('?'), _) => {
+            app.mode = Mode::Help;
+            Action::None
+        }
         (KeyCode::Char('g'), _) => {
             app.toggle_order();
             Action::None
@@ -472,142 +516,130 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
 }
 
 fn handle_filter_key(key: KeyEvent, app: &mut App) -> Action {
-    match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => {
-            if app.filter.is_empty() {
-                app.filter_active = false;
-            } else {
-                app.filter.clear();
+    match key.code {
+        KeyCode::Esc if app.filter.is_empty() => app.filter_active = false,
+        KeyCode::Esc => app.clear_filter(),
+        KeyCode::Enter => app.filter_active = false,
+        KeyCode::Down => return Action::SelectNext,
+        KeyCode::Up => return Action::SelectPrev,
+        _ => {
+            let before = app.filter.value().to_string();
+            if app.filter.handle(key) && app.filter.value() != before {
                 app.selected = 0;
             }
-            Action::None
         }
-        (KeyCode::Enter, _) => {
-            app.filter_active = false;
-            Action::None
-        }
-        (KeyCode::Backspace, _) => {
-            app.filter.pop();
-            app.selected = 0;
-            Action::None
-        }
-        (KeyCode::Down, _) => Action::SelectNext,
-        (KeyCode::Up, _) => Action::SelectPrev,
-        (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-            app.filter.push(c);
-            app.selected = 0;
-            Action::None
-        }
-        _ => Action::None,
     }
+    Action::None
 }
 
 fn handle_picker_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
-    match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => {
-            app.mode = Mode::Normal;
-            Action::None
-        }
-        (KeyCode::Down, _) => {
-            picker_mut(app, PickerState::select_next);
-            Action::None
-        }
-        (KeyCode::Up, _) => {
-            picker_mut(app, PickerState::select_prev);
-            Action::None
-        }
-        (KeyCode::Enter, _) => handle_picker_enter(app, config),
-        (KeyCode::Tab, _) => {
-            picker_mut(app, PickerState::toggle_mark);
-            Action::None
-        }
-        (KeyCode::Backspace, _) => {
-            picker_mut(app, PickerState::backspace);
-            Action::None
-        }
-        (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-            picker_mut(app, |p| p.type_char(c));
-            Action::None
-        }
-        _ => Action::None,
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Down => picker_mut(app, PickerState::select_next),
+        KeyCode::Up => picker_mut(app, PickerState::select_prev),
+        KeyCode::Enter => return handle_picker_enter(app, config),
+        KeyCode::Tab => picker_mut(app, PickerState::toggle_mark),
+        _ => picker_mut(app, |p| {
+            p.edit(key);
+        }),
     }
+    Action::None
 }
 
 fn handle_new_task_name_key(key: KeyEvent, app: &mut App) -> Action {
-    match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => {
-            app.mode = Mode::Normal;
-            Action::None
-        }
-        (KeyCode::Enter, _) => {
-            let (name, dirs) = match &app.mode {
-                Mode::NewTaskEnterName { name, project_dirs } => {
-                    (name.clone(), project_dirs.clone())
-                }
-                _ => return Action::None,
+    let Mode::NewTaskEnterName { name, project_dirs } = &mut app.mode else {
+        return Action::None;
+    };
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Enter if !name.is_empty() => {
+            let action = Action::DoNewTask {
+                name: name.value().to_string(),
+                dirs: std::mem::take(project_dirs),
             };
-            if name.is_empty() {
-                return Action::None;
-            }
             app.mode = Mode::Normal;
-            Action::DoNewTask { name, dirs }
+            return action;
         }
-        (KeyCode::Backspace, _) => {
-            if let Mode::NewTaskEnterName { ref mut name, .. } = app.mode {
-                name.pop();
-            }
-            Action::None
+        _ => {
+            name.handle(key);
         }
-        (KeyCode::Char(c), _) => {
-            if let Mode::NewTaskEnterName { ref mut name, .. } = app.mode {
-                name.push(c);
-            }
-            Action::None
-        }
-        _ => Action::None,
     }
+    Action::None
 }
 
 fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
-    match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => {
+    let Mode::SpawnEnterPath(input) = &mut app.mode else {
+        return Action::None;
+    };
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Enter => {
+            let path = input.value().to_string();
             app.mode = Mode::Normal;
-            Action::None
-        }
-        (KeyCode::Enter, _) => {
-            let path = match &app.mode {
-                Mode::SpawnEnterPath(p) => p.clone(),
-                _ => return Action::None,
-            };
             let dir = PathBuf::from(&path);
             if !dir.is_dir() {
                 app.set_status(format!("Not a directory: {path}"), Duration::from_secs(3));
-                app.mode = Mode::Normal;
                 return Action::None;
             }
-            let root = match repository(&dir) {
-                Ok(root) => root,
-                Err(e) => {
-                    app.set_status(e, Duration::from_secs(5));
-                    app.mode = Mode::Normal;
-                    return Action::None;
+            match repository(&dir) {
+                Ok(root) => {
+                    app.mode = Mode::NewTaskEnterName {
+                        project_dirs: vec![root],
+                        name: TextInput::default(),
+                    }
                 }
-            };
-            app.mode = Mode::NewTaskEnterName {
-                project_dirs: vec![root],
-                name: String::new(),
-            };
-            Action::None
-        }
-        (KeyCode::Backspace, _) => {
-            if let Mode::SpawnEnterPath(ref mut path) = app.mode {
-                path.pop();
+                Err(e) => app.set_status(e, Duration::from_secs(5)),
             }
-            Action::None
         }
-        (KeyCode::Char(c), _) => {
-            if let Mode::SpawnEnterPath(ref mut path) = app.mode {
-                path.push(c);
+        _ => {
+            input.handle(key);
+        }
+    }
+    Action::None
+}
+
+/// A click or the wheel: in the task list, select (a member's row focuses
+/// that member while the pane is open) or move the selection; over the
+/// pane, scroll the agent's screen; in the project picker, highlight or
+/// move. A click closes the help.
+fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
+    let at = ratatui::layout::Position::new(mouse.column, mouse.row);
+    let click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    match &mut app.mode {
+        Mode::Normal => {}
+        Mode::Help if click => {
+            app.mode = Mode::Normal;
+            return Action::None;
+        }
+        Mode::NewTaskPickProject(picker) => {
+            match (mouse.kind, app.hits.picker) {
+                (MouseEventKind::ScrollDown, _) => picker.select_next(),
+                (MouseEventKind::ScrollUp, _) => picker.select_prev(),
+                (MouseEventKind::Down(MouseButton::Left), Some((area, first)))
+                    if area.contains(at) =>
+                {
+                    let index = first + usize::from(at.y - area.y);
+                    if index < picker.filtered_items().len() {
+                        picker.selected = index;
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+        _ => return Action::None,
+    }
+    let in_list = app.hits.list.contains(at);
+    let in_pane = app.hits.pane.is_some_and(|pane| pane.contains(at));
+    match mouse.kind {
+        MouseEventKind::ScrollDown if in_list => Action::SelectNext,
+        MouseEventKind::ScrollUp if in_list => Action::SelectPrev,
+        MouseEventKind::ScrollDown if in_pane => Action::ScrollPeek(Scroll::Down(3)),
+        MouseEventKind::ScrollUp if in_pane => Action::ScrollPeek(Scroll::Up(3)),
+        MouseEventKind::Down(MouseButton::Left) if in_list => {
+            let row = usize::from(at.y - app.hits.list.y);
+            if let Some(Some((index, member))) = app.hits.rows.get(row).cloned() {
+                app.select_at(index, member);
             }
             Action::None
         }
@@ -743,7 +775,7 @@ fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
 // New task flow
 // ---------------------------------------------------------------------------
 
-fn start_new_task_flow(app: &mut App, _config: &Config) {
+fn start_new_task_flow(app: &mut App) {
     let cwd_display = std::env::current_dir()
         .ok()
         .map(|p| ui::shorten_home(&p.display().to_string()))
@@ -759,26 +791,33 @@ fn start_new_task_flow(app: &mut App, _config: &Config) {
             id: "__enter_path__".into(),
         },
     ];
+    // Those found last time, while they are looked for again.
+    items.extend(app.projects.iter().flatten().cloned());
+    let mut picker = PickerState::new("Pick project", items);
+    picker.loading = true;
+    app.mode = Mode::NewTaskPickProject(picker);
+}
 
-    // Discover projects using tam-worktree
-    if let Ok(wt_config) = tam_worktree::config::load_config() {
-        if let Ok(ignore) = tam_worktree::discovery::build_ignore_set(&wt_config.ignore) {
-            let root = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            if let Ok(paths) =
-                tam_worktree::discovery::discover(&root, &ignore, wt_config.max_depth)
-            {
-                let entries = tam_worktree::pretty::build_pretty_names(&paths);
-                for entry in &entries {
-                    items.push(PickerItem {
-                        display: entry.display_name.clone(),
-                        id: entry.path.to_string_lossy().into_owned(),
-                    });
-                }
-            }
-        }
-    }
-
-    app.mode = Mode::NewTaskPickProject(PickerState::new("Pick project", items));
+/// The projects under `$HOME` (`tam ls`'s discovery): it walks the
+/// directories, so not on the UI thread.
+fn discover_projects() -> Vec<PickerItem> {
+    let Ok(wt_config) = tam_worktree::config::load_config() else {
+        return Vec::new();
+    };
+    let Ok(ignore) = tam_worktree::discovery::build_ignore_set(&wt_config.ignore) else {
+        return Vec::new();
+    };
+    let root = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let Ok(paths) = tam_worktree::discovery::discover(&root, &ignore, wt_config.max_depth) else {
+        return Vec::new();
+    };
+    tam_worktree::pretty::build_pretty_names(&paths)
+        .into_iter()
+        .map(|entry| PickerItem {
+            display: entry.display_name,
+            id: entry.path.to_string_lossy().into_owned(),
+        })
+        .collect()
 }
 
 /// Enter in the project picker: the projects picked with tab, else the
@@ -797,7 +836,7 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
     };
     app.mode = Mode::Normal;
     if ids == ["__enter_path__"] {
-        app.mode = Mode::SpawnEnterPath(String::new());
+        app.mode = Mode::SpawnEnterPath(TextInput::default());
         return Action::None;
     }
 
@@ -820,7 +859,7 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
     }
     app.mode = Mode::NewTaskEnterName {
         project_dirs: roots,
-        name: String::new(),
+        name: TextInput::default(),
     };
     Action::None
 }
@@ -2016,5 +2055,192 @@ mod tests {
             cannot_repair: None,
         }));
         assert_eq!(gone.branch_due(), None);
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn prompts_edit_at_the_cursor() {
+        let config = Config::default();
+        let mut app = App::new();
+        app.mode = Mode::NewTaskEnterName {
+            project_dirs: vec![PathBuf::from("/src/api")],
+            name: TextInput::from("feat-x"),
+        };
+        // ctrl-u clears (it typed a `u` before), ← then a character inserts.
+        handle_key_event(
+            key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut app,
+            &config,
+        );
+        for c in "fix-nav".chars() {
+            handle_key_event(press(c), &mut app, &config);
+        }
+        for _ in 0..3 {
+            handle_key_event(key(KeyCode::Left, KeyModifiers::NONE), &mut app, &config);
+        }
+        handle_key_event(press('x'), &mut app, &config);
+        let action = handle_key_event(key(KeyCode::Enter, KeyModifiers::NONE), &mut app, &config);
+        assert!(
+            matches!(action, Action::DoNewTask { ref name, ref dirs } if name == "fix-xnav" && dirs.len() == 1),
+        );
+
+        // The filter: typed, edited, esc clears it, esc again closes it.
+        let mut app = two_member_app(&[]);
+        handle_key_event(press('/'), &mut app, &config);
+        assert!(app.filter_active);
+        for c in "wxb".chars() {
+            handle_key_event(press(c), &mut app, &config);
+        }
+        handle_key_event(key(KeyCode::Left, KeyModifiers::NONE), &mut app, &config);
+        handle_key_event(
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut app,
+            &config,
+        );
+        assert_eq!(app.filter.value(), "wb");
+        // Fuzzy, on members too: w-b in feat's member web.
+        let names: Vec<&str> = app
+            .visible_tasks()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["feat"]);
+        // Esc empties it, the task found still selected.
+        app.filter = TextInput::from("lb");
+        assert_eq!(app.selected_task().unwrap().name, "other");
+        handle_key_event(key(KeyCode::Esc, KeyModifiers::NONE), &mut app, &config);
+        assert!(app.filter_active && app.filter.is_empty());
+        assert_eq!(app.selected_task().unwrap().name, "other");
+        assert_eq!(app.visible_tasks().len(), 2);
+        handle_key_event(key(KeyCode::Esc, KeyModifiers::NONE), &mut app, &config);
+        assert!(!app.filter_active);
+
+        // `?` shows the keys; any key closes them, and does nothing else.
+        handle_key_event(press('?'), &mut app, &config);
+        assert!(matches!(app.mode, Mode::Help));
+        assert!(matches!(
+            handle_key_event(press('q'), &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    /// Draw `app` (so that it knows where things are), `width`x`height`.
+    fn draw(app: &mut App, width: u16, height: u16) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui::render(f, app)).unwrap();
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn the_mouse_selects_and_scrolls() {
+        let click = MouseEventKind::Down(MouseButton::Left);
+        // Rows: header (0), column names (1), then
+        // `api + web` (2), feat (3), ├ app (4), └ web (5), lib (6), other (7).
+        let mut app = two_member_app(&[]);
+        draw(&mut app, 80, 24);
+        assert_eq!(app.selected_task().unwrap().name, "feat");
+        handle_mouse(mouse(click, 10, 7), &mut app);
+        assert_eq!(app.selected_task().unwrap().name, "other");
+        // A group's header: nothing.
+        handle_mouse(mouse(click, 10, 6), &mut app);
+        assert_eq!(app.selected_task().unwrap().name, "other");
+        // A member's row selects its task, and with the pane open, it.
+        handle_mouse(mouse(click, 10, 5), &mut app);
+        assert_eq!(app.selected_task().unwrap().name, "feat");
+        app.peek = Some(Peek::default());
+        app.sync_focus();
+        draw(&mut app, 80, 24);
+        handle_mouse(mouse(click, 10, 5), &mut app);
+        assert_eq!(app.focused_member().unwrap().1.id(), "m-2");
+        handle_mouse(mouse(click, 10, 4), &mut app);
+        assert_eq!(app.focused_member().unwrap().1.id(), "m-1");
+
+        // The wheel: over the list it moves the selection, over the pane it
+        // scrolls the screen.
+        assert!(matches!(
+            handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 4), &mut app),
+            Action::SelectNext
+        ));
+        let pane = app.hits.pane.unwrap();
+        assert!(matches!(
+            handle_mouse(mouse(MouseEventKind::ScrollUp, 10, pane.y + 2), &mut app),
+            Action::ScrollPeek(Scroll::Up(3))
+        ));
+        // Outside both (the footer): nothing.
+        assert!(matches!(
+            handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 23), &mut app),
+            Action::None
+        ));
+
+        // A click closes the help.
+        app.mode = Mode::Help;
+        handle_mouse(mouse(click, 0, 0), &mut app);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn the_picker_opens_at_once_and_takes_the_projects_when_found() {
+        let item = |name: &str| PickerItem {
+            display: name.into(),
+            id: format!("/src/{name}"),
+        };
+        let mut app = App::new();
+        start_new_task_flow(&mut app);
+        let Mode::NewTaskPickProject(picker) = &mut app.mode else {
+            panic!("the picker opens without waiting");
+        };
+        assert!(picker.loading);
+        assert_eq!(picker.items.len(), 2, "the current directory and a path");
+        // Highlight the path entry and pick nothing yet; the projects come.
+        picker.select_next();
+        app.set_projects(vec![item("api"), item("web")]);
+        let Mode::NewTaskPickProject(picker) = &mut app.mode else {
+            panic!("still picking");
+        };
+        assert!(!picker.loading);
+        let ids: Vec<&str> = picker.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["__cwd__", "__enter_path__", "/src/api", "/src/web"]);
+        assert_eq!(picker.selected_item().unwrap().id, "__enter_path__", "kept");
+
+        // A click picks an item on screen, the wheel moves.
+        draw(&mut app, 80, 24);
+        let (area, first) = app.hits.picker.unwrap();
+        assert_eq!(first, 0);
+        handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 1,
+                area.y + 3,
+            ),
+            &mut app,
+        );
+        handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), &mut app);
+        let Mode::NewTaskPickProject(picker) = &app.mode else {
+            panic!("still picking");
+        };
+        assert_eq!(picker.selected_item().unwrap().id, "/src/api");
+
+        // The next time, those found are there from the start; found after
+        // the picker closed, they are kept for it.
+        app.mode = Mode::Normal;
+        app.set_projects(vec![item("docs")]);
+        start_new_task_flow(&mut app);
+        let Mode::NewTaskPickProject(picker) = &app.mode else {
+            panic!("picking");
+        };
+        assert_eq!(picker.items.last().unwrap().id, "/src/docs");
     }
 }

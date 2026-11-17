@@ -338,6 +338,7 @@ Narrow terminals drop AGENT, then CTX, then BRANCH before cutting task names.
 | `p` | Toggle peek panel | Always |
 | `/` | Enter filter mode | Always |
 | `g` | Group by repository, or attention first | Always |
+| `?` | Show every key | Always |
 | `q` | Quit TUI | Always |
 | Config keys | Custom commands | Always |
 
@@ -363,13 +364,15 @@ Peek is read-only. To interact with the agent, press `enter` to attach.
 
 ### Filter mode
 
-Pressing `/` enters filter mode. The header shows the filter text. Typing filters the task list by name, provider, or directory (case-insensitive substring match). `esc` clears the filter and returns to normal mode. Navigating and pressing `enter` on a result selects it and exits filter mode.
+Pressing `/` enters filter mode. A line above the list shows the filter text, edited at a cursor (arrows, `home`/`end`, `ctrl-←`/`ctrl-→` by word, `ctrl-w`, `ctrl-u`/`ctrl-k`), as in every prompt. Typing filters the task list fuzzily (the letters in order, not necessarily together; a capital makes it case-sensitive) by task name, member name, repository or branch, the matched letters highlighted, the list keeping its order. `esc` empties the filter, the task found still selected, then a second `esc` returns to normal mode. `enter` keeps the filter and returns to normal mode.
+
+`?` shows every key, custom commands included. The mouse selects a task with a click (with the pane open, a member's row shows that member), the wheel moves the selection over the list and scrolls the agent's screen over the pane; the dashboard reports clicks and the wheel only, and lets go of the mouse while attached.
 
 ### New task flow
 
 Pressing `n` in the TUI starts a multi-step flow:
 
-**Step 1 — Select project**: a picker showing discovered projects (via `tam-worktree` discovery). "Current directory" is always an option. The user navigates and selects; `tab` picks several projects (one worktree, one member each), numbered in the order picked. In step 2, the name of an existing task adds the picked projects to it, and the popup says so.
+**Step 1 — Select project**: a picker showing discovered projects (via `tam-worktree` discovery, on a thread: the picker opens at once with those found last time, and the list fills in), filtered fuzzily, the best matches first. "Current directory" is always an option. The user navigates and selects; `tab` picks several projects (one worktree, one member each), numbered in the order picked. In step 2, the name of an existing task adds the picked projects to it, and the popup says so.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐

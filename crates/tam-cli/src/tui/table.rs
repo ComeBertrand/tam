@@ -13,6 +13,7 @@ use crate::task::{Member, Task};
 
 use super::app::{self, App, Order, Row};
 use super::branch::Observation;
+use super::fuzzy;
 use super::triage::{age, one_line};
 use super::ui::{agent_detail_line, context_display, first_line, status_display};
 
@@ -171,6 +172,20 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             offset = (end - height).min(row);
         }
     }
+    // For the mouse: the task (its index among the visible ones) and the
+    // member each row is about.
+    let mut task_index = 0;
+    let row_tasks: Vec<Option<(usize, Option<String>)>> = rows
+        .iter()
+        .map(|row| match row {
+            Row::Group(_) => None,
+            Row::Task(_) => {
+                task_index += 1;
+                Some((task_index - 1, None))
+            }
+            Row::Member { member, .. } => Some((task_index - 1, Some(member.id().to_string()))),
+        })
+        .collect();
     drop(rows);
 
     let table = Table::new(table_rows, constraints)
@@ -182,6 +197,30 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .with_selected(selected_row);
     frame.render_stateful_widget(table, area, &mut state);
     app.table_offset = state.offset();
+    app.hits.list = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    app.hits.rows = row_tasks
+        .into_iter()
+        .skip(app.table_offset)
+        .take(height)
+        .collect();
+}
+
+/// A task's or member's name, the characters the filter matched
+/// highlighted.
+fn name_line(name: &str, query: &str, style: Style) -> Line<'static> {
+    match fuzzy::fuzzy(query, name).filter(|m| !m.positions.is_empty()) {
+        Some(m) => fuzzy::highlight(
+            name,
+            &m.positions,
+            style,
+            style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        None => Line::styled(name.to_string(), style),
+    }
 }
 
 /// Column widths for `width` columns: drops the columns that do not fit
@@ -246,7 +285,7 @@ fn fit(cols: &mut Vec<Col>, cells: &mut [Vec<Line<'static>>], width: u16) -> Vec
 fn task_cell(col: Col, task: &Task, app: &App, now: u64) -> Line<'static> {
     if let [member] = &task.members[..] {
         return match col {
-            Col::Task => Line::raw(task.name.clone()),
+            Col::Task => name_line(&task.name, app.filter.value(), Style::new()),
             Col::Repo => Line::raw(member.info.repo.clone()),
             _ => member_cell(col, task, member, false, false, app, now),
         };
@@ -256,7 +295,11 @@ fn task_cell(col: Col, task: &Task, app: &App, now: u64) -> Line<'static> {
         Col::Age => app::most_urgent(task)
             .map(|m| age_cell(task, m, now))
             .unwrap_or_default(),
-        Col::Task => Line::styled(task.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+        Col::Task => name_line(
+            &task.name,
+            app.filter.value(),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
         Col::Repo => Line::raw(app::repo_group(task)),
         _ => Line::default(),
     }
@@ -285,11 +328,15 @@ fn member_cell(
             } else {
                 (" ", Style::new())
             };
-            Line::from(vec![
-                Span::styled(format!(" {tree}"), dim),
-                Span::styled(mark, style),
-                Span::styled(member.info.name.clone(), style),
-            ])
+            let mut line = name_line(&member.info.name, app.filter.value(), style);
+            line.spans.splice(
+                0..0,
+                [
+                    Span::styled(format!(" {tree}"), dim),
+                    Span::styled(mark, style),
+                ],
+            );
+            line
         }
         Col::Repo => Line::default(),
         Col::Branch => branch_cell(member, app.branches.get(member.id())),

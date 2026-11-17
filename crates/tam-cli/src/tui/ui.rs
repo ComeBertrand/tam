@@ -10,8 +10,9 @@ use tam_proto::{AgentDetail, AgentState};
 use crate::task::TaskStatus;
 
 use super::app::{App, MemberChoice, Mode, Order, PaneTab, PickerState};
+use super::input::TextInput;
 use super::peek::{Peek, ScreenView};
-use super::{table, triage};
+use super::{fuzzy, table, triage};
 
 /// The task list's narrowest and widest beside the pane.
 const LIST_MIN: u16 = 50;
@@ -40,6 +41,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_filter(frame, filter_area, app);
     }
     render_tasks(frame, table_area, app);
+    app.hits.pane = pane;
     if let Some(pane) = pane {
         // Out of the app while drawn: the pane reads the rest of it.
         if let Some(mut peek) = app.peek.take() {
@@ -50,13 +52,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_footer(frame, footer_area, app);
 
     // Overlay popups
+    app.hits.picker = match &mut app.mode {
+        Mode::NewTaskPickProject(picker) => Some(render_picker_popup(frame, picker)),
+        _ => None,
+    };
     match &app.mode {
-        Mode::Normal => {}
-        Mode::NewTaskPickProject(picker) => {
-            render_picker_popup(frame, picker);
-        }
+        Mode::Normal | Mode::NewTaskPickProject(_) => {}
+        Mode::Help => render_help_popup(frame, app),
         Mode::NewTaskEnterName { name, project_dirs } => {
-            let joins = app.tasks.iter().any(|t| t.name == *name);
+            let joins = app.tasks.iter().any(|t| t.name == name.value());
             render_new_task_popup(frame, name, project_dirs, joins);
         }
         Mode::SpawnEnterPath(path) => {
@@ -118,15 +122,20 @@ fn split(area: Rect, app: &App, filter: bool) -> (Rect, Option<Rect>) {
 }
 
 fn render_filter(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(" /", Style::new().fg(Color::Cyan))];
-    spans.push(Span::raw(&app.filter));
-    if app.filter_active {
-        spans.push(Span::styled("█", Style::new().fg(Color::DarkGray)));
-    }
-    frame.render_widget(Line::from(spans), area);
+    let [prompt, text] =
+        Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
+    frame.render_widget(Span::styled(" / ", Style::new().fg(Color::Cyan)), prompt);
+    app.filter.render(
+        frame,
+        text,
+        Style::new(),
+        app.filter_active && matches!(app.mode, Mode::Normal),
+    );
 }
 
 fn render_tasks(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.hits.list = Rect::default();
+    app.hits.rows.clear();
     if !app.visible_tasks().is_empty() {
         table::render(frame, area, app);
         return;
@@ -233,7 +242,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled("any", Style::new().bold()),
                 Span::raw(":cancel"),
             ],
-            Mode::Notice { .. } => vec![
+            Mode::Notice { .. } | Mode::Help => vec![
                 Span::styled(" any", Style::new().bold()),
                 Span::raw(":close"),
             ],
@@ -335,6 +344,7 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
     for cmd in &app.commands {
         hints.push((cmd.key.as_str(), cmd.name.clone(), 5));
     }
+    hints.push(("?", "help".into(), 0));
     hints.push(("q", "quit".into(), 0));
     hints
 }
@@ -511,17 +521,24 @@ fn render_screen(frame: &mut Frame, area: Rect, peek: &mut Peek) {
     frame.render_widget(Paragraph::new(message).fg(Color::DarkGray), area);
 }
 
-fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
+/// The project picker; returns where its items are and the first one
+/// shown (for the mouse).
+fn render_picker_popup(frame: &mut Frame, picker: &mut PickerState) -> (Rect, usize) {
     let area = frame
         .area()
         .centered(Constraint::Percentage(60), Constraint::Percentage(60));
     frame.render_widget(Clear, area);
 
+    let title = if picker.loading {
+        format!(" {} · looking for projects… ", picker.title)
+    } else {
+        format!(" {} ", picker.title)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Cyan))
-        .title(format!(" {} ", picker.title))
+        .title(title)
         .title_style(Style::new().bold().fg(Color::Cyan))
         .padding(Padding::horizontal(1));
 
@@ -530,19 +547,27 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
 
     let [filter_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let [prompt, text] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(filter_area);
+    frame.render_widget(Span::styled("> ", Style::new().fg(Color::Cyan)), prompt);
+    picker.filter.render(frame, text, Style::new(), true);
 
-    let filter_line = Line::from(vec![
-        Span::styled("> ", Style::new().fg(Color::Cyan)),
-        Span::raw(&picker.filter),
-        Span::styled("█", Style::new().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(filter_line, filter_area);
-
-    let filtered = picker.filtered_items();
+    // The highlighted item in view, the list moving only as far as needed.
+    let filtered = picker.filtered();
+    let height = list_area.height as usize;
+    let mut offset = picker.offset.min(filtered.len().saturating_sub(height));
+    if picker.selected < offset {
+        offset = picker.selected;
+    } else if height > 0 && picker.selected >= offset + height {
+        offset = picker.selected + 1 - height;
+    }
+    let matched = Style::new().fg(Color::Cyan).bold();
     let items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
-        .map(|(i, item)| {
+        .skip(offset)
+        .take(height)
+        .map(|(i, (item, positions))| {
             let style = if i == picker.selected {
                 Style::new().add_modifier(Modifier::REVERSED)
             } else {
@@ -554,11 +579,14 @@ fn render_picker_popup(frame: &mut Frame, picker: &PickerState) {
                 None if picker.marked.is_empty() => Span::raw(""),
                 None => Span::raw("  "),
             };
-            ListItem::new(Line::from(vec![mark, Span::raw(item.display.as_str())])).style(style)
+            let mut line = fuzzy::highlight(&item.display, positions, Style::new(), matched);
+            line.spans.insert(0, mark);
+            ListItem::new(line).style(style)
         })
         .collect();
-
     frame.render_widget(List::new(items), list_area);
+    picker.offset = offset;
+    (list_area, offset)
 }
 
 /// The repositories of `dirs`, as the popup names them.
@@ -576,7 +604,12 @@ fn repo_names(dirs: &[std::path::PathBuf]) -> String {
 
 /// The task name input, with where its worktrees go: a new task, or more
 /// members of the existing task of that name (`joins`).
-fn render_new_task_popup(frame: &mut Frame, name: &str, dirs: &[std::path::PathBuf], joins: bool) {
+fn render_new_task_popup(
+    frame: &mut Frame,
+    name: &TextInput,
+    dirs: &[std::path::PathBuf],
+    joins: bool,
+) {
     // 2 content rows + 2 border + 2 vertical padding = 6
     let area = frame
         .area()
@@ -594,11 +627,14 @@ fn render_new_task_popup(frame: &mut Frame, name: &str, dirs: &[std::path::PathB
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let name_line = Line::from(vec![
-        Span::raw("Task name: "),
-        Span::styled(name, Style::new().bold()),
-        Span::styled("█", Style::new().fg(Color::DarkGray)),
-    ]);
+    let [name_row, where_row] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let label = "Task name: ";
+    let [label_area, text] =
+        Layout::horizontal([Constraint::Length(label.len() as u16), Constraint::Fill(1)])
+            .areas(name_row);
+    frame.render_widget(Span::raw(label), label_area);
+    name.render(frame, text, Style::new().bold(), true);
     let repos = repo_names(dirs);
     let where_line = if joins {
         Line::from(vec![
@@ -609,10 +645,10 @@ fn render_new_task_popup(frame: &mut Frame, name: &str, dirs: &[std::path::PathB
     } else {
         Line::from(vec![Span::raw("in "), Span::raw(repos)]).fg(Color::DarkGray)
     };
-    frame.render_widget(Paragraph::new(vec![name_line, where_line]), inner);
+    frame.render_widget(where_line, where_row);
 }
 
-fn render_enter_path_popup(frame: &mut Frame, path: &str) {
+fn render_enter_path_popup(frame: &mut Frame, path: &TextInput) {
     // 1 content row + 2 border + 2 vertical padding = 5
     let area = frame
         .area()
@@ -630,12 +666,145 @@ fn render_enter_path_popup(frame: &mut Frame, path: &str) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let input_line = Line::from(vec![
-        Span::styled("> ", Style::new().fg(Color::Cyan)),
-        Span::raw(path),
-        Span::styled("█", Style::new().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(input_line, inner);
+    let [prompt, text] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
+    frame.render_widget(Span::styled("> ", Style::new().fg(Color::Cyan)), prompt);
+    path.render(frame, text, Style::new(), true);
+}
+
+/// Every key, by what it acts on, custom commands included: in two
+/// columns when the terminal is wide enough, cut at its bottom.
+fn render_help_popup(frame: &mut Frame, app: &App) {
+    let entry = |key: &str, what: &str| (key.to_string(), what.to_string());
+    let mut sections: Vec<(&str, Vec<(String, String)>)> = vec![
+        (
+            "Task",
+            vec![
+                entry("j/k ↑/↓", "select"),
+                entry("enter", "attach (ctrl-] back)"),
+                entry("r", "run, resuming"),
+                entry("R", "run, new session"),
+                entry("s", "stop the agent"),
+                entry("d", "drop (or recreate)"),
+                entry("n", "new task"),
+            ],
+        ),
+        (
+            "List",
+            vec![
+                entry("/", "filter (fuzzy)"),
+                entry("g", "by repo / attention"),
+                entry("click", "select a row"),
+                entry("wheel", "move the selection"),
+            ],
+        ),
+        (
+            "Pane",
+            vec![
+                entry("p", "show / hide"),
+                entry("tab", "triage / terminal"),
+                entry("←/→", "another member"),
+                entry("pgup/pgdn", "scroll (wheel too)"),
+                entry("home/end", "oldest line / live"),
+            ],
+        ),
+        (
+            "Typing",
+            vec![
+                entry("ctrl-←/→", "move by word"),
+                entry("ctrl-w", "delete a word"),
+                entry("ctrl-u/k", "delete to start/end"),
+            ],
+        ),
+    ];
+    if !app.commands.is_empty() {
+        sections.push((
+            "Custom commands",
+            app.commands
+                .iter()
+                .map(|c| (c.key.clone(), c.name.clone()))
+                .collect(),
+        ));
+    }
+    sections.push(("Other", vec![entry("?", "this help"), entry("q", "quit")]));
+
+    let keys = sections
+        .iter()
+        .flat_map(|(_, keys)| keys)
+        .map(|(key, _)| Span::raw(key.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    let lines = |sections: &[(&str, Vec<(String, String)>)]| -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for (title, entries) in sections {
+            if !lines.is_empty() {
+                lines.push(Line::raw(""));
+            }
+            lines.push(Line::styled(
+                title.to_string(),
+                Style::new().fg(Color::Cyan).bold(),
+            ));
+            for (key, what) in entries {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{key:<keys$}  "), Style::new().bold()),
+                    Span::raw(what.clone()),
+                ]));
+            }
+        }
+        lines
+    };
+    let one = lines(&sections);
+    let width_of = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    // Two columns when one would not fit the height and two fit the width:
+    // the first sections on the left, about half the rows.
+    let screen = frame.area();
+    let rows = |n: usize| n as u16 + 4;
+    let split = (1..sections.len())
+        .min_by_key(|&i| {
+            let (l, r) = (lines(&sections[..i]).len(), lines(&sections[i..]).len());
+            l.max(r)
+        })
+        .unwrap_or(sections.len());
+    let (left, right) = (lines(&sections[..split]), lines(&sections[split..]));
+    let two_wide = width_of(&left) + 4 + width_of(&right) + 6;
+    let columns = if rows(one.len()) > screen.height && two_wide <= screen.width {
+        vec![left, right]
+    } else {
+        vec![one]
+    };
+    let height = columns.iter().map(|c| rows(c.len())).max().unwrap_or(4);
+    let width = match &columns[..] {
+        [one] => width_of(one) + 6,
+        _ => two_wide,
+    };
+    let area = screen.centered(
+        Constraint::Length(width.min(screen.width)),
+        Constraint::Length(height.min(screen.height)),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(" Keys ")
+        .title_style(Style::new().bold().fg(Color::Cyan))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    match &columns[..] {
+        [one] => frame.render_widget(Paragraph::new(one.clone()), inner),
+        [left, right] => {
+            let [l, _, r] = Layout::horizontal([
+                Constraint::Length(width_of(left)),
+                Constraint::Length(4),
+                Constraint::Fill(1),
+            ])
+            .areas(inner);
+            frame.render_widget(Paragraph::new(left.clone()), l);
+            frame.render_widget(Paragraph::new(right.clone()), r);
+        }
+        _ => {}
+    }
 }
 
 /// Asks to drop a task, or (with `member`, the focused member of a task
@@ -1028,9 +1197,13 @@ mod tests {
     fn preview_pane_shows_the_agent_screen() {
         let mut app = App::new();
         app.peek = Some(Peek::default());
-        let s = screen(&mut app, 60, 20);
+        let s = screen(&mut app, 80, 20);
         assert!(s.contains("(no agent running)"), "{s}");
         assert!(s.contains("pgup/pgdn:scroll"), "{s}");
+        // Narrower: the footer keeps what matters most, help among them.
+        let s = screen(&mut app, 60, 20);
+        assert!(!s.contains("pgup/pgdn:scroll"), "{s}");
+        assert!(s.contains("?:help  q:quit"), "{s}");
 
         // Lines 0-9 in history, the live screen (5 rows) shows 10-12.
         let size = |n| std::num::NonZeroU16::new(n).unwrap();
@@ -1069,6 +1242,7 @@ mod tests {
     use crate::task::Task;
     use crate::tui::app::{PaneTab, TaskDetail};
     use crate::tui::branch::{BranchState, Observation};
+    use crate::tui::input::TextInput;
     use tam_proto::{AgentInfo, MemberHealth, MemberInfo, MessageInfo, RunInfo, TaskInfo};
 
     fn member_info(id: &str, name: &str) -> MemberInfo {
@@ -1830,5 +2004,225 @@ mod tests {
         app.selected = 0;
         let s = screen(&mut app, 80, 10);
         assert!(s.lines().nth(2).unwrap().starts_with("api"), "{s}");
+    }
+
+    // -- Help, filter, prompts -------------------------------------------
+
+    #[test]
+    fn help_lists_every_key_and_the_custom_commands() {
+        let mut app = dashboard();
+        app.commands = vec![crate::config::CustomCommand {
+            name: "open in editor".into(),
+            key: "o".into(),
+            command: "code {dir}".into(),
+        }];
+        app.mode = Mode::Help;
+        let s = screen(&mut app, 80, 24);
+        show("help 80x24", &s);
+        for text in [
+            "Keys",
+            "attach (ctrl-] back)",
+            "by repo / attention",
+            "triage / terminal",
+            "Custom commands",
+            "open in editor",
+            "this help",
+        ] {
+            assert!(s.contains(text), "{text}: {s}");
+        }
+        assert!(s.contains("any:close"), "{s}");
+        let s = screen(&mut app, 120, 40);
+        show("help 120x40", &s);
+        assert!(s.contains("open in editor"), "{s}");
+        // Narrow and short: one column, cut, but not garbled.
+        let s = screen(&mut app, 50, 20);
+        show("help 50x20", &s);
+        assert!(s.contains("attach (ctrl-] back)"), "{s}");
+    }
+
+    /// The screen, and where the terminal's cursor is (when shown).
+    fn screen_and_cursor(app: &mut App, width: u16, height: u16) -> (String, Option<(u16, u16)>) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let backend = terminal.backend();
+        let at = backend.cursor_position();
+        let cursor = backend.cursor_visible().then_some((at.x, at.y));
+        let buf = backend.buffer();
+        let s = (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (s, cursor)
+    }
+
+    #[test]
+    fn the_filter_matches_fuzzily_and_highlights_what_matched() {
+        let mut app = dashboard();
+        app.filter_active = true;
+        app.filter = TextInput::from("unpr");
+        let (s, cursor) = screen_and_cursor(&mut app, 80, 24);
+        show("filter unpr", &s);
+        assert!(s.contains(" / unpr"), "{s}");
+        assert!(s.contains("unit-pricing"), "{s}");
+        assert!(!s.contains("perf"), "{s}");
+        // The terminal's cursor after the text.
+        assert_eq!(cursor, Some((7, 1)));
+        // A member's repository matches too: the tasks in rustpallet.
+        app.filter = TextInput::from("rustp");
+        let s = screen(&mut app, 80, 24);
+        assert!(s.contains("offload-explain"), "{s}");
+        assert!(!s.contains("unit-pricing"), "{s}");
+        // Matched characters are highlighted (not the others).
+        app.filter = TextInput::from("nv");
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row = (0..24)
+            .find(|&y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("2d nav ")
+            })
+            .unwrap();
+        let text: String = (0..80).map(|x| buf[(x, row)].symbol()).collect();
+        let x = text[..text.find("2d nav ").unwrap()].chars().count() as u16 + 3;
+        assert_eq!(buf[(x, row)].fg, Color::Cyan);
+        assert_eq!(buf[(x + 1, row)].fg, Color::Reset);
+        assert_eq!(buf[(x + 2, row)].fg, Color::Cyan);
+        // Typing elsewhere: no cursor in the list.
+        app.filter_active = false;
+        let (_, cursor) = screen_and_cursor(&mut app, 80, 24);
+        assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn prompts_show_the_cursor_where_editing_happens() {
+        let mut app = App::new();
+        let mut name = TextInput::from("feat-x");
+        name.handle(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.mode = Mode::NewTaskEnterName {
+            project_dirs: vec!["/src/api".into()],
+            name,
+        };
+        let (s, cursor) = screen_and_cursor(&mut app, 80, 24);
+        let row = s
+            .lines()
+            .position(|l| l.contains("Task name: feat-x"))
+            .unwrap() as u16;
+        let col = s.lines().nth(row as usize).unwrap().find("feat-x").unwrap() as u16;
+        // Before the `x` (the line has box-drawing characters: count chars).
+        let line = s.lines().nth(row as usize).unwrap();
+        let col_chars = line[..col as usize].chars().count() as u16;
+        assert_eq!(cursor, Some((col_chars + 5, row)));
+
+        // The picker's filter, its matches first, the matched letters marked.
+        use super::super::app::PickerItem;
+        let item = |name: &str| PickerItem {
+            display: name.into(),
+            id: format!("/src/{name}"),
+        };
+        let mut picker = PickerState::new(
+            "Pick project",
+            vec![
+                item("rustpallet"),
+                item("backend"),
+                item("tam"),
+                item("tam-web"),
+            ],
+        );
+        picker.filter = TextInput::from("tw");
+        picker.loading = true;
+        app.mode = Mode::NewTaskPickProject(picker);
+        let (s, cursor) = screen_and_cursor(&mut app, 80, 24);
+        show("picker tw", &s);
+        assert!(s.contains("looking for projects…"), "{s}");
+        assert!(s.contains("│ tam-web"), "{s}");
+        assert!(!s.contains("backend"), "{s}");
+        assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn a_long_picker_scrolls_to_the_highlighted_project() {
+        use super::super::app::PickerItem;
+        let items = (0..40)
+            .map(|i| PickerItem {
+                display: format!("project-{i:02}"),
+                id: format!("/src/p{i}"),
+            })
+            .collect();
+        let mut picker = PickerState::new("Pick project", items);
+        picker.selected = 30;
+        let mut app = App::new();
+        app.mode = Mode::NewTaskPickProject(picker);
+        let s = screen(&mut app, 80, 24);
+        assert!(s.contains("project-30"), "{s}");
+        assert!(!s.contains("project-00"), "{s}");
+        let (area, first) = app.hits.picker.unwrap();
+        assert!(first > 0 && first <= 30 && 30 < first + area.height as usize);
+    }
+
+    #[test]
+    fn every_mode_draws_at_any_size() {
+        use super::super::app::PickerItem;
+        let modes = || {
+            let item = |name: &str| PickerItem {
+                display: name.into(),
+                id: format!("/src/{name}"),
+            };
+            vec![
+                Mode::Normal,
+                Mode::Help,
+                Mode::NewTaskPickProject(PickerState::new(
+                    "Pick project",
+                    vec![item("api"), item("web")],
+                )),
+                Mode::NewTaskEnterName {
+                    project_dirs: vec!["/src/api".into()],
+                    name: TextInput::from("a-rather-long-task-name-for-a-narrow-popup"),
+                },
+                Mode::SpawnEnterPath(TextInput::from("~/src")),
+                Mode::ConfirmDropTask {
+                    name: "unit-pricing".into(),
+                    member: Some(MemberChoice {
+                        id: "m-5".into(),
+                        label: "unit-pricing/frontend".into(),
+                    }),
+                },
+                Mode::Notice {
+                    title: "Drop Failed".into(),
+                    lines: vec!["a reason".into()],
+                },
+            ]
+        };
+        for (width, height) in [(1, 1), (10, 3), (24, 6), (40, 10), (80, 24), (250, 70)] {
+            for pane in [false, true] {
+                for mode in modes() {
+                    let mut app = dashboard();
+                    select(&mut app, "unit-pricing");
+                    if pane {
+                        app = with_pane(app);
+                    }
+                    app.filter_active = true;
+                    let normal = matches!(mode, Mode::Normal);
+                    app.mode = mode;
+                    let s = screen(&mut app, width, height);
+                    if normal && pane && width >= 80 {
+                        show(&format!("filter + pane {width}x{height}"), &s);
+                    }
+                }
+            }
+        }
+        // The new-task name, longer than its popup: the end, where one types.
+        let mut app = App::new();
+        app.mode = modes().swap_remove(3);
+        let s = screen(&mut app, 80, 24);
+        show("long name", &s);
+        assert!(s.contains("narrow-popup"), "{s}");
     }
 }

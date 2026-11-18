@@ -82,6 +82,91 @@ pub struct AgentDetail {
     /// Last tool call refused by the agent's auto mode in the current turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<DeniedTool>,
+    /// The request `pending` is about, in full, while a client can answer
+    /// it (`Request::Answer`): the agent's hook waits for the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<Ask>,
+}
+
+/// A request an agent waits on that a client can answer (`Request::Answer`)
+/// instead of the user answering it in the agent's terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ask {
+    /// Names this request in `Request::Answer`: every request gets its own,
+    /// so an answer never reaches another one.
+    pub id: String,
+    /// The tool asking (e.g. `Bash`, `ExitPlanMode`, `AskUserQuestion`).
+    pub tool: String,
+    pub kind: AskKind,
+}
+
+/// What a request asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AskKind {
+    /// Permission to run the tool once, with this input (as text).
+    Permission {
+        input: String,
+        /// `input` was cut: the agent's terminal shows all of it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cut: bool,
+    },
+    /// Approval of a plan (Claude's `ExitPlanMode`).
+    Plan {
+        plan: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cut: bool,
+    },
+    /// Questions to answer (Claude's `AskUserQuestion`).
+    Questions { questions: Vec<AskQuestion> },
+}
+
+/// A question of `AskKind::Questions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskQuestion {
+    pub question: String,
+    /// Short label (e.g. `Auth method`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub options: Vec<AskOption>,
+    /// Several options can be chosen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_select: bool,
+}
+
+/// An option of an `AskQuestion`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The answer to an `Ask`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AskAnswer {
+    /// Allow the tool call, once; approve the plan.
+    Allow,
+    /// Refuse it. With a reason, the agent goes on with it; without one,
+    /// it is asked to stop and wait for the user.
+    Deny {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Answer the questions, in order: for each, the labels of the options
+    /// chosen (one unless `multi_select`) and the user's own answer, if
+    /// typed (`other`).
+    Answers { answers: Vec<QuestionAnswer> },
+}
+
+/// The answer to one `AskQuestion`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnswer {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<String>,
 }
 
 impl AgentDetail {
@@ -614,6 +699,25 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// Wait for the answer to a permission request (sent by the agent's
+    /// `PermissionRequest` hook, `tam hook-notify`, after its `HookEvent`):
+    /// the request becomes the agent's `AgentDetail::ask`. Holds the
+    /// connection: replies `HookOutput` once a client answers it, `Ok` when
+    /// it is over otherwise (answered in the agent's terminal, a newer
+    /// request, the agent's exit).
+    WaitAnswer {
+        agent_id: String,
+        /// The hook's JSON input.
+        payload: serde_json::Value,
+    },
+    /// Answer the request `ask` (`Ask::id`) of agent `agent`. Replies `Ok`
+    /// once the agent's hook has the answer, else `Error` (the request was
+    /// answered or changed meanwhile: nothing was sent).
+    Answer {
+        agent: String,
+        ask: String,
+        answer: AskAnswer,
+    },
 }
 
 /// What the agent of a task member is doing: its state, or `Exit` when no
@@ -850,6 +954,11 @@ pub enum Response {
         /// tool call (Claude agents, through their hooks).
         #[serde(default)]
         notified: Vec<String>,
+    },
+    /// What the hook waiting for an answer (`WaitAnswer`) prints for its
+    /// agent: the decision, as the agent reads it.
+    HookOutput {
+        output: String,
     },
 }
 

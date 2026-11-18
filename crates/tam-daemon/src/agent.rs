@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use tam_proto::{AgentInfo, AgentResponse, AgentState, ScreenInfo};
+use tam_proto::{AgentInfo, AgentResponse, AgentState, Ask, ScreenInfo};
 use tokio::sync::{broadcast, watch};
 use tracing::error;
 
@@ -446,6 +446,30 @@ impl Agent {
     /// reported it; `None` while a turn runs or before the first one ends.
     pub fn response(&self) -> Option<&AgentResponse> {
         self.hook_data.response.as_ref()
+    }
+
+    /// Whether the agent's hooks report something it waits on (a
+    /// permission, a question).
+    pub fn is_pending(&self) -> bool {
+        self.hook_data.detail.pending.is_some()
+    }
+
+    /// Show `ask` to clients as the request they can answer (`None`: no
+    /// longer). Returns whether it changed.
+    pub fn set_ask(&mut self, ask: Option<Ask>) -> bool {
+        let changed = self.hook_data.detail.ask != ask;
+        self.hook_data.detail.ask = ask;
+        changed
+    }
+
+    /// A client answered the request the agent waited on: it goes on
+    /// working (its next hook tells how). The answer counts as output, so
+    /// the silence fallback leaves it the usual time to show some.
+    pub fn answered(&mut self) {
+        self.hook_data.detail.pending = None;
+        self.hook_data.detail.ask = None;
+        self.set_state(AgentState::Working);
+        *lock(&self.last_output_at) = Instant::now();
     }
 }
 

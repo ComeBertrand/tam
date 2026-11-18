@@ -51,20 +51,25 @@ pub async fn notify(agent: Option<String>, socket: Option<PathBuf>, legacy_event
     if let Ok(Some(mut client)) = Client::try_connect_at(&socket).await {
         let reply = client
             .send(tam_proto::Request::HookEvent {
-                agent_id,
+                agent_id: agent_id.clone(),
                 event: event.clone(),
-                payload: Some(payload),
+                payload: Some(payload.clone()),
             })
             .await;
         // Nothing else goes to stdout: Claude reads it (as context for some
         // events, as a decision for others). Not println!: it panics when
         // stdout is closed.
-        if let Ok(tam_proto::Response::HookContext { context }) = reply {
-            let _ = writeln!(
-                std::io::stdout().lock(),
-                "{}",
-                hook_output(&event, &context)
-            );
+        if let Ok(tam_proto::Response::HookContext { context }) = &reply {
+            let _ = writeln!(std::io::stdout().lock(), "{}", hook_output(&event, context));
+        }
+        // A permission request waits for the dashboard's answer, while
+        // Claude shows its own dialog (the first answer wins). Anything but
+        // an answer prints nothing: the dialog stays, nothing approved.
+        if event == "PermissionRequest" && matches!(reply, Ok(tam_proto::Response::Ok)) {
+            let wait = tam_proto::Request::WaitAnswer { agent_id, payload };
+            if let Ok(tam_proto::Response::HookOutput { output }) = client.send(wait).await {
+                let _ = writeln!(std::io::stdout().lock(), "{output}");
+            }
         }
     }
 }

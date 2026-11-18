@@ -17,6 +17,7 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
+use crate::answer::{self, Delivery};
 use crate::inbox::{self, Handover, Inbox, ReplyOutcome};
 use crate::ledger::Ledger;
 use crate::notify::{self, Notification, NotifyConfig};
@@ -51,6 +52,8 @@ struct DaemonState {
     /// What changed in a member's task since its agent last heard (merge,
     /// split), by member id: told at its next prompt or tool call.
     peer_changes: HashMap<String, Vec<String>>,
+    /// Permission requests agents' hooks wait on, for clients to answer.
+    asks: answer::Asks,
 }
 
 /// Default idle timeout before daemon auto-shuts down (seconds).
@@ -130,6 +133,7 @@ impl Daemon {
             idle_deadline: None,
             inbox: Inbox::default(),
             peer_changes: HashMap::new(),
+            asks: answer::Asks::default(),
         }));
 
         // Create socket directory
@@ -384,6 +388,7 @@ impl DaemonState {
             exit_code,
         });
         self.inbox.agent_gone(id, agent.member());
+        self.asks.release(id);
         if let Some(member) = agent.member() {
             self.peer_changes.remove(member);
         }
@@ -611,6 +616,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 } else if let Request::WaitInbox { agent_id } = request {
                     // Takes over the connection until messages are handed over.
                     return handle_wait_inbox(buf_reader, writer, &state, &agent_id).await;
+                } else if let Request::WaitAnswer { agent_id, payload } = request {
+                    // Takes over the connection until the request is over.
+                    return handle_wait_answer(buf_reader, writer, &state, &agent_id, &payload).await;
                 } else {
                     let response = dispatch(request, &state).await;
                     write_response(&mut writer, &response).await?;
@@ -767,6 +775,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             payload,
         } => {
             handle_inbox_hook(state, &agent_id, &event, payload.as_ref()).await;
+            handle_answer_hook(state, &agent_id, &event, payload.as_ref()).await;
             handle_hook_event(state, &agent_id, &event, payload.as_ref()).await
         }
         Request::Shutdown => handle_shutdown(state).await,
@@ -915,6 +924,10 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::SplitMember { member, name } => {
             handle_split_member(state, &member, name.as_deref()).await
         }
+        Request::WaitAnswer { .. } => Response::Error {
+            message: "wait_answer should be handled by connection handler".into(),
+        },
+        Request::Answer { agent, ask, answer } => handle_answer(state, &agent, &ask, answer).await,
     }
 }
 
@@ -2990,5 +3003,136 @@ impl DaemonState {
             });
         }
         Ok((task, member, name))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Answers: a client answers the permission request an agent's hook waits on
+// (`answer.rs`).
+// ---------------------------------------------------------------------------
+
+/// How long an answer waits for the hook's connection to take it.
+const ANSWER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl DaemonState {
+    /// Show clients `ask` as the request of agent `id` they can answer
+    /// (`None`: none).
+    fn show_ask(&mut self, id: &str, ask: Option<tam_proto::Ask>) {
+        let changed = self
+            .agents
+            .get_mut(id)
+            .is_some_and(|agent| agent.set_ask(ask));
+        if changed {
+            if let Some(info) = self.agent_info(id) {
+                self.broadcast(Event::AgentUpdated {
+                    id: id.to_string(),
+                    info,
+                });
+            }
+        }
+    }
+}
+
+/// A hook event that tells the request an agent waits on is over (its tool
+/// ran, a turn ended or started, another request came) releases its hook.
+async fn handle_answer_hook(
+    state: &Arc<Mutex<DaemonState>>,
+    agent_id: &str,
+    event: &str,
+    payload: Option<&serde_json::Value>,
+) {
+    let mut state = state.lock().await;
+    if state.asks.ended_by(agent_id, event, payload) {
+        state.asks.release(agent_id);
+        state.show_ask(agent_id, None);
+    }
+}
+
+/// An agent's `PermissionRequest` hook waits for the answer: show the
+/// request to clients and hold the connection until one answers it
+/// (`HookOutput`), or it is over otherwise (`Ok`: the hook prints nothing),
+/// or the hook goes away.
+async fn handle_wait_answer(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    state: &Arc<Mutex<DaemonState>>,
+    agent_id: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    let registered = {
+        let mut state = state.lock().await;
+        // Only a request its provider took as one: it waits on it.
+        if state.agents.get(agent_id).is_some_and(Agent::is_pending) {
+            state
+                .asks
+                .register(agent_id, payload)
+                .map(|(ask, token, rx)| {
+                    state.show_ask(agent_id, Some(ask));
+                    (token, rx)
+                })
+        } else {
+            None
+        }
+    };
+    let Some((token, mut rx)) = registered else {
+        return write_response(&mut writer, &Response::Ok).await;
+    };
+
+    let mut buf = [0u8; 256];
+    tokio::select! {
+        delivery = &mut rx => match delivery {
+            Ok(Delivery { output, written }) => {
+                let response = Response::HookOutput { output };
+                let _ = written.send(write_response(&mut writer, &response).await.is_ok());
+            }
+            // Over otherwise: Claude keeps to its own dialog.
+            Err(_) => {
+                let _ = write_response(&mut writer, &Response::Ok).await;
+            }
+        },
+        _ = reader.read(&mut buf) => {
+            // The hook went away: answered "no" in the terminal, or timed out.
+            let mut state = state.lock().await;
+            if state.asks.unregister(agent_id, token) {
+                state.show_ask(agent_id, None);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A client answers the request `ask` of agent `agent_id`: hand it to the
+/// hook waiting on that request, and reply once the hook has it.
+async fn handle_answer(
+    state: &Arc<Mutex<DaemonState>>,
+    agent_id: &str,
+    ask: &str,
+    answer: tam_proto::AskAnswer,
+) -> Response {
+    let written = {
+        let mut state = state.lock().await;
+        match state.asks.answer(agent_id, ask, &answer) {
+            Ok(written) => {
+                if let Some(agent) = state.agents.get_mut(agent_id) {
+                    agent.answered();
+                }
+                if let Some(info) = state.agent_info(agent_id) {
+                    state.broadcast(Event::AgentUpdated {
+                        id: agent_id.to_string(),
+                        info,
+                    });
+                }
+                written
+            }
+            Err(message) => return Response::Error { message },
+        }
+    };
+    info!(id = %agent_id, ask = %ask, answer = ?answer, "answered");
+    match tokio::time::timeout(ANSWER_WRITE_TIMEOUT, written).await {
+        Ok(Ok(true)) => Response::Ok,
+        _ => Response::Error {
+            message: "the agent's hook went away before it got the answer: answer in its terminal"
+                .into(),
+        },
     }
 }

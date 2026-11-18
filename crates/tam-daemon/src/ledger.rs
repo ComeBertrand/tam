@@ -1441,7 +1441,7 @@ fn new_message_id(taken: impl Fn(&str) -> bool) -> String {
     }
 }
 
-fn random_u32() -> u32 {
+pub(crate) fn random_u32() -> u32 {
     let mut buf = [0u8; 4];
     if File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))

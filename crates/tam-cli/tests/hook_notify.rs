@@ -6,7 +6,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tam_daemon::daemon::Daemon;
@@ -32,11 +32,21 @@ async fn send(stream: &mut UnixStream, request: &Request) -> Response {
 
 /// Run the real `tam hook-notify` as an injected hook would.
 fn hook_notify(sock: &Path, agent: &str, payload: &serde_json::Value) {
+    let out = start_hook_notify(sock, agent, payload)
+        .wait_with_output()
+        .unwrap();
+    assert!(out.status.success());
+}
+
+/// Start the real `tam hook-notify` as an injected hook would, its output
+/// kept: a permission request's waits for an answer.
+fn start_hook_notify(sock: &Path, agent: &str, payload: &serde_json::Value) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tam"))
         .arg("hook-notify")
         .env("TAM_AGENT_ID", agent)
         .env("TAM_SOCKET", sock)
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     child
@@ -45,7 +55,30 @@ fn hook_notify(sock: &Path, agent: &str, payload: &serde_json::Value) {
         .unwrap()
         .write_all(payload.to_string().as_bytes())
         .unwrap();
-    assert!(child.wait().unwrap().success());
+    child
+}
+
+/// What a waiting `tam hook-notify` printed once it exited (it must, soon).
+async fn printed(child: Child) -> String {
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
+    let out = tokio::time::timeout(Duration::from_secs(10), out)
+        .await
+        .expect("hook-notify still waiting")
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The agent's info once the request it waits on can be answered.
+async fn asking(stream: &mut UnixStream, id: &str) -> AgentInfo {
+    for _ in 0..100 {
+        let info = agent(stream, id).await;
+        if info.detail.ask.is_some() {
+            return info;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no request to answer");
 }
 
 /// Session of the latest run of task `feat`.
@@ -180,17 +213,16 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
     // not be resumed.
     assert_eq!(run_session(&mut stream).await, None);
 
-    hook_notify(
-        &sock,
-        &member,
-        &serde_json::json!({
-            "hook_event_name": "PermissionRequest",
-            "session_id": "sess-1",
-            "tool_name": "Bash",
-            "tool_input": {"command": "cargo test"},
-        }),
-    );
-    let info = agent(&mut stream, &member).await;
+    // A permission request: hook-notify waits for an answer from the
+    // dashboard while Claude shows its own dialog.
+    let permission = serde_json::json!({
+        "hook_event_name": "PermissionRequest",
+        "session_id": "sess-1",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cargo test"},
+    });
+    let waiting = start_hook_notify(&sock, &member, &permission);
+    let info = asking(&mut stream, &member).await;
     assert_eq!(info.state, AgentState::Blocked);
     assert_eq!(info.detail.session_id.as_deref(), Some("sess-1"));
     assert_eq!(info.detail.pending.as_ref().unwrap().summary, "cargo test");
@@ -220,18 +252,40 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
         Some("Bash")
     );
 
+    // Allowed in the terminal: the tool runs, and the waiting hook exits
+    // printing nothing (Claude has its answer).
     hook_notify(
         &sock,
         &member,
         &serde_json::json!({
             "hook_event_name": "PostToolUse",
             "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
             "tool_response": {"stdout": "x".repeat(100_000)},
         }),
     );
     let info = agent(&mut stream, &member).await;
     assert_eq!(info.state, AgentState::Working);
     assert!(info.detail.pending.is_none());
+    assert!(info.detail.ask.is_none());
+    assert_eq!(printed(waiting).await, "");
+
+    // Answered from the dashboard: the hook prints the decision, nothing
+    // else, on one line.
+    let waiting = start_hook_notify(&sock, &member, &permission);
+    let ask = asking(&mut stream, &member).await.detail.ask.unwrap();
+    let answer = Request::Answer {
+        agent: member.clone(),
+        ask: ask.id,
+        answer: tam_proto::AskAnswer::Allow,
+    };
+    assert!(matches!(send(&mut stream, &answer).await, Response::Ok));
+    let decision = serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "PermissionRequest",
+        "decision": {"behavior": "allow"},
+    }});
+    assert_eq!(printed(waiting).await, format!("{decision}\n"));
+    assert_eq!(agent(&mut stream, &member).await.state, AgentState::Working);
 
     hook_notify(
         &sock,

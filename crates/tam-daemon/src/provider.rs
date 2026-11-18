@@ -223,14 +223,23 @@ pub fn claude_hook_settings(command: &str) -> String {
         if let Some(m) = matcher {
             entry.insert("matcher".into(), m.into());
         }
+        let timeout = match event {
+            "PermissionRequest" => CLAUDE_PERMISSION_TIMEOUT,
+            _ => 5,
+        };
         entry.insert(
             "hooks".into(),
-            serde_json::json!([{ "type": "command", "command": command, "timeout": 5 }]),
+            serde_json::json!([{ "type": "command", "command": command, "timeout": timeout }]),
         );
         hooks.insert(event.into(), Value::Array(vec![Value::Object(entry)]));
     }
     serde_json::json!({ "hooks": hooks }).to_string()
 }
+
+/// How long the `PermissionRequest` hook waits for an answer from a client
+/// (seconds; see `crate::answer`). Claude's own dialog shows meanwhile and
+/// stays when the hook is killed then, nothing approved.
+const CLAUDE_PERMISSION_TIMEOUT: u64 = 24 * 3600;
 
 /// Events whose firing arms an inbox hook: one waits for messages after the
 /// session starts (or is resumed, cleared, compacted) and after each turn.
@@ -1367,6 +1376,10 @@ mod tests {
         }
         assert_eq!(hooks["PreToolUse"][0]["matcher"], "AskUserQuestion");
         assert!(hooks["Stop"][0].get("matcher").is_none());
+        // The permission hook waits for an answer from the dashboard; the
+        // others report and are done.
+        assert_eq!(hooks["PermissionRequest"][0]["hooks"][0]["timeout"], 86400);
+        assert_eq!(hooks["Stop"][0]["hooks"][0]["timeout"], 5);
     }
 
     #[test]

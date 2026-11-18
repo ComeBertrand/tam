@@ -150,6 +150,41 @@ adopt). `tam-cli` depends on all three.
   agent's turn, never shown again: two agents waiting on each other each
   get a reply). Loop guard: hop count (at most 6, reset when the user prompts the
   agent) and 20 messages per 10 minutes per agent.
+- **Answering requests from a client (#33)** — `tam-daemon/src/answer.rs`.
+  Claude's `PermissionRequest` hook is `tam hook-notify` like the others,
+  with a 24h timeout (`CLAUDE_PERMISSION_TIMEOUT`): after its `HookEvent` it
+  sends `WaitAnswer` on the same connection (handled like `WaitInbox`:
+  `handle_wait_answer`) and waits. Claude shows its own dialog meanwhile and
+  takes the first answer. Only a request the provider took as pending is
+  held. The daemon keeps it (`answer::Asks`: one per agent, a random
+  `ask-xxxxxxxx` id) and shows it as `AgentDetail::ask`: the tool's whole
+  input as text, the plan, or the questions with their options (16k chars
+  at most, `cut`). `Answer { agent, ask, answer }` is taken only for that id
+  while its hook is connected; the decision is built from the hook's own
+  payload (`answer::decision`), written to that connection only (an answer
+  never reaches another request), and the reply waits for the write. Allow
+  is once: no rule is added, `permission_suggestions` never echoed. Plan
+  approval passes the plan back (`updatedInput`, required) with `setMode
+  default` (Claude would restore the mode from before plan mode, maybe
+  accepting edits). Questions: `updatedInput.answers`, question text to the
+  chosen labels then the typed answer joined by `, `, as Claude's own dialog
+  gives them. Deny tells the agent it came from the dashboard, with the
+  reason (it goes on) or without (it is asked to stop and wait); never
+  `interrupt`: Claude applies it even to a request the user already said
+  yes to in the terminal (the hook runs until the tool ends), stopping the
+  turn. A late deny without it is ignored. A request `cut` cannot be
+  allowed (what was not shown). An answered agent is `working`
+  (`Agent::answered`). A request ends without an answer
+  (the hook is told `Ok` and prints nothing: the dialog stays, nothing
+  approved) when its connection closes (no in the terminal: Claude kills the
+  hook; the timeout), its tool runs (`PostToolUse`/`PostToolUseFailure` of
+  the same tool whose input agrees on the fields both have: Claude adds a
+  question's answers and annotations, drops a plan's text; yes in the
+  terminal leaves the hook running), a newer `PermissionRequest` or a turn
+  ending or starting comes
+  (`Asks::ended_by`, `handle_answer_hook`), or the agent exits (its hooks
+  outlive it). MCP elicitation and codex/generic agents have nothing to
+  answer from a client: attach, or `tam msg`.
 - **Peers and discovery** — an agent knows its task from its environment:
   `$TAM_AGENT_ID` (its member id, the only stable handle) and `$TAM_SOCKET`;
   never a task name or peer list, which change (a member joins; a merge,
@@ -385,8 +420,11 @@ cargo test
 - Unit tests are inline in each module (~340 across all crates)
 - Integration tests in `crates/tam-daemon/tests/` (~60 async tests, real
   sockets/PTYs/git repos; `merge.rs`: merge/split replies, events and what
-  fake Claude agents are told at their next prompt or tool call) and `crates/tam-cli/tests/` (`tam hook-notify`
-  against a daemon, session resume with a fake `claude`; one test per file:
+  fake Claude agents are told at their next prompt or tool call; `answer.rs`:
+  a fake Claude's waiting permission hook answered, refused when stale,
+  released when the request ends otherwise) and `crates/tam-cli/tests/` (`tam hook-notify`
+  against a daemon, a permission request's hook printing the decision or
+  nothing, session resume with a fake `claude`; one test per file:
   they set process environment; `tam msg`/`inbox-wait`/`history` against a
   daemon, child processes with temp XDG dirs and no
   `TAM_AGENT_ID`/`TAM_SOCKET`; `tam peers` and the start note on real git

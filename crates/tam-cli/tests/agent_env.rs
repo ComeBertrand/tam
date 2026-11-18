@@ -2,7 +2,8 @@
 //! the daemon's: `tam new` from one shell, `tam run` from another, each
 //! agent gets its caller's variables and `PATH` (the fake `claude` is only
 //! on the caller's), without what was the caller's own: a calling agent's
-//! `TAM_AGENT_ID`, a calling Claude session's variables, its pane.
+//! `TAM_AGENT_ID`, a calling Claude session's variables, its pane. Then the
+//! configured wrapper (`[spawn] wrapper`), read at each start.
 //!
 //! Kept to a single test: it sets process environment (HOME,
 //! XDG_CONFIG_HOME, a variable only the daemon has) for the daemon it runs
@@ -108,6 +109,7 @@ fn fake_claude(bin: &Path, report: &Path) {
   echo "claude_config=$CLAUDE_CONFIG_DIR"
   echo "tmux=$TMUX"
   echo "pwd=$PWD"
+  echo "wrapped=$WRAPPED"
 }} > '{r}.tmp'
 mv '{r}.tmp' '{r}'
 exec sleep 3600
@@ -213,6 +215,33 @@ async fn agents_run_in_the_environment_of_the_command_that_starts_them() {
     let found = report(&report_file).await;
     assert_eq!(found["caller"], "run");
     assert_eq!(found["id"], member);
+    assert_eq!(found["wrapped"], "");
+
+    // A wrapper set meanwhile (no restart of anything): the agent runs
+    // through it, in its worktree, with its caller's environment.
+    let wrap = bin.join("wrap");
+    std::fs::write(
+        &wrap,
+        "#!/bin/sh\nexport WRAPPED=\"$CALLER\"\nexec \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrap, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!(
+            "[spawn]\nwrapper = [\"wrap\"]\n\n[worktree]\nroot = \"{}\"\n",
+            worktrees.display()
+        ),
+    )
+    .unwrap();
+    ok(&output(tam(root, &repo, &["stop", "feat"])).await);
+    let mut run = tam(root, &repo, &["run", "feat", "--detach"]);
+    run.env("CALLER", "wrapped run");
+    ok(&output(run).await);
+    let found = report(&report_file).await;
+    assert_eq!(found["wrapped"], "wrapped run");
+    assert_eq!(found["id"], member);
+    assert_eq!(found["pwd"], dir);
 
     ok(&output(tam(root, &repo, &["stop", "feat"])).await);
     assert!(matches!(

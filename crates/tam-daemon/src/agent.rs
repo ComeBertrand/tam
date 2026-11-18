@@ -70,6 +70,10 @@ pub struct Agent {
 pub struct Launch {
     /// The agent's whole environment, the client's. Empty: the daemon's.
     pub env: AgentEnv,
+    /// Command the agent's command is given to as trailing arguments, in
+    /// the worktree (`direnv exec .`: the worktree's dev environment). It
+    /// should `exec` the agent, which then keeps its pid. Empty: none.
+    pub wrapper: Vec<String>,
 }
 
 /// `TERM` of an agent whose caller has none (a script, cron): the agent's
@@ -77,6 +81,29 @@ pub struct Launch {
 const FALLBACK_TERM: &str = "xterm-256color";
 
 impl Launch {
+    /// `cmd` given to the wrapper, if any, which runs where `cmd` would,
+    /// with what the provider set on it.
+    fn wrap(&self, cmd: Command) -> Command {
+        let Some((program, args)) = self.wrapper.split_first() else {
+            return cmd;
+        };
+        let mut wrapped = Command::new(program);
+        wrapped
+            .args(args)
+            .arg(cmd.get_program())
+            .args(cmd.get_args());
+        if let Some(dir) = cmd.get_current_dir() {
+            wrapped.current_dir(dir);
+        }
+        for (key, val) in cmd.get_envs() {
+            match val {
+                Some(val) => wrapped.env(key, val),
+                None => wrapped.env_remove(key),
+            };
+        }
+        wrapped
+    }
+
     /// Run `cmd` (in `dir`) with the client's environment instead of the
     /// daemon's, keeping what the provider set on it. The program is looked
     /// up on the client's `PATH`.
@@ -119,7 +146,7 @@ impl Agent {
         // Verify directory exists
         anyhow::ensure!(dir.is_dir(), "directory does not exist: {}", dir.display());
 
-        let mut cmd = provider.build_command(dir, args, resume_session, prompt);
+        let mut cmd = launch.wrap(provider.build_command(dir, args, resume_session, prompt));
         launch.apply(&mut cmd, dir);
         for (key, val) in env_vars {
             cmd.env(key, val);
@@ -160,8 +187,16 @@ impl Agent {
                     Ok(())
                 })
                 .spawn()
-                .with_context(|| {
-                    format!("failed to spawn '{}' in {}", provider.name(), dir.display())
+                .with_context(|| match launch.wrapper.first() {
+                    Some(wrapper) => format!(
+                        "failed to spawn '{}' through '{}' in {}",
+                        provider.name(),
+                        wrapper,
+                        dir.display()
+                    ),
+                    None => {
+                        format!("failed to spawn '{}' in {}", provider.name(), dir.display())
+                    }
                 })?
         };
 
@@ -629,5 +664,32 @@ mod tests {
             silence_fallback(AgentState::Working, Duration::from_secs(600), None),
             AgentState::Working
         );
+    }
+
+    #[test]
+    fn the_wrapper_runs_the_agents_command_where_it_would_run() {
+        let mut cmd = Command::new("claude");
+        cmd.current_dir("/w/app--feat")
+            .args(["--resume", "s-1", "fix the bug"])
+            .env("FROM_PROVIDER", "1");
+        let launch = Launch {
+            env: AgentEnv::default(),
+            wrapper: vec!["direnv".into(), "exec".into(), ".".into()],
+        };
+        let wrapped = launch.wrap(cmd);
+        assert_eq!(wrapped.get_program(), "direnv");
+        let args: Vec<_> = wrapped.get_args().collect();
+        assert_eq!(
+            args,
+            ["exec", ".", "claude", "--resume", "s-1", "fix the bug"]
+        );
+        assert_eq!(wrapped.get_current_dir(), Some(Path::new("/w/app--feat")));
+        let envs: Vec<_> = wrapped.get_envs().collect();
+        assert_eq!(envs, [(OsStr::new("FROM_PROVIDER"), Some(OsStr::new("1")))]);
+
+        // Without one, the command as it is.
+        let cmd = Launch::default().wrap(Command::new("claude"));
+        assert_eq!(cmd.get_program(), "claude");
+        assert_eq!(cmd.get_args().count(), 0);
     }
 }

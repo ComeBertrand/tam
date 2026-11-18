@@ -916,6 +916,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             args,
             prompt,
             env,
+            wrapper,
         } => {
             handle_run_agent(
                 state,
@@ -926,7 +927,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                     session,
                     args,
                     prompt,
-                    launch: crate::agent::Launch { env },
+                    launch: crate::agent::Launch { env, wrapper },
                 },
             )
             .await

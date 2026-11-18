@@ -9,6 +9,10 @@
 //! reach them, which of their worktrees it can read, the task's brief and
 //! its scratch directory. What changes by the second (what the peers'
 //! agents are doing) and changes in between are for `tam peers`.
+//!
+//! Except merges and splits, which change an agent's task or most of its
+//! peers at once: the agents of the members involved are told at their next
+//! prompt or tool call (`change_note`), with the note as it is then.
 
 use std::path::PathBuf;
 
@@ -116,6 +120,65 @@ fn note(task: &TaskInfo, member: &MemberInfo, peers: &[(String, &MemberInfo)]) -
          agents are doing."
     ));
     out
+}
+
+/// What the agent of member `id` is told after merges or splits changed
+/// its task or peers: what changed (`changes`, oldest first), then its note
+/// as the ledger is now (`readable`: as `session_note` takes it). `None`
+/// for an unknown member.
+pub fn change_note(
+    ledger: &Ledger,
+    id: &str,
+    readable: &[PathBuf],
+    changes: &[String],
+) -> Option<String> {
+    let note = session_note(ledger, id, readable)?;
+    let mut out = changes.join("\n");
+    out.push('\n');
+    out.push_str(&note);
+    Some(out)
+}
+
+/// What a member of task `into` is told when tasks `from` are merged into
+/// it.
+pub fn merged_in(into: &str, from: &[String]) -> String {
+    match from {
+        [one] => {
+            format!("[tam] Task {one} was merged into this task ({into}): its members joined it.")
+        }
+        several => format!(
+            "[tam] Tasks {} were merged into this task ({into}): their members joined it.",
+            several.join(", ")
+        ),
+    }
+}
+
+/// What a member of task `from` is told when `from` is merged into task
+/// `into`: it was `before`, it is `now`.
+pub fn merged_away(from: &str, into: &str, before: &str, now: &str) -> String {
+    format!(
+        "[tam] Task {from} was merged into task {into}: this member, {before} until now, is \
+         {now}. Names through task {from} no longer resolve; member ids still do."
+    )
+}
+
+/// What a member (`before`) is told when it is split out of task `from`
+/// into a new task `task`.
+pub fn split_away(before: &str, from: &str, task: &str) -> String {
+    format!(
+        "[tam] This member, {before} until now, was split out of task {from} into a task of \
+         its own: {task}. The members of {from} are no longer its peers (tam msg {from}/<member> \
+         or a member id still reaches them)."
+    )
+}
+
+/// What the members left in a task are told when member `before` (`id`) is
+/// split out of it into a new task `task`.
+pub fn split_off(before: &str, id: &str, task: &str) -> String {
+    format!(
+        "[tam] Member {before} ({id}) was split out of this task into task {task}: it is no \
+         longer a peer."
+    )
 }
 
 #[cfg(test)]
@@ -228,5 +291,35 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("tam msg r1 "), "{note}");
+    }
+
+    #[test]
+    fn merges_and_splits_say_what_changed() {
+        assert_eq!(
+            merged_in("feat", &["ui".into()]),
+            "[tam] Task ui was merged into this task (feat): its members joined it."
+        );
+        assert_eq!(
+            merged_in("feat", &["ui".into(), "docs".into()]),
+            "[tam] Tasks ui, docs were merged into this task (feat): their members joined it."
+        );
+        let away = merged_away("ui", "feat", "ui", "feat/web");
+        assert!(
+            away.starts_with(
+                "[tam] Task ui was merged into task feat: this member, ui until now, is feat/web."
+            ),
+            "{away}"
+        );
+        assert!(away.contains("member ids still do"), "{away}");
+        let split = split_away("feat/web", "feat", "web");
+        assert!(
+            split.contains("split out of task feat into a task of its own: web."),
+            "{split}"
+        );
+        assert_eq!(
+            split_off("feat/web", "m-2", "web"),
+            "[tam] Member feat/web (m-2) was split out of this task into task web: it is no \
+             longer a peer."
+        );
     }
 }

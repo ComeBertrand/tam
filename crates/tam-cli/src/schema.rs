@@ -1,5 +1,6 @@
 //! The JSON documents tam prints for agents and scripts: `--json` of `ps`,
-//! `new`, `run`, `wait` and `result`, version [`SCHEMA_VERSION`]. Built from
+//! `new`, `run`, `wait`, `result`, `merge` and `split`, version
+//! [`SCHEMA_VERSION`]. Built from
 //! the daemon's types but kept apart from them, so that the wire protocol
 //! can change without changing them. Documented in the README (Scripting):
 //! a change here is a change there.
@@ -354,4 +355,43 @@ impl Outcome {
             response_at: o.response.as_ref().map(|r| r.at),
         }
     }
+}
+
+/// `tam merge --json` and `tam split --json`: the task the members moved
+/// into, the tasks they came from, and the members of the tasks involved.
+#[derive(Serialize)]
+pub struct Moved {
+    pub schema_version: u32,
+    /// The merged task, or the new one.
+    pub task: String,
+    /// The tasks merged into it (gone now), or the task split from.
+    pub from: Vec<String>,
+    /// The merged task's members; the member split out, then those left in
+    /// the task it came from.
+    pub members: Vec<MovedMember>,
+    /// `null`: a merge or split is all or nothing (a failure is the error
+    /// document).
+    pub error: Option<ErrorInfo>,
+}
+
+#[derive(Serialize)]
+pub struct MovedMember {
+    pub id: String,
+    /// Its task now.
+    pub task: String,
+    pub name: String,
+    pub label: String,
+    /// Its label before: names that went with it no longer resolve.
+    pub previous_label: Option<String>,
+    /// Whether it moved to `task` (else it was there already, or stayed in
+    /// the task split from).
+    pub moved: bool,
+    pub repo: String,
+    pub branch: String,
+    pub dir: PathBuf,
+    /// The agent (provider) running for the member: it keeps running.
+    pub agent: Option<String>,
+    /// Whether its agent is told of the change at its next prompt or tool
+    /// call (Claude agents).
+    pub notified: bool,
 }

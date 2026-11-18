@@ -30,6 +30,7 @@ mod config;
 mod drop_report;
 mod health;
 mod hook;
+mod moves;
 mod msg;
 mod peers;
 mod repos;
@@ -499,6 +500,11 @@ async fn run(cli: Cli) -> Result<()> {
             json,
             from,
         } => brief::brief(name, set, local, json, from).await?,
+
+        Commands::Merge { into, from, json } => moves::merge(&into, &from, json).await?,
+        Commands::Split { member, name, json } => {
+            moves::split(&member, name.as_deref(), json).await?
+        }
     }
 
     Ok(())

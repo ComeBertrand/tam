@@ -375,6 +375,41 @@ pub enum Commands {
         #[arg(long, env = "TAM_AGENT_ID", hide = true)]
         from: Option<String>,
     },
+
+    /// Merge tasks: the members of each FROM task join task INTO, and the
+    /// FROM tasks are gone. Worktrees, branches and running agents stay as
+    /// they are; Claude agents learn of their new task and peers at their
+    /// next prompt or tool call. Exit status: 0 merged, 1 refused, 3 no
+    /// such task, 5 daemon unreachable.
+    Merge {
+        /// The task that stays, with its name
+        into: String,
+
+        /// The tasks merged into it
+        #[arg(required = true)]
+        from: Vec<String>,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Split a member out of its task into a task of its own (the inverse
+    /// of merge). Its worktree, branch and running agent stay as they are.
+    /// Exit status: 0 split, 1 refused (e.g. a task's only member), 3 no
+    /// such member, 5 daemon unreachable.
+    Split {
+        /// TASK/MEMBER or member id
+        member: String,
+
+        /// Name of the new task (default: the member's branch, unless a task
+        /// has that name)
+        name: Option<String>,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// A state `tam wait` waits for: an agent state, or `exit` (no agent runs).

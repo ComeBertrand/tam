@@ -599,6 +599,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brief: Option<String>,
     },
+    /// Move the members of tasks `from` into task `into`, where they join
+    /// last, in order, and forget the `from` tasks (`tam merge`). No
+    /// worktree, branch or agent is touched. Replies `Moved`.
+    MergeTasks {
+        into: String,
+        from: Vec<String>,
+    },
+    /// Move one member (`<task>/<member>` or a member id) out of its task
+    /// into a new task `name`, by default named after the member's branch
+    /// (`tam split`). Its task keeps its other members. Replies `Moved`.
+    SplitMember {
+        member: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 /// What the agent of a task member is doing: its state, or `Exit` when no
@@ -804,6 +819,8 @@ pub enum Response {
     /// Text for the agent's model, which the hook that sent the `HookEvent`
     /// adds to its context (Claude: `additionalContext`). Replied to the
     /// `SessionStart` of a member's agent: its task and the other members.
+    /// After a merge or split changed them, also to the agent's next
+    /// `UserPromptSubmit` or `PostToolUse`.
     HookContext {
         context: String,
     },
@@ -818,6 +835,21 @@ pub enum Response {
     Brief {
         task: String,
         brief: TaskBrief,
+    },
+    /// Members moved to another task (`MergeTasks`, `SplitMember`).
+    Moved {
+        /// The tasks involved, as they are now: the merged task; the new
+        /// task, then the one it was split from.
+        tasks: Vec<TaskInfo>,
+        /// Ids of the members that moved.
+        moved: Vec<String>,
+        /// The label (`TaskInfo::member_label`) each member of `tasks` had
+        /// before, by member id.
+        previous: BTreeMap<String, String>,
+        /// Members whose running agents are told at their next prompt or
+        /// tool call (Claude agents, through their hooks).
+        #[serde(default)]
+        notified: Vec<String>,
     },
 }
 
@@ -2089,5 +2121,41 @@ mod tests {
         };
         assert_eq!(linked.file(), None);
         assert_eq!(linked.location(), "https://tickets/CS-12");
+    }
+
+    #[test]
+    fn merge_and_split_wire_format() {
+        let json = serde_json::to_string(&Request::MergeTasks {
+            into: "feat".into(),
+            from: vec!["ui".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"merge_tasks","into":"feat","from":["ui"]}"#
+        );
+        let json = serde_json::to_string(&Request::SplitMember {
+            member: "feat/web".into(),
+            name: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"split_member","member":"feat/web"}"#);
+        let reply: Response = serde_json::from_str(
+            r#"{"type":"moved","tasks":[],"moved":["m-1"],"previous":{"m-1":"ui"}}"#,
+        )
+        .unwrap();
+        match reply {
+            Response::Moved {
+                moved,
+                previous,
+                notified,
+                ..
+            } => {
+                assert_eq!(moved, ["m-1"]);
+                assert_eq!(previous["m-1"], "ui");
+                assert!(notified.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

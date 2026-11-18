@@ -114,7 +114,9 @@ pub fn json_output(command: &Commands) -> bool {
         | Commands::Peers { json, .. }
         | Commands::Wait { json, .. }
         | Commands::Result { json, .. }
-        | Commands::Brief { json, .. } => *json,
+        | Commands::Brief { json, .. }
+        | Commands::Merge { json, .. }
+        | Commands::Split { json, .. } => *json,
         _ => false,
     }
 }

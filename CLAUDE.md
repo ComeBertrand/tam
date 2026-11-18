@@ -184,7 +184,18 @@ adopt). `tam-cli` depends on all three.
   ending or starting comes
   (`Asks::ended_by`, `handle_answer_hook`), or the agent exits (its hooks
   outlive it). MCP elicitation and codex/generic agents have nothing to
-  answer from a client: attach, or `tam msg`.
+  answer from a client: attach, or `tam msg`. No CLI command answers (an
+  approval path agents could call is #29's). The dashboard: `a`
+  (`tui/answer.rs`, `Mode::Answer`) opens on the focused member's
+  `detail.ask` as it is then and keeps it: the dialog answers that id only;
+  `App::answer_stale` (the member's ask is another or none) makes any key
+  close it, nothing sent; a `cut` request offers no `y`; keys before its first draw (`shown`, set in
+  render: `a` and `y` in one input batch) do nothing; `enter` never
+  allows. Permission/plan: `y`, `n` then an optional reason (`TextInput`).
+  Questions: one at a time, a row to type one's own answer, a review step
+  with several. A refused answer opens a notice. `m` (`Mode::Message`)
+  sends `SendMessage` from the user to the focused member's id: the same
+  path as `tam msg`, for every provider. `a` and `m` are reserved keys.
 - **Peers and discovery** — an agent knows its task from its environment:
   `$TAM_AGENT_ID` (its member id, the only stable handle) and `$TAM_SOCKET`;
   never a task name or peer list, which change (a member joins; a merge,
@@ -212,7 +223,9 @@ adopt). `tam-cli` depends on all three.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
 - **Triage pane** — the TUI's detail pane (`p`; `tui/triage.rs`,
   `ui::render_pane`) tells, for the focused member of the selected task,
-  what it needs from the user without attaching: its state and since when
+  what it needs from the user without attaching (and `a` answers it when
+  the daemon can: the whole request, `AgentDetail::ask`, shown whatever the
+  state, which a parallel tool call can move on): its state and since when
   (`AgentInfo.state_since`, stamped by the daemon when it reports the change,
   "now" while a hook's change is not reported yet; the TUI stamps a
   `StateChange` itself), the permission it waits on (tool and one-line

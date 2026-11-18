@@ -1,3 +1,4 @@
+mod answer;
 mod app;
 mod branch;
 mod fuzzy;
@@ -28,6 +29,7 @@ use crate::repos;
 use crate::task::{Member, Task};
 use tam_proto::SessionChoice;
 
+use self::answer::{AnswerDialog, Outcome};
 use self::app::{App, MemberChoice, Mode, PaneTab, PickerItem, PickerState, TaskDetail};
 use self::input::TextInput;
 use self::peek::{Peek, Scroll};
@@ -83,6 +85,20 @@ enum Action {
         name: String,
     },
     ScrollPeek(Scroll),
+    /// Answer the request `ask` of agent `agent` (see `answer`).
+    Answer {
+        agent: String,
+        ask: String,
+        answer: tam_proto::AskAnswer,
+        /// The member, and what the answer says: for the status line.
+        label: String,
+        what: String,
+    },
+    /// Send a message to a member's agent, from the user.
+    SendMessage {
+        member: String,
+        text: String,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -374,6 +390,19 @@ async fn run_loop(
                     }
                     screen_moved = true;
                 }
+                Action::Answer {
+                    agent,
+                    ask,
+                    answer,
+                    label,
+                    what,
+                } => {
+                    let request = tam_proto::Request::Answer { agent, ask, answer };
+                    answer_request(client, app, request, &label, &what).await?;
+                }
+                Action::SendMessage { member, text } => {
+                    send_message(client, app, &member, &text).await?;
+                }
                 Action::None => {}
             }
         }
@@ -400,6 +429,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             Action::None
         }
         Mode::NewTaskPickProject(_) => handle_picker_key(key, app, config),
+        Mode::Answer(_) => handle_answer_key(key, app),
+        Mode::Message { .. } => handle_message_key(key, app),
     }
 }
 
@@ -440,6 +471,14 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             _ => Action::None,
         },
         (KeyCode::Char('p'), _) => Action::TogglePeek,
+        (KeyCode::Char('a'), _) => {
+            open_answer(app);
+            Action::None
+        }
+        (KeyCode::Char('m'), _) => {
+            open_message(app);
+            Action::None
+        }
         (KeyCode::Char('?'), _) => {
             app.mode = Mode::Help;
             Action::None
@@ -763,6 +802,104 @@ fn handle_repair_or_drop_key(key: KeyEvent, app: &mut App) -> Action {
 /// pane shows.
 fn selected_member(app: &App) -> Option<(&Task, &Member)> {
     app.focused_member()
+}
+
+/// `a`: the answer dialog, on the request the member's agent waits on as
+/// shown now (the dialog keeps it: the one it answers), or why there is
+/// none to answer from here.
+fn open_answer(app: &mut App) {
+    let Some((task, member)) = selected_member(app) else {
+        return;
+    };
+    let label = task.member_label(member);
+    let why = match &member.agent_info {
+        Some(agent) => match &agent.detail.ask {
+            Some(ask) => {
+                let dialog = AnswerDialog::new(agent.id.clone(), label, ask.clone());
+                app.mode = Mode::Answer(dialog);
+                return;
+            }
+            None if matches!(
+                agent.state,
+                tam_proto::AgentState::Blocked | tam_proto::AgentState::Question
+            ) =>
+            {
+                format!("'{label}' waits on what the dashboard cannot answer: enter attaches")
+            }
+            None => format!("'{label}' waits on no answer"),
+        },
+        None => format!("No agent runs for '{label}'"),
+    };
+    app.set_status(why, Duration::from_secs(4));
+}
+
+/// `m`: a message to the member's agent (or its next one).
+fn open_message(app: &mut App) {
+    let Some((task, member)) = selected_member(app) else {
+        return;
+    };
+    let how = match &member.agent_info {
+        None => "No agent runs: its next one gets the message when it starts.",
+        Some(agent) if agent.provider == "claude" => {
+            "Claude reads it at its next step, at once when idle."
+        }
+        Some(_) => "Typed into its terminal once it is idle.",
+    };
+    app.mode = Mode::Message {
+        member: member.id().to_string(),
+        label: task.member_label(member),
+        how: how.into(),
+        text: TextInput::default(),
+    };
+}
+
+/// The answer dialog: the request's keys (see `answer::AnswerDialog::key`).
+fn handle_answer_key(key: KeyEvent, app: &mut App) -> Action {
+    let stale = app.answer_stale();
+    let Mode::Answer(dialog) = &mut app.mode else {
+        return Action::None;
+    };
+    match dialog.key(key, stale) {
+        Outcome::Stay => Action::None,
+        Outcome::Close => {
+            app.mode = Mode::Normal;
+            Action::None
+        }
+        Outcome::Send(answer) => {
+            let Mode::Answer(dialog) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+                unreachable!("in the answer dialog");
+            };
+            Action::Answer {
+                what: answer::describe(&dialog.ask, &answer),
+                agent: dialog.agent,
+                ask: dialog.ask.id,
+                answer,
+                label: dialog.label,
+            }
+        }
+    }
+}
+
+/// The message prompt: enter sends (not an empty message), esc cancels.
+fn handle_message_key(key: KeyEvent, app: &mut App) -> Action {
+    let Mode::Message { member, text, .. } = &mut app.mode else {
+        return Action::None;
+    };
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Enter if !text.value().trim().is_empty() => {
+            let action = Action::SendMessage {
+                member: std::mem::take(member),
+                text: text.value().to_string(),
+            };
+            app.mode = Mode::Normal;
+            return action;
+        }
+        _ => {
+            text.handle(key);
+        }
+    }
+    Action::None
 }
 
 fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
@@ -1166,6 +1303,53 @@ fn status_bar_seq(name: &str, provider: &str, cols: u16, rows: u16) -> String {
         "\x1b[1;{}r\x1b[{rows};1H\x1b[2K\x1b[7m{line}\x1b[m",
         rows - 1
     )
+}
+
+/// Send an answer: the status line says it went, a notice why it did not
+/// (the request was answered or changed meanwhile: nothing was sent).
+async fn answer_request(
+    client: &mut Client,
+    app: &mut App,
+    request: tam_proto::Request,
+    label: &str,
+    what: &str,
+) -> Result<()> {
+    match client.send(request).await? {
+        tam_proto::Response::Ok => {
+            app.set_status(format!("Sent to '{label}': {what}"), Duration::from_secs(4));
+        }
+        tam_proto::Response::Error { message } => {
+            app.mode = Mode::Notice {
+                title: "Not Sent".into(),
+                lines: vec![format!("Your answer to '{label}': {message}.")],
+            };
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Send a message from the user to a member (its id), as `tam msg` does;
+/// the status line says whether it is delivered yet.
+async fn send_message(client: &mut Client, app: &mut App, member: &str, text: &str) -> Result<()> {
+    let request = tam_proto::Request::SendMessage {
+        to: member.into(),
+        text: text.into(),
+        from: None,
+    };
+    let status = match client.send(request).await? {
+        tam_proto::Response::Sent { message, pending } => match pending {
+            Some(why) => format!(
+                "Sent to '{}' ({}), not delivered yet: {why}",
+                message.to_label, message.id
+            ),
+            None => format!("Delivered to '{}' ({})", message.to_label, message.id),
+        },
+        tam_proto::Response::Error { message } => format!("Message not sent: {message}"),
+        _ => return Ok(()),
+    };
+    app.set_status(status, Duration::from_secs(5));
+    Ok(())
 }
 
 async fn stop_agent(client: &mut Client, app: &mut App, id: &str, label: &str) -> Result<()> {
@@ -1721,6 +1905,147 @@ mod tests {
             handle_normal_key(press('s'), &mut app, &config),
             Action::StopAgent { ref id, ref label } if id == "m-2" && label == "feat/web"
         ));
+    }
+
+    fn set_ask(app: &mut App, id: &str, ask: Option<tam_proto::Ask>) {
+        let mut info = app.find_member(id).unwrap().1.agent_info.clone().unwrap();
+        info.detail.ask = ask;
+        app.update_agent(info);
+    }
+
+    fn bash_ask(id: &str) -> tam_proto::Ask {
+        tam_proto::Ask {
+            id: id.into(),
+            tool: "Bash".into(),
+            kind: tam_proto::AskKind::Permission {
+                input: "command: ls".into(),
+                cut: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_answers_the_request_it_opened_on_and_nothing_else() {
+        use tam_proto::AgentState::{Blocked, Working};
+        let mut app = two_member_app(&[("m-1", Working), ("m-2", Blocked)]);
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        let config = Config::default();
+
+        // Blocked on what the dashboard cannot answer (its hook is gone).
+        handle_key_event(press('a'), &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+        let status = app.status_message().unwrap().to_string();
+        assert!(status.contains("enter attaches"), "{status}");
+
+        // The pane closed: the member the task's status is about.
+        set_ask(&mut app, "m-2", Some(bash_ask("ask-1")));
+        handle_key_event(press('a'), &mut app, &config);
+        let Mode::Answer(dialog) = &app.mode else {
+            panic!("no answer dialog");
+        };
+        assert_eq!(
+            (dialog.agent.as_str(), dialog.ask.id.as_str()),
+            ("m-2", "ask-1")
+        );
+        // Typed with `a`, before the request was drawn: nothing.
+        assert!(matches!(
+            handle_key_event(press('y'), &mut app, &config),
+            Action::None
+        ));
+        draw(&mut app, 100, 30);
+        // Another member comes to need the user more: the dialog keeps to
+        // its own.
+        app.update_state("m-1", Blocked);
+        app.sync_focus();
+        match handle_key_event(press('y'), &mut app, &config) {
+            Action::Answer {
+                agent,
+                ask,
+                answer,
+                label,
+                what,
+            } => {
+                assert_eq!((agent.as_str(), ask.as_str()), ("m-2", "ask-1"));
+                assert_eq!(answer, tam_proto::AskAnswer::Allow);
+                assert_eq!(
+                    (label.as_str(), what.as_str()),
+                    ("feat/web", "Bash allowed once")
+                );
+            }
+            _ => panic!("no answer sent"),
+        }
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // The request changes while the dialog is open: any key closes it,
+        // nothing sent.
+        app.update_state("m-1", Working);
+        app.sync_focus();
+        handle_key_event(press('a'), &mut app, &config);
+        draw(&mut app, 100, 30);
+        set_ask(&mut app, "m-2", Some(bash_ask("ask-2")));
+        assert!(app.answer_stale());
+        assert!(matches!(
+            handle_key_event(press('y'), &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        // Answered in the terminal: the same.
+        handle_key_event(press('a'), &mut app, &config);
+        draw(&mut app, 100, 30);
+        set_ask(&mut app, "m-2", None);
+        assert!(app.answer_stale());
+        assert!(matches!(
+            handle_key_event(press('y'), &mut app, &config),
+            Action::None
+        ));
+
+        // Not waiting: nothing to answer.
+        app.update_state("m-2", Working);
+        handle_key_event(press('a'), &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn m_sends_the_member_a_message() {
+        use tam_proto::AgentState::{Blocked, Working};
+        let mut app = two_member_app(&[("m-1", Working), ("m-2", Blocked)]);
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        let config = Config::default();
+        handle_key_event(press('m'), &mut app, &config);
+        let Mode::Message { label, how, .. } = &app.mode else {
+            panic!("no message prompt");
+        };
+        assert_eq!(label, "feat/web");
+        assert!(how.starts_with("Claude reads it"), "{how}");
+        // Enter sends nothing empty.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::None
+        ));
+        for c in "run clippy too".chars() {
+            handle_key_event(press(c), &mut app, &config);
+        }
+        match handle_key_event(enter, &mut app, &config) {
+            Action::SendMessage { member, text } => {
+                assert_eq!((member.as_str(), text.as_str()), ("m-2", "run clippy too"));
+            }
+            _ => panic!("no message sent"),
+        }
+        assert!(matches!(app.mode, Mode::Normal));
+        // A member without an agent: its next one gets it.
+        app.remove_agent("m-2");
+        app.remove_agent("m-1");
+        handle_key_event(press('m'), &mut app, &config);
+        let Mode::Message { how, .. } = &app.mode else {
+            panic!("no message prompt");
+        };
+        assert!(how.starts_with("No agent runs"), "{how}");
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key_event(esc, &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

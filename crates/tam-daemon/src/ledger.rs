@@ -137,6 +137,13 @@ pub enum LedgerEvent {
         brief: Option<String>,
         timestamp: u64,
     },
+    /// A member moved to another task (`tam merge`, `tam split`) with its
+    /// worktree, runs, sessions and messages. It joins that task last.
+    MemberMoved {
+        member: String,
+        task: String,
+        timestamp: u64,
+    },
 }
 
 /// Ledger lines written before tasks had members (tam <= 0.3.6): a task had
@@ -1054,6 +1061,10 @@ impl State {
                     .retain(|(_, e)| !matches!(e, LedgerEvent::BriefSet { .. }));
                 record.events.push((seq, event));
             }
+            LedgerEvent::MemberMoved { member, task, .. } => {
+                let (member, task) = (member.clone(), task.clone());
+                self.move_member(seq, &member, &task, event);
+            }
         }
     }
 
@@ -1271,6 +1282,119 @@ impl Ledger {
             timestamp: now(),
         })?;
         Ok(true)
+    }
+}
+
+/// Members moving between tasks (`tam merge`, `tam split`): one append each,
+/// no worktree, branch or agent touched.
+impl Ledger {
+    /// Move the members of tasks `from` into task `into` (they join it last,
+    /// task by task, in join order), then forget the `from` tasks. Returns
+    /// the merged task.
+    ///
+    /// Briefs (#25): `into` keeps its brief; a `from` task's reference goes
+    /// with its `TaskDropped`. Recording it with `into` instead would be
+    /// one more event in this append, before that `TaskDropped`.
+    pub fn merge_tasks(&mut self, into: &str, from: &[String]) -> Result<TaskInfo> {
+        self.require(into)?;
+        if from.is_empty() {
+            bail!("no task to merge into '{}'", into);
+        }
+        let timestamp = now();
+        let mut events = Vec::new();
+        for (i, name) in from.iter().enumerate() {
+            self.require(name)?;
+            if name == into {
+                bail!("cannot merge task '{}' into itself", into);
+            }
+            if from[..i].contains(name) {
+                bail!("task '{}' is given twice", name);
+            }
+            for member in self.member_ids(name) {
+                events.push(LedgerEvent::MemberMoved {
+                    member,
+                    task: into.into(),
+                    timestamp,
+                });
+            }
+            events.push(LedgerEvent::TaskDropped {
+                task: name.clone(),
+                timestamp,
+            });
+        }
+        self.append_all(events)?;
+        Ok(self.task(into).expect("task exists"))
+    }
+
+    /// Move a member out of its task into a new task `name`. Refused for a
+    /// task's only member: that task would be left empty. Returns the new
+    /// task.
+    pub fn split_member(&mut self, member: &str, name: &str) -> Result<TaskInfo> {
+        let task = self.require_member(member)?;
+        if name.trim().is_empty() {
+            bail!("task name cannot be empty");
+        }
+        if self.state.tasks.contains_key(name) {
+            bail!("task '{}' already exists", name);
+        }
+        if self.member_ids(&task).len() < 2 {
+            bail!("'{}' is the only member of task '{}'", member, task);
+        }
+        let timestamp = now();
+        self.append_all(vec![
+            LedgerEvent::TaskCreated {
+                name: name.into(),
+                timestamp,
+            },
+            LedgerEvent::MemberMoved {
+                member: member.into(),
+                task: name.into(),
+                timestamp,
+            },
+        ])?;
+        Ok(self.task(name).expect("task just created"))
+    }
+}
+
+impl State {
+    /// Fold a `MemberMoved`: the member leaves its task and joins `task`
+    /// last. Ignored for an unknown member or task.
+    ///
+    /// What compaction keeps must fold to the same, with the member's
+    /// first task maybe gone: its `MemberAdded` is kept naming its current
+    /// task, whose `TaskCreated` is kept before it (its order lowered to
+    /// the member's when the task is younger), and only its latest move is
+    /// kept: it puts the member at its place in the task's join order. A
+    /// move into the member's own task, as such a ledger has, puts it last
+    /// again.
+    fn move_member(&mut self, seq: usize, member: &str, task: &str, event: LedgerEvent) {
+        if !self.tasks.contains_key(task) {
+            return;
+        }
+        let Some(record) = self.members.get_mut(member) else {
+            return;
+        };
+        let from = std::mem::replace(&mut record.task, task.to_string());
+        record
+            .events
+            .retain(|(_, e)| !matches!(e, LedgerEvent::MemberMoved { .. }));
+        let mut added = None;
+        for (at, e) in &mut record.events {
+            if let LedgerEvent::MemberAdded { task: joined, .. } = e {
+                *joined = task.to_string();
+                added = Some(*at);
+            }
+        }
+        record.events.push((seq, event));
+        if let Some(old) = self.tasks.get_mut(&from) {
+            old.members.retain(|m| m != member);
+        }
+        let target = self.tasks.get_mut(task).expect("checked above");
+        target.members.retain(|m| m != member);
+        target.members.push(member.to_string());
+        if let (Some(added), Some((created, _))) = (added, target.events.first_mut()) {
+            *created = (*created).min(added);
+        }
     }
 }
 
@@ -2726,5 +2850,360 @@ mod tests {
         assert_eq!(ledger.brief("feat"), None);
         create(&mut ledger, "feat", "/w/feat");
         assert_eq!(ledger.brief("feat"), None);
+    }
+
+    /// What a member keeps across a move and a reopen.
+    #[derive(Debug, PartialEq)]
+    struct MemberFold {
+        runs: Vec<RunInfo>,
+        open: bool,
+        session: Option<String>,
+        pending: Vec<MessageInfo>,
+        response: Option<AgentResponse>,
+    }
+
+    /// The folded tasks with their members' history, and every message.
+    type Folded = (Vec<(TaskInfo, Vec<MemberFold>)>, Vec<MessageInfo>);
+
+    fn folded(ledger: &Ledger) -> Folded {
+        let tasks = ledger
+            .tasks()
+            .into_iter()
+            .map(|t| {
+                let members = t
+                    .members
+                    .iter()
+                    .map(|m| MemberFold {
+                        runs: ledger.member_runs(&m.id),
+                        open: ledger.has_open_run(&m.id),
+                        session: ledger
+                            .last_provider(&m.id)
+                            .and_then(|p| ledger.current_session(&m.id, &p)),
+                        pending: ledger.pending_messages(&m.id),
+                        response: ledger.last_response(&m.id),
+                    })
+                    .collect();
+                (t, members)
+            })
+            .collect();
+        (tasks, ledger.messages(None))
+    }
+
+    /// Reopen twice: the first open compacts, the second finds nothing to
+    /// compact and leaves the file as it is. Both fold to `expected`.
+    fn reopen_keeps(path: &Path, expected: &Folded) -> Ledger {
+        let ledger = Ledger::open(path).unwrap().0;
+        assert_eq!(&folded(&ledger), expected);
+        drop(ledger);
+        let before = fs::read_to_string(path).unwrap();
+        let (ledger, report) = Ledger::open(path).unwrap();
+        assert_eq!(report.compacted, 0);
+        assert_eq!(fs::read_to_string(path).unwrap(), before);
+        assert_eq!(&folded(&ledger), expected);
+        ledger
+    }
+
+    fn names(task: &TaskInfo) -> Vec<&str> {
+        task.members.iter().map(|m| m.name.as_str()).collect()
+    }
+
+    #[test]
+    fn merged_members_keep_their_history_across_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        // The task merged away is the older one: its member joined before
+        // the task it moves into was created.
+        let ui = [new_member("frontend", "ui", "/w/frontend--ui")];
+        let web = ledger.create_task("ui", &ui).unwrap().members[0].id.clone();
+        ledger.run_started(&web, "claude", None).unwrap();
+        ledger.session_reported(&web, "s-web").unwrap();
+        let done = AgentResponse {
+            text: "done".into(),
+            at: 1,
+        };
+        ledger.run_ended_with(&web, 0, Some(done)).unwrap();
+        let feat = [new_member("backend", "feat", "/w/backend--feat")];
+        let api = ledger.create_task("feat", &feat).unwrap().members[0]
+            .id
+            .clone();
+        ledger
+            .run_started(&api, "claude", Some("s-api".into()))
+            .unwrap();
+        let pending = ledger.send_message(Some(&api), &web, "schema?", 1, None);
+        let pending = pending.unwrap();
+        let read = ledger.send_message(None, &web, "hi", 0, None).unwrap();
+        ledger.message_delivered(&read.id).unwrap();
+
+        let task = ledger.merge_tasks("feat", &["ui".into()]).unwrap();
+        assert_eq!(names(&task), ["backend", "frontend"]);
+        assert_eq!(task.run_count, 2);
+        assert!(ledger.task("ui").is_none());
+        assert_eq!(ledger.member_task(&web), Some("feat"));
+        let session = ledger.current_session(&web, "claude");
+        assert_eq!(session.as_deref(), Some("s-web"));
+        assert_eq!(ledger.pending_messages(&web)[0].id, pending.id);
+        assert_eq!(ledger.resolve("feat/frontend").unwrap().1.id, web);
+        assert!(ledger.resolve("ui").is_err());
+        assert_eq!(
+            ledger.message(&pending.id).unwrap().to_label,
+            "feat/frontend"
+        );
+
+        // Runs after the move are the member's too.
+        ledger
+            .run_started(&web, "claude", Some("s-web".into()))
+            .unwrap();
+        ledger.session_reported(&web, "s-web2").unwrap();
+        ledger.run_ended(&api, 0).unwrap();
+        let expected = folded(&ledger);
+        assert_eq!(expected.0[0].0.run_count, 3);
+        drop(ledger);
+
+        let ledger = reopen_keeps(&path, &expected);
+        let session = ledger.current_session(&web, "claude");
+        assert_eq!(session.as_deref(), Some("s-web2"));
+        assert!(ledger.has_open_run(&web));
+        // The merged task's creation goes first, the member names it, and
+        // its latest move keeps it after the member that was there first.
+        assert_eq!(
+            event_types(&path),
+            [
+                "task_created",
+                "member_added",
+                "agent_run_started",
+                "agent_session_identified",
+                "agent_run_ended",
+                "member_added",
+                "agent_run_started",
+                "message_sent",
+                "message_sent",
+                "message_delivered",
+                "member_moved",
+                "agent_run_started",
+                "agent_session_changed",
+                "agent_run_ended",
+            ]
+        );
+        // Nothing names the task merged away.
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(r#""task":"ui""#), "{raw}");
+        assert!(!raw.contains(r#""name":"ui""#), "{raw}");
+    }
+
+    #[test]
+    fn moves_keep_join_order_and_short_names() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        // Members of one repository in each task: the one that moves in
+        // takes `<repo>-<branch>`, and no member already there is renamed.
+        let a = create(&mut ledger, "a", "/w/app--a");
+        let b = create(&mut ledger, "b", "/w/app--b");
+        let task = ledger.merge_tasks("b", &["a".into()]).unwrap();
+        assert_eq!(names(&task), ["app", "app-a"]);
+        assert_eq!(task.members[0].id, b);
+        let expected = folded(&ledger);
+        drop(ledger);
+        let mut ledger = reopen_keeps(&path, &expected);
+
+        // Split back out under another name, then merged again the other
+        // way round: a second move of the same member.
+        let split = ledger.split_member(&a, "a2").unwrap();
+        assert_eq!(split.members[0].id, a);
+        assert_eq!(names(&split), ["app"]);
+        assert_eq!(names(&ledger.task("b").unwrap()), ["app"]);
+        let task = ledger.merge_tasks("a2", &["b".into()]).unwrap();
+        assert_eq!(names(&task), ["app", "app-b"]);
+        assert_eq!(task.members[1].id, b);
+        let c = ledger
+            .add_member("a2", &new_member("app", "c", "/w/app--c"))
+            .unwrap()
+            .members[2]
+            .id
+            .clone();
+        let task = ledger.task("a2").unwrap();
+        assert_eq!(names(&task), ["app", "app-b", "app-c"]);
+        let expected = folded(&ledger);
+        drop(ledger);
+        let ledger = reopen_keeps(&path, &expected);
+        assert_eq!(ledger.task("a2").unwrap().members[2].id, c);
+        // One move kept per member that moved.
+        let moves = event_types(&path)
+            .into_iter()
+            .filter(|t| t == "member_moved")
+            .count();
+        assert_eq!(moves, 2);
+    }
+
+    #[test]
+    fn split_leaves_the_others_and_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let task = ledger
+            .create_task(
+                "feat",
+                &[
+                    new_member("app", "feat", "/w/app--feat"),
+                    new_member("app", "x", "/w/app--x"),
+                    new_member("web", "feat", "/w/web--feat"),
+                ],
+            )
+            .unwrap();
+        let (first, second) = (task.members[0].id.clone(), task.members[1].id.clone());
+        ledger
+            .run_started(&first, "codex", Some("s1".into()))
+            .unwrap();
+
+        let split = ledger.split_member(&first, "feat-api").unwrap();
+        assert_eq!(split.run_count, 1);
+        assert!(ledger.has_open_run(&first));
+        // The remaining members' names are derived again.
+        let rest = ledger.task("feat").unwrap();
+        assert_eq!(names(&rest), ["app", "web"]);
+        assert_eq!(rest.members[0].id, second);
+        assert_eq!(ledger.resolve("feat-api").unwrap().1.id, first);
+
+        // Nothing dropped: the file is kept as written.
+        let expected = folded(&ledger);
+        drop(ledger);
+        let before = fs::read_to_string(&path).unwrap();
+        let mut ledger = reopen_keeps(&path, &expected);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+        // Dropping the task it came from leaves it alone.
+        ledger.drop_task("feat", true).unwrap();
+        let expected = (
+            vec![expected
+                .0
+                .into_iter()
+                .find(|(t, _)| t.name == "feat-api")
+                .unwrap()],
+            Vec::new(),
+        );
+        assert_eq!(folded(&ledger), expected);
+        drop(ledger);
+        reopen_keeps(&path, &expected);
+    }
+
+    #[test]
+    fn merge_and_split_refusals_record_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let a = create(&mut ledger, "a", "/w/app--a");
+        create(&mut ledger, "b", "/w/app--b");
+        let before = event_types(&path);
+        let refused = |r: Result<TaskInfo>| r.unwrap_err().to_string();
+        assert!(refused(ledger.merge_tasks("nope", &["a".into()])).contains("not found"));
+        assert!(refused(ledger.merge_tasks("a", &["nope".into()])).contains("not found"));
+        assert!(refused(ledger.merge_tasks("a", &[])).contains("no task"));
+        assert!(refused(ledger.merge_tasks("a", &["a".into()])).contains("itself"));
+        let twice = ledger.merge_tasks("a", &["b".into(), "b".into()]);
+        assert!(refused(twice).contains("twice"));
+        assert!(refused(ledger.split_member(&a, "c")).contains("only member"));
+        assert!(refused(ledger.split_member("m-nope", "c")).contains("not found"));
+        ledger
+            .add_member("a", &new_member("web", "a", "/w/web--a"))
+            .unwrap();
+        assert!(refused(ledger.split_member(&a, "b")).contains("already exists"));
+        assert!(refused(ledger.split_member(&a, " ")).contains("empty"));
+        let mut after = before;
+        after.push("member_added".into());
+        assert_eq!(event_types(&path), after);
+    }
+
+    #[test]
+    fn migrated_tasks_merge_like_any() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        fs::write(&path, LEGACY).unwrap();
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let myapp = ledger.task("feat").unwrap().members[0].id.clone();
+        // `fix/x` was created after `feat`'s member, which has an open run.
+        let task = ledger.merge_tasks("fix/x", &["feat".into()]).unwrap();
+        assert_eq!(names(&task), ["api", "myapp"]);
+        assert_eq!(task.run_count, 2);
+        assert!(task.members.iter().all(|m| m.repo_root.is_none()));
+        assert!(ledger.has_open_run(&myapp));
+        let session = ledger.current_session(&myapp, "codex");
+        assert_eq!(session.as_deref(), Some("s2"));
+        ledger.run_ended(&myapp, 0).unwrap();
+        let expected = folded(&ledger);
+        drop(ledger);
+        let ledger = reopen_keeps(&path, &expected);
+        assert_eq!(ledger.tasks().len(), 1);
+        assert_eq!(ledger.member_runs(&myapp)[1].exit_code, Some(0));
+    }
+
+    #[test]
+    fn merge_then_split_back_under_the_old_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let back = [new_member("backend", "back", "/w/backend--back")];
+        let api = ledger.create_task("back", &back).unwrap().members[0]
+            .id
+            .clone();
+        let front = [new_member("frontend", "front", "/w/frontend--front")];
+        let web = ledger.create_task("front", &front).unwrap().members[0]
+            .id
+            .clone();
+        ledger
+            .run_started(&web, "claude", Some("s-web".into()))
+            .unwrap();
+        ledger
+            .send_message(Some(&web), &api, "done?", 1, None)
+            .unwrap();
+
+        ledger.merge_tasks("back", &["front".into()]).unwrap();
+        // The default name `tam split` gives: the member's branch, free
+        // again once its task was merged away.
+        let split = ledger.split_member(&web, "front").unwrap();
+        assert_eq!(split.members[0].id, web);
+        assert_eq!(names(&split), ["frontend"]);
+        assert_eq!(ledger.task("back").unwrap().members[0].id, api);
+        assert!(ledger.has_open_run(&web));
+        assert_eq!(ledger.messages(Some("back"))[0].from_label, "front");
+        let expected = folded(&ledger);
+        drop(ledger);
+        reopen_keeps(&path, &expected);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_target_brief_and_a_split_starts_without() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        let back = [new_member("backend", "back", "/w/backend--back")];
+        ledger.create_task("back", &back).unwrap();
+        let front = [new_member("frontend", "front", "/w/frontend--front")];
+        let web = ledger.create_task("front", &front).unwrap().members[0]
+            .id
+            .clone();
+        ledger.set_brief("back", Some("CS-1")).unwrap();
+        ledger.set_brief("front", Some("CS-2")).unwrap();
+
+        // The target's brief stays; the source's goes with the source.
+        ledger.merge_tasks("back", &["front".into()]).unwrap();
+        assert_eq!(ledger.brief("back").as_deref(), Some("CS-1"));
+        assert_eq!(ledger.brief("front"), None);
+        let expected = folded(&ledger);
+        drop(ledger);
+        let mut ledger = reopen_keeps(&path, &expected);
+        assert_eq!(ledger.brief("back").as_deref(), Some("CS-1"));
+        let types = event_types(&path);
+        assert_eq!(types.iter().filter(|t| *t == "brief_set").count(), 1);
+
+        // A task split off starts with the local brief, as a new task does.
+        ledger.split_member(&web, "front").unwrap();
+        assert_eq!(ledger.brief("front"), None);
+        assert_eq!(ledger.brief("back").as_deref(), Some("CS-1"));
+        let expected = folded(&ledger);
+        drop(ledger);
+        let ledger = reopen_keeps(&path, &expected);
+        assert_eq!(ledger.brief("front"), None);
+        assert_eq!(ledger.brief("back").as_deref(), Some("CS-1"));
     }
 }

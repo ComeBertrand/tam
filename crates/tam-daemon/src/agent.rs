@@ -1,7 +1,8 @@
+use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -11,7 +12,7 @@ use anyhow::{Context, Result};
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use tam_proto::{AgentInfo, AgentResponse, AgentState, Ask, ScreenInfo};
+use tam_proto::{AgentEnv, AgentInfo, AgentResponse, AgentState, Ask, ScreenInfo};
 use tokio::sync::{broadcast, watch};
 use tracing::error;
 
@@ -63,9 +64,49 @@ pub struct Agent {
     readable: Vec<PathBuf>,
 }
 
+/// What the client starting an agent has it run in (`Request::RunAgent`).
+/// Held until the process starts, never kept: the environment holds secrets.
+#[derive(Default)]
+pub struct Launch {
+    /// The agent's whole environment, the client's. Empty: the daemon's.
+    pub env: AgentEnv,
+}
+
+/// `TERM` of an agent whose caller has none (a script, cron): the agent's
+/// terminal is a PTY, drawn by tam's screen and the viewers' terminals.
+const FALLBACK_TERM: &str = "xterm-256color";
+
+impl Launch {
+    /// Run `cmd` (in `dir`) with the client's environment instead of the
+    /// daemon's, keeping what the provider set on it. The program is looked
+    /// up on the client's `PATH`.
+    fn apply(&self, cmd: &mut Command, dir: &Path) {
+        if !self.env.is_empty() {
+            let set: Vec<(OsString, Option<OsString>)> = cmd
+                .get_envs()
+                .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+                .collect();
+            cmd.env_clear().envs(&self.env.0);
+            let term = self.env.0.get("TERM").map(String::as_str);
+            if matches!(term, None | Some("" | "dumb")) {
+                cmd.env("TERM", FALLBACK_TERM);
+            }
+            for (key, val) in set {
+                match val {
+                    Some(val) => cmd.env(key, val),
+                    None => cmd.env_remove(key),
+                };
+            }
+        }
+        // Not the directory of the shell the environment comes from.
+        cmd.env("PWD", dir);
+    }
+}
+
 impl Agent {
-    /// Spawn a new agent process attached to a PTY.
-    /// `env_vars` are set on the child process (e.g. TAM_AGENT_ID, TAM_SOCKET).
+    /// Spawn a new agent process attached to a PTY, in the environment
+    /// `launch` gives. `env_vars` are set on the child process on top of it
+    /// (TAM_AGENT_ID, TAM_SOCKET: whatever the client's environment had).
     pub fn spawn(
         provider: Arc<dyn Provider>,
         dir: &Path,
@@ -73,11 +114,13 @@ impl Agent {
         resume_session: Option<&str>,
         prompt: Option<&str>,
         env_vars: &[(&str, &str)],
+        launch: &Launch,
     ) -> Result<Self> {
         // Verify directory exists
         anyhow::ensure!(dir.is_dir(), "directory does not exist: {}", dir.display());
 
         let mut cmd = provider.build_command(dir, args, resume_session, prompt);
+        launch.apply(&mut cmd, dir);
         for (key, val) in env_vars {
             cmd.env(key, val);
         }

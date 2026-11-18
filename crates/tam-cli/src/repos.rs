@@ -73,6 +73,63 @@ pub fn git_env() -> BTreeMap<String, String> {
     )
 }
 
+/// The environment of an agent we start (`RunAgent`): ours, so that it runs
+/// with our `PATH`, tools and credentials rather than the daemon's, without
+/// what ties git to one repository (see [`git_env`]) and what is ours rather
+/// than the agent's (see [`NOT_FOR_AGENTS`]).
+pub fn agent_env() -> tam_proto::AgentEnv {
+    tam_proto::AgentEnv(for_agent(git_env()))
+}
+
+/// Variables of the caller that are not the agent's. Claude's are those a
+/// Claude session sets for the commands it runs (an agent starting another
+/// one); its own settings (`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_USE_BEDROCK`,
+/// …) pass.
+const NOT_FOR_AGENTS: &[&str] = &[
+    // The calling agent's: the daemon sets the new agent's own.
+    "TAM_AGENT_ID",
+    "TAM_SOCKET",
+    // A calling Claude session's: a session started with them counts as
+    // nested in it and writes no transcript (so cannot be resumed), and the
+    // messaging token is that session's secret.
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDE_ENV_FILE",
+    // The caller's own pane or window: the agent's tools would act on it
+    // (e.g. Claude opens teammates in tmux panes when `$TMUX` is set).
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
+    "WEZTERM_PANE",
+    "KITTY_WINDOW_ID",
+    "WINDOWID",
+    // The caller's terminal size and directory: the agent's PTY has its
+    // own, and it runs in its worktree.
+    "COLUMNS",
+    "LINES",
+    "PWD",
+    "OLDPWD",
+];
+
+fn for_agent(vars: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    vars.into_iter()
+        .filter(|(k, _)| !NOT_FOR_AGENTS.contains(&k.as_str()))
+        .collect()
+}
+
 fn without_local_git_vars(
     vars: impl Iterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
@@ -251,6 +308,44 @@ mod tests {
         let env = without_local_git_vars(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         let keys: Vec<&str> = env.keys().map(String::as_str).collect();
         assert_eq!(keys, ["GIT_SSH_COMMAND", "PATH"]);
+    }
+
+    #[test]
+    fn an_agent_gets_our_environment_but_not_our_session_or_pane() {
+        let vars = [
+            ("PATH", "/nix/store/x/bin:/bin"),
+            ("SSH_AUTH_SOCK", "/run/agent.sock"),
+            ("DIRENV_DIFF", "eJx"),
+            ("TERM", "xterm-kitty"),
+            ("CLAUDE_CONFIG_DIR", "/home/u/.claude-work"),
+            ("CLAUDE_CODE_USE_BEDROCK", "1"),
+            // Ours as an agent, or as a Claude session's command.
+            ("TAM_AGENT_ID", "m-caller"),
+            ("TAM_SOCKET", "/run/tam/sock"),
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "abc"),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "secret"),
+            ("TMUX", "/tmp/tmux-1000/default,1,0"),
+            ("COLUMNS", "200"),
+            ("PWD", "/home/u"),
+        ];
+        let env = for_agent(
+            vars.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        let keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CONFIG_DIR",
+                "DIRENV_DIFF",
+                "PATH",
+                "SSH_AUTH_SOCK",
+                "TERM"
+            ]
+        );
     }
 
     #[test]

@@ -539,6 +539,11 @@ pub enum Request {
         args: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        /// The client's environment: the agent runs with exactly this, plus
+        /// `TAM_AGENT_ID` and `TAM_SOCKET` (see `AgentEnv`). Empty: the
+        /// daemon's.
+        #[serde(default, skip_serializing_if = "AgentEnv::is_empty")]
+        env: AgentEnv,
     },
     /// Check every member's worktree against git now (the daemon also does on
     /// start and periodically). Replies `Tasks` once done, and pushes
@@ -854,6 +859,28 @@ pub enum SessionChoice {
     New,
     /// This session, whatever the member's current one.
     Id(String),
+}
+
+/// The environment an agent starts with: its caller's (`tam run`, `tam new`,
+/// the dashboard), so that it gets that shell's `PATH`, tools and
+/// credentials, not the daemon's (inherited from whichever shell started it,
+/// maybe days ago). It holds secrets: the daemon starts the agent with it
+/// and keeps nothing (no ledger, no log, no event), and its `Debug` shows
+/// only how many variables it has.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentEnv(pub BTreeMap<String, String>);
+
+impl AgentEnv {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for AgentEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AgentEnv({} variables)", self.0.len())
+    }
 }
 
 /// Daemon -> Client response.
@@ -1832,6 +1859,7 @@ mod tests {
                 session,
                 args,
                 prompt,
+                env,
             } => {
                 assert_eq!(member, "m-1");
                 assert_eq!(provider, None);
@@ -1839,6 +1867,7 @@ mod tests {
                 assert_eq!(session, SessionChoice::Current);
                 assert!(args.is_empty());
                 assert_eq!(prompt, None);
+                assert!(env.is_empty());
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1855,9 +1884,11 @@ mod tests {
                 session: session.clone(),
                 args: vec![],
                 prompt: None,
+                env: AgentEnv::default(),
             };
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("\"session\":{wire}")), "{json}");
+            assert!(!json.contains("env"), "{json}");
             match serde_json::from_str::<Request>(&json).unwrap() {
                 Request::RunAgent {
                     session: back,
@@ -1870,6 +1901,36 @@ mod tests {
                 other => panic!("wrong variant: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn run_agent_env_is_a_plain_object_never_debug_printed() {
+        let env = AgentEnv(BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            ("API_TOKEN".to_string(), "s3cret".to_string()),
+        ]));
+        let req = Request::RunAgent {
+            member: "m-1".into(),
+            provider: None,
+            default_provider: "claude".into(),
+            session: SessionChoice::New,
+            args: vec![],
+            prompt: None,
+            env: env.clone(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.ends_with(r#""env":{"API_TOKEN":"s3cret","PATH":"/bin"}}"#),
+            "{json}"
+        );
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::RunAgent { env: back, .. } => assert_eq!(back, env),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // A request logged with `{:?}` shows no name or value.
+        let debug = format!("{req:?}");
+        assert!(debug.contains("AgentEnv(2 variables)"), "{debug}");
+        assert!(!debug.contains("s3cret") && !debug.contains("API_TOKEN"));
     }
 
     #[test]

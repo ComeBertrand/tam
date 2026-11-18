@@ -263,8 +263,9 @@ impl Client {
     }
 
     /// Start a member's agent (`provider`: else the member's last agent, else
-    /// `default_provider`) in the chosen session, in our environment.
-    /// Returns the agent id and the session it resumed, if any.
+    /// `default_provider`) in the chosen session, in our environment, through
+    /// the configured wrapper (read now: a dashboard sees a change). Returns
+    /// the agent id and the session it resumed, if any.
     pub async fn run_agent(
         &mut self,
         member: &str,
@@ -283,6 +284,9 @@ impl Client {
             prompt,
             // The agent runs where we are, not where the daemon started.
             env: crate::repos::agent_env(),
+            wrapper: crate::config::load_config()
+                .context("cannot read tam's config")?
+                .wrapper,
         };
         match self.send(request).await? {
             Response::Running { id, resumed } => Ok((id, resumed)),

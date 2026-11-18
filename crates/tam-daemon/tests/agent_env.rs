@@ -156,7 +156,13 @@ fn run_agent(member: &str, provider: &str, args: Vec<String>, env: &AgentEnv) ->
         args,
         prompt: None,
         env: env.clone(),
+        wrapper: vec![],
     }
+}
+
+fn script(path: &Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 }
 
 fn create_task(name: &str, dir: &Path) -> Request {
@@ -309,6 +315,96 @@ async fn an_agent_runs_in_its_callers_environment_and_nothing_of_it_is_kept() {
             &path.display().to_string(),
             &String::from_utf8_lossy(&bytes),
         );
+    }
+    cmd.request(&Request::Shutdown).await;
+}
+
+#[tokio::test]
+async fn a_wrapper_runs_the_agent_in_its_worktree_and_environment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let sock = root.join("d.sock");
+    let ledger = root.join("ledger.jsonl");
+    // Both only on the caller's PATH.
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // Like `direnv exec .`: adds to the environment where it runs, then
+    // becomes the agent.
+    script(
+        &bin.join("wrap"),
+        "#!/bin/sh\n[ \"$1\" = --flag ] && shift\nexport WRAPPED_IN=\"$(pwd)\"\nexec \"$@\"\n",
+    );
+    let report = root.join("report");
+    script(
+        &bin.join("wrapped-agent"),
+        &format!(
+            "#!/bin/sh\n{{\n  echo \"wrapped_in=$WRAPPED_IN\"\n  echo \"caller=$CALLER\"\n  \
+             echo \"id=$TAM_AGENT_ID\"\n  echo \"pid=$$\"\n  \
+             for a in \"$@\"; do echo \"arg=$a\"; done\n}} > '{r}.tmp'\nmv '{r}.tmp' '{r}'\n\
+             exec sleep 3600\n",
+            r = report.display()
+        ),
+    );
+    let work = root.join("app--feat");
+    std::fs::create_dir_all(&work).unwrap();
+
+    start_daemon(&sock, &ledger).await;
+    let mut cmd = Conn::connect(&sock).await;
+    let member = match cmd.request(&create_task("feat", &work)).await {
+        Response::Task { task, .. } => task.members[0].id.clone(),
+        other => panic!("expected Task, got {other:?}"),
+    };
+    let env = AgentEnv(BTreeMap::from([
+        (
+            "PATH".to_string(),
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        ),
+        ("CALLER".to_string(), "dashboard".to_string()),
+    ]));
+    let mut request = run_agent(
+        &member,
+        "wrapped-agent",
+        vec!["one".into(), "two words".into()],
+        &env,
+    );
+    if let Request::RunAgent { wrapper, .. } = &mut request {
+        *wrapper = vec!["wrap".into(), "--flag".into()];
+    }
+    match cmd.request(&request).await {
+        Response::Running { id, .. } => assert_eq!(id, member),
+        other => panic!("expected Running, got {other:?}"),
+    }
+    let found = read_report(&report).await;
+    let pid = match cmd.request(&Request::List).await {
+        Response::Agents { agents } => agents[0].pid.unwrap(),
+        other => panic!("expected Agents, got {other:?}"),
+    };
+    assert_eq!(
+        found,
+        [
+            format!("wrapped_in={}", work.display()),
+            "caller=dashboard".to_string(),
+            format!("id={member}"),
+            // The wrapper became the agent: the daemon's pid is the agent's.
+            format!("pid={pid}"),
+            "arg=one".to_string(),
+            "arg=two words".to_string(),
+        ]
+    );
+    cmd.request(&Request::Kill { id: member.clone() }).await;
+
+    // A wrapper that cannot be started is named.
+    if let Request::RunAgent { wrapper, .. } = &mut request {
+        *wrapper = vec!["no-such-wrapper-tam".into()];
+    }
+    match cmd.request(&request).await {
+        Response::Error { message } => {
+            assert!(
+                message.contains("through 'no-such-wrapper-tam'"),
+                "{message}"
+            )
+        }
+        other => panic!("expected Error, got {other:?}"),
     }
     cmd.request(&Request::Shutdown).await;
 }

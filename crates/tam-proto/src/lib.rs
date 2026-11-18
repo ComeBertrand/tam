@@ -544,6 +544,12 @@ pub enum Request {
         /// daemon's.
         #[serde(default, skip_serializing_if = "AgentEnv::is_empty")]
         env: AgentEnv,
+        /// A command the agent's command is given to as trailing arguments,
+        /// run in the member's worktree with `env` (e.g. `direnv exec .`):
+        /// it adds the worktree's own environment and runs the agent in its
+        /// place (`exec`). Empty: the agent's command alone.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wrapper: Vec<String>,
     },
     /// Check every member's worktree against git now (the daemon also does on
     /// start and periodically). Replies `Tasks` once done, and pushes
@@ -1860,6 +1866,7 @@ mod tests {
                 args,
                 prompt,
                 env,
+                wrapper,
             } => {
                 assert_eq!(member, "m-1");
                 assert_eq!(provider, None);
@@ -1868,6 +1875,7 @@ mod tests {
                 assert!(args.is_empty());
                 assert_eq!(prompt, None);
                 assert!(env.is_empty());
+                assert!(wrapper.is_empty());
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1885,10 +1893,11 @@ mod tests {
                 args: vec![],
                 prompt: None,
                 env: AgentEnv::default(),
+                wrapper: vec![],
             };
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("\"session\":{wire}")), "{json}");
-            assert!(!json.contains("env"), "{json}");
+            assert!(!json.contains("env") && !json.contains("wrapper"), "{json}");
             match serde_json::from_str::<Request>(&json).unwrap() {
                 Request::RunAgent {
                     session: back,
@@ -1917,10 +1926,13 @@ mod tests {
             args: vec![],
             prompt: None,
             env: env.clone(),
+            wrapper: vec!["direnv".into(), "exec".into(), ".".into()],
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
-            json.ends_with(r#""env":{"API_TOKEN":"s3cret","PATH":"/bin"}}"#),
+            json.ends_with(
+                r#""env":{"API_TOKEN":"s3cret","PATH":"/bin"},"wrapper":["direnv","exec","."]}"#
+            ),
             "{json}"
         );
         match serde_json::from_str::<Request>(&json).unwrap() {

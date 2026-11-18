@@ -132,6 +132,15 @@ adopt). `tam-cli` depends on all three.
   (as the caller did); its hooks through `$TAM_SOCKET`. Known limit: the
   daemon still looks for Claude transcripts (resume check, context) under
   its own `HOME`/`CLAUDE_CONFIG_DIR`.
+  The caller's environment is rarely the worktree's dev shell (a dashboard
+  launched elsewhere): `[spawn] wrapper` (e.g. `["direnv", "exec", "."]`)
+  is read by `Client::run_agent` at each start (a running dashboard sees a
+  change) and sent as `RunAgent.wrapper`; `Launch::wrap` gives it the
+  provider's command as trailing arguments, in the worktree, and it should
+  `exec` the agent (same pid). Evaluated at every start and resume, in the
+  worktree, on top of the caller's environment (direnv unloads an `.envrc`
+  loaded elsewhere through `DIRENV_DIFF`, which is kept); its output and
+  errors are on the agent's screen. A spawn error names it. Not recorded.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
   detection, generic/codex use PTY heuristic (5s idle timeout). Claude's hooks
   are injected per spawn (`claude --settings`) and run `tam hook-notify`, which
@@ -525,8 +534,9 @@ cargo test
 - `agent_env.rs`, in both crates: the daemon's runs an agent found only on
   the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
   value) in replies, events, errors and every file next to the ledger,
-  before and after a restart; the CLI's has `tam new` and `tam run` from
-  shells other than the daemon's (a fake `claude` only on theirs).
+  before and after a restart, and runs one through a wrapper; the CLI's has
+  `tam new` and `tam run` from shells other than the daemon's (a fake
+  `claude` only on theirs), then a wrapper configured meanwhile.
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

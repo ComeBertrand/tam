@@ -16,6 +16,7 @@ pub struct ConfigFile {
 pub struct SpawnConfig {
     #[serde(alias = "agent")]
     pub default_agent: Option<String>,
+    pub wrapper: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +55,10 @@ pub struct Config {
     pub commands: Vec<CustomCommand>,
     pub theme: Option<String>,
     pub animate: bool,
+    /// Command every agent's command is given to, in its worktree (e.g.
+    /// `["direnv", "exec", "."]`: the worktree's dev environment). Empty:
+    /// none.
+    pub wrapper: Vec<String>,
 }
 
 impl Default for Config {
@@ -64,6 +69,7 @@ impl Default for Config {
             commands: Vec::new(),
             theme: None,
             animate: true,
+            wrapper: Vec::new(),
         }
     }
 }
@@ -95,12 +101,25 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         );
     }
 
+    let wrapper = file
+        .spawn
+        .as_ref()
+        .and_then(|s| s.wrapper.clone())
+        .unwrap_or_default();
+    if wrapper
+        .first()
+        .is_some_and(|program| program.trim().is_empty())
+    {
+        anyhow::bail!("spawn.wrapper: the first word must be the command to run");
+    }
+
     Ok(Config {
         default_agent,
         finder,
         commands,
         theme,
         animate: file.tui.as_ref().and_then(|t| t.animate).unwrap_or(true),
+        wrapper,
     })
 }
 
@@ -345,6 +364,19 @@ default_agent = "codex"
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(config.default_agent, "codex");
+        assert!(config.wrapper.is_empty());
+    }
+
+    #[test]
+    fn parse_spawn_wrapper() {
+        let config = parse_config("[spawn]\nwrapper = [\"direnv\", \"exec\", \".\"]\n").unwrap();
+        assert_eq!(config.wrapper, ["direnv", "exec", "."]);
+        let config = parse_config("[spawn]\nwrapper = []\n").unwrap();
+        assert!(config.wrapper.is_empty());
+        let err = parse_config("[spawn]\nwrapper = [\"\", \"exec\"]\n").unwrap_err();
+        assert!(err.to_string().contains("spawn.wrapper"), "{err}");
+        // A command line, not a shell string.
+        assert!(parse_config("[spawn]\nwrapper = \"direnv exec .\"\n").is_err());
     }
 
     #[test]

@@ -93,6 +93,7 @@ impl Harness {
             args: vec![],
             prompt: None,
             env: Default::default(),
+            wrapper: vec![],
         };
         let resumed = match send(&mut self.stream, &request).await {
             Response::Running { id, resumed } => {

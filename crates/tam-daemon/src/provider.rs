@@ -613,6 +613,10 @@ fn claude_transcript_exists(claude_dir: &Path, session: &str) -> bool {
         .any(|project| project.path().join(&file).is_file())
 }
 
+/// Context window of a Claude session, in tokens. Neither the transcript nor
+/// the hooks say what it is; current models have 1M.
+const CLAUDE_CONTEXT_LIMIT: u64 = 1_000_000;
+
 fn claude_context_usage(pid: u32, dir: &Path, transcript: Option<&Path>) -> Option<ContextUsage> {
     // The transcript reported by the hooks is authoritative; without it
     // (no hook seen yet), guess from the PID session file, then from the
@@ -624,21 +628,14 @@ fn claude_context_usage(pid: u32, dir: &Path, transcript: Option<&Path>) -> Opti
 
     // Read JSONL, find last assistant message with usage
     let content = std::fs::read_to_string(&jsonl_path).ok()?;
-    let (usage, model) = find_last_usage(&content)?;
+    let (usage, _model) = find_last_usage(&content)?;
 
     let used =
         usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
 
-    // Context limit: 1M if model has [1m] suffix or tokens already exceed 200k
-    let limit = if model.as_deref().is_some_and(|m| m.contains("[1m]")) || used > 180_000 {
-        1_000_000
-    } else {
-        200_000
-    };
-
     Some(ContextUsage {
         used_tokens: used,
-        limit_tokens: limit,
+        limit_tokens: CLAUDE_CONTEXT_LIMIT,
     })
 }
 
@@ -1394,7 +1391,9 @@ mod tests {
         let u = ClaudeProvider::new(None)
             .context_usage(0, Path::new("/nonexistent"), Some(&t))
             .unwrap();
-        assert_eq!(u.percent(), 50);
+        assert_eq!(u.used_tokens, 100_000);
+        assert_eq!(u.limit_tokens, 1_000_000);
+        assert_eq!(u.percent(), 10);
     }
 
     #[test]

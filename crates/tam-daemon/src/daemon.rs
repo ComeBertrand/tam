@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,6 +48,9 @@ struct DaemonState {
     idle_deadline: Option<Instant>,
     /// Message delivery state (the messages are in the ledger).
     inbox: Inbox,
+    /// What changed in a member's task since its agent last heard (merge,
+    /// split), by member id: told at its next prompt or tool call.
+    peer_changes: HashMap<String, Vec<String>>,
 }
 
 /// Default idle timeout before daemon auto-shuts down (seconds).
@@ -126,6 +129,7 @@ impl Daemon {
             connected_clients: Arc::new(AtomicUsize::new(0)),
             idle_deadline: None,
             inbox: Inbox::default(),
+            peer_changes: HashMap::new(),
         }));
 
         // Create socket directory
@@ -380,6 +384,9 @@ impl DaemonState {
             exit_code,
         });
         self.inbox.agent_gone(id, agent.member());
+        if let Some(member) = agent.member() {
+            self.peer_changes.remove(member);
+        }
         let Some(member) = agent.member() else {
             return;
         };
@@ -904,6 +911,10 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         } => handle_create_members(state, &task, members, source, join, env).await,
         Request::GetBrief { task } => handle_get_brief(state, &task).await,
         Request::SetBrief { task, brief } => handle_set_brief(state, &task, brief).await,
+        Request::MergeTasks { into, from } => handle_merge_tasks(state, &into, &from).await,
+        Request::SplitMember { member, name } => {
+            handle_split_member(state, &member, name.as_deref()).await
+        }
     }
 }
 
@@ -1225,6 +1236,10 @@ async fn handle_hook_event(
     if let Some((member, session_id)) = session {
         state.record_hook_session(&member, &session_id);
     }
+    // After a merge or split: what changed, and its task now.
+    if let Some(context) = state.take_peer_note(agent_id, event, payload) {
+        return Response::HookContext { context };
+    }
     // Whenever a session starts (resumed, cleared, compacted too): what its
     // task is now, and its peers.
     if event == "SessionStart" {
@@ -1465,8 +1480,9 @@ async fn handle_drop_member(
         // Again, under the claim: another drop may have taken the other
         // members since.
         let is_last = match guard.ledger.member(&member.id) {
-            Some((now, _)) => now.members.len() < 2,
-            None => {
+            // A merge or split may have moved it since.
+            Some((now, _)) if now.name == task.name => now.members.len() < 2,
+            _ => {
                 guard.dropping.remove(&task.name);
                 return Response::Error {
                     message: format!("'{label}' is no longer a member of task '{}'", task.name),
@@ -2668,5 +2684,311 @@ async fn handle_set_brief(
         Err(e) => Response::Error {
             message: format!("the brief is set, but {e:#}"),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge and split: members move between tasks (`Ledger::merge_tasks`,
+// `Ledger::split_member`). One ledger append, no git, agents keep running.
+// ---------------------------------------------------------------------------
+
+/// Most changes a member's agent is told at once: the oldest go first (the
+/// note that follows them tells its task as it is now).
+const MAX_PEER_CHANGES: usize = 5;
+
+impl DaemonState {
+    /// Why the membership of `tasks` cannot change now: one is unknown or
+    /// being dropped (a drop removes the worktrees it listed when claimed).
+    fn refuse_move(&self, tasks: &[&str]) -> Option<String> {
+        tasks.iter().find_map(|t| {
+            if self.ledger.task(t).is_none() {
+                Some(format!("task '{t}' not found"))
+            } else if self.dropping.contains(*t) {
+                Some(format!("task '{t}' is being dropped"))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The labels the members of `tasks` have now, by member id.
+    fn labels(&self, tasks: &[&str]) -> BTreeMap<String, String> {
+        tasks
+            .iter()
+            .filter_map(|t| self.ledger.task(t))
+            .flat_map(|task| {
+                let labels: Vec<(String, String)> = task
+                    .members
+                    .iter()
+                    .map(|m| (m.id.clone(), task.member_label(m)))
+                    .collect();
+                labels
+            })
+            .collect()
+    }
+
+    /// Tell clients the task of moved members' running agents changed (a
+    /// client lists an agent under its member, by member id).
+    fn agents_moved(&self, members: &[String]) {
+        let ids: Vec<&String> = self
+            .agents
+            .iter()
+            .filter(|(_, a)| a.member().is_some_and(|m| members.iter().any(|id| id == m)))
+            .map(|(id, _)| id)
+            .collect();
+        for id in ids {
+            if let Some(info) = self.agent_info(id) {
+                self.broadcast(Event::AgentUpdated {
+                    id: id.clone(),
+                    info,
+                });
+            }
+        }
+    }
+
+    /// Keep what changed for the running agents of members that have hooks
+    /// (Claude): `(member, change)`. Returns the members told.
+    fn note_peer_changes(&mut self, changes: Vec<(String, String)>) -> Vec<String> {
+        let mut told = Vec::new();
+        for (member, change) in changes {
+            let hooked = self
+                .agents
+                .values()
+                .any(|a| a.member() == Some(member.as_str()) && a.inbox_hook());
+            if !hooked {
+                continue;
+            }
+            let kept = self.peer_changes.entry(member.clone()).or_default();
+            kept.push(change);
+            if kept.len() > MAX_PEER_CHANGES {
+                kept.remove(0);
+            }
+            told.push(member);
+        }
+        told
+    }
+
+    /// What agent `agent_id` is told at this hook of changes to its task:
+    /// at a prompt or a tool call (not a subagent's: its context is not the
+    /// session's), what changed and its note now. A session start gets the
+    /// whole note anyway: they are forgotten.
+    fn take_peer_note(
+        &mut self,
+        agent_id: &str,
+        event: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Option<String> {
+        let member = self.agents.get(agent_id)?.member()?.to_string();
+        let subagent = payload
+            .and_then(|p| p.get("agent_id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty());
+        match event {
+            "SessionStart" => {
+                self.peer_changes.remove(&member);
+                return None;
+            }
+            "UserPromptSubmit" => {}
+            "PostToolUse" if !subagent => {}
+            _ => return None,
+        }
+        let changes = self.peer_changes.remove(&member)?;
+        let readable = self.agents.get(agent_id)?.readable();
+        crate::peers::change_note(&self.ledger, &member, readable, &changes)
+    }
+
+    /// Make the directories of tasks members moved into, if missing: the
+    /// note their agents get names the brief and scratch directory there.
+    fn ensure_moved_dirs(&self, tasks: &[&TaskInfo]) {
+        for task in tasks {
+            if let Err(e) = self.ensure_brief(task) {
+                warn!(task = %task.name, "cannot make the task's directory: {e:#}");
+            }
+        }
+    }
+}
+
+/// Merge tasks `from` into task `into` (`Request::MergeTasks`): their
+/// members join it, they are gone. Refused while one of them is being
+/// dropped.
+async fn handle_merge_tasks(
+    state: &Arc<Mutex<DaemonState>>,
+    into: &str,
+    from: &[String],
+) -> Response {
+    let error = |why: String| Response::Error {
+        message: format!("cannot merge into '{into}': {why}"),
+    };
+    let mut names = vec![into];
+    names.extend(from.iter().map(String::as_str));
+    // At once while a drop holds one of them; then after the creation,
+    // repair or drop under way (a member joining one of them moves too).
+    if let Some(why) = state.lock().await.refuse_move(&names) {
+        return error(why);
+    }
+    let worktrees = state.lock().await.worktrees.clone();
+    let _held = worktrees.lock().await;
+    let mut state = state.lock().await;
+    if let Some(why) = state.refuse_move(&names) {
+        return error(why);
+    }
+    let previous = state.labels(&names);
+    // Moving members, with the task each comes from.
+    let origins: Vec<(String, String)> = from
+        .iter()
+        .flat_map(|t| {
+            state
+                .ledger
+                .member_ids(t)
+                .into_iter()
+                .map(|id| (id, t.clone()))
+        })
+        .collect();
+    let moved: Vec<String> = origins.iter().map(|(id, _)| id.clone()).collect();
+    let task = match state.ledger.merge_tasks(into, from) {
+        Ok(task) => task,
+        Err(e) => return error(format!("{e:#}")),
+    };
+    info!(task = %into, from = ?from, "tasks merged");
+    for name in from {
+        state.broadcast(Event::TaskDropped { name: name.clone() });
+    }
+    state.broadcast(Event::TaskUpdated { task: task.clone() });
+    state.agents_moved(&moved);
+    state.ensure_moved_dirs(&[&task]);
+
+    let changes = task
+        .members
+        .iter()
+        .map(|m| {
+            let change = match origins.iter().find(|(id, _)| *id == m.id) {
+                Some((_, origin)) => crate::peers::merged_away(
+                    origin,
+                    into,
+                    previous.get(&m.id).unwrap_or(&m.id),
+                    &task.member_label(m),
+                ),
+                None => crate::peers::merged_in(into, from),
+            };
+            (m.id.clone(), change)
+        })
+        .collect();
+    let notified = state.note_peer_changes(changes);
+    Response::Moved {
+        tasks: vec![task],
+        moved,
+        previous,
+        notified,
+    }
+}
+
+/// Split a member out of its task into a new task (`Request::SplitMember`):
+/// `name`, else its branch. Refused for a task's only member, and while its
+/// task is being dropped.
+async fn handle_split_member(
+    state: &Arc<Mutex<DaemonState>>,
+    target: &str,
+    name: Option<&str>,
+) -> Response {
+    let first = match state.lock().await.split_plan(target, name) {
+        Ok(plan) => plan,
+        Err(message) => return Response::Error { message },
+    };
+    let worktrees = state.lock().await.worktrees.clone();
+    let _held = worktrees.lock().await;
+    let mut state = state.lock().await;
+    // Again, by id: it may have moved meanwhile.
+    let (task, member, name) = match state.split_plan(&first.1.id, name) {
+        Ok(plan) if plan.0.name == first.0.name => plan,
+        Ok(_) => {
+            return Response::Error {
+                message: format!(
+                    "cannot split '{}': it is no longer a member of task '{}'",
+                    first.0.member_label(&first.1),
+                    first.0.name
+                ),
+            }
+        }
+        Err(message) => return Response::Error { message },
+    };
+    let label = task.member_label(&member);
+    let previous = state.labels(&[&task.name]);
+    let created = match state.ledger.split_member(&member.id, &name) {
+        Ok(created) => created,
+        Err(e) => {
+            return Response::Error {
+                message: format!("cannot split '{label}': {e:#}"),
+            }
+        }
+    };
+    let rest = state
+        .ledger
+        .task(&task.name)
+        .expect("the task keeps its other members");
+    info!(task = %task.name, member = %member.id, into = %name, "member split");
+    state.broadcast(Event::TaskUpdated { task: rest.clone() });
+    state.broadcast(Event::TaskCreated {
+        task: created.clone(),
+    });
+    let moved = vec![member.id.clone()];
+    state.agents_moved(&moved);
+    state.ensure_moved_dirs(&[&created]);
+
+    let mut changes = vec![(
+        member.id.clone(),
+        crate::peers::split_away(&label, &task.name, &name),
+    )];
+    for m in &rest.members {
+        changes.push((
+            m.id.clone(),
+            crate::peers::split_off(&label, &member.id, &name),
+        ));
+    }
+    let notified = state.note_peer_changes(changes);
+    Response::Moved {
+        tasks: vec![created, rest],
+        moved,
+        previous,
+        notified,
+    }
+}
+
+impl DaemonState {
+    /// The member `target` names (see `Ledger::resolve`), its task, and the
+    /// name of the task it would be split into; else why it cannot be.
+    fn split_plan(
+        &self,
+        target: &str,
+        name: Option<&str>,
+    ) -> Result<(TaskInfo, tam_proto::MemberInfo, String), String> {
+        // Plain `resolve`, as for a drop. `tam split` sends the member id it
+        // resolved as `tam run` does (from an agent, a peer's short name too).
+        let (task, member) = self
+            .ledger
+            .resolve(target)
+            .map_err(|e| format!("cannot split '{target}': {e:#}"))?;
+        let label = task.member_label(&member);
+        let refuse = |why: String| Err(format!("cannot split '{label}': {why}"));
+        if self.dropping.contains(&task.name) {
+            return refuse(format!("task '{}' is being dropped", task.name));
+        }
+        if task.members.len() < 2 {
+            return refuse(format!(
+                "it is the only member of task '{}': there is nothing to split it from",
+                task.name
+            ));
+        }
+        let name = match name {
+            Some(name) if name.trim().is_empty() => return refuse("a task needs a name".into()),
+            Some(name) => name.to_string(),
+            None => member.branch.clone(),
+        };
+        if self.ledger.task(&name).is_some() {
+            return refuse(match name == member.branch {
+                true => format!("task '{name}' (its branch) already exists: name the new task"),
+                false => format!("task '{name}' already exists"),
+            });
+        }
+        Ok((task, member, name))
     }
 }

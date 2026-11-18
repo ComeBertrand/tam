@@ -552,6 +552,58 @@ impl Client {
     }
 }
 
+/// Members moved between tasks (`tam merge`, `tam split`).
+pub struct Moved {
+    /// The tasks involved, as they are now: the merged task; the new task,
+    /// then the one it was split from.
+    pub tasks: Vec<TaskInfo>,
+    /// Ids of the members that moved.
+    pub moved: Vec<String>,
+    /// The label each member of `tasks` had before, by member id.
+    pub previous: std::collections::BTreeMap<String, String>,
+    /// Members whose running agents are told at their next prompt or tool
+    /// call.
+    pub notified: Vec<String>,
+}
+
+impl Client {
+    /// Merge tasks `from` into task `into` (see `Request::MergeTasks`).
+    pub async fn merge_tasks(&mut self, into: &str, from: &[String]) -> Result<Moved> {
+        let request = Request::MergeTasks {
+            into: into.into(),
+            from: from.to_vec(),
+        };
+        moved("MergeTasks", self.send(request).await?)
+    }
+
+    /// Split member `member` (a member id, `<task>/<member>`) out of its
+    /// task into a new task: `name`, else its branch.
+    pub async fn split_member(&mut self, member: &str, name: Option<&str>) -> Result<Moved> {
+        let request = Request::SplitMember {
+            member: member.into(),
+            name: name.map(str::to_string),
+        };
+        moved("SplitMember", self.send(request).await?)
+    }
+}
+
+fn moved(request: &str, response: Response) -> Result<Moved> {
+    match response {
+        Response::Moved {
+            tasks,
+            moved,
+            previous,
+            notified,
+        } => Ok(Moved {
+            tasks,
+            moved,
+            previous,
+            notified,
+        }),
+        other => Err(unexpected(request, other)),
+    }
+}
+
 /// Turn a daemon error (or an unexpected reply) into an error.
 fn unexpected(request: &str, response: Response) -> anyhow::Error {
     match response {

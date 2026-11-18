@@ -27,7 +27,7 @@ adopt). `tam-cli` depends on all three.
   `<repo>-<branch>`, assigned in join order, never containing `/`) are derived
   when the ledger is folded, not stored. Agents store only their member id;
   `AgentInfo.task` is looked up when asked, so moving a member to another task
-  (a future merge) is one ledger event. Names typed by users (task, `task/member`,
+  (merge, split) is one ledger event. Names typed by users (task, `task/member`,
   member id, or the cwd) are resolved by the daemon: `Ledger::resolve` /
   `member_at`, request `ResolveMember`.
 - **Task status is always derived** — computed from agent state + the
@@ -333,9 +333,44 @@ adopt). `tam-cli` depends on all three.
   unless `-p`; a typed path that exists is made absolute. Every member gets
   the same start prompt: its own part comes from the note (its repo, its
   peers) and the brief, or `tam msg`. Merging tasks (#27): the target keeps
-  its brief; the source's directory should move to the target's
-  `scratch/from-<source>/`, a differing reference written there and
-  reported, nothing deleted.
+  its brief; the sources' references go with them, their directories stay
+  in `tasks/` (see Merge and split). Still open: moving a source's
+  directory to the target's `scratch/from-<source>/`, a differing reference
+  written there and reported, nothing deleted.
+- **Merge and split** — `MergeTasks { into, from }` (`tam merge INTO FROM...`)
+  and `SplitMember { member, name }` (`tam split TASK/MEMBER [NAME]`, by default
+  named after the member's branch) move members between tasks: one ledger
+  append (`Ledger::merge_tasks`: a `MemberMoved` per member of each `from` task,
+  then its `TaskDropped`; `Ledger::split_member`: `TaskCreated`, `MemberMoved`),
+  no git, agents keep running. A moved member joins last: no member already in
+  the task is renamed. Compaction must fold a member whose first task is gone:
+  `State::move_member` rewrites its kept `MemberAdded` to name its current task,
+  keeps only its latest `MemberMoved` (a move into its own task, as a compacted
+  ledger has, puts it last again: join order, so short names), and lowers the
+  order of the target's `TaskCreated` to the member's `MemberAdded` (task events
+  sort first at equal order). The handlers (end of `daemon.rs`) refuse an
+  unknown task, a task in `dropping` (at once, then again under the worktree
+  lock, taken so that a creation or drop under way ends first), a task's only
+  member, a taken or empty name. Events: the source's `TaskDropped` (split: its
+  `TaskUpdated`), the target's `TaskUpdated` (`TaskCreated`), then `AgentUpdated`
+  for each moved running agent (clients rebuild a member new to a task without
+  its agent). Reply `Moved` (tasks, moved ids, labels before, members told; JSON
+  `schema::Moved`). Running Claude agents of the members involved are told
+  without being woken: `DaemonState::peer_changes` keeps what changed
+  (`peers::merged_in`, `merged_away`, `split_away`, `split_off`), and their next
+  `UserPromptSubmit` or `PostToolUse` (not a subagent's: payload `agent_id`) gets
+  `HookContext` with it and `peers::session_note` (`peers::change_note`); a
+  `SessionStart` or the agent's exit forgets it. Codex and generic agents are not
+  told. Names through a merged task stop resolving; member ids do not. Briefs
+  (#25): the target keeps its brief, a source's `BriefSet` goes with its task,
+  and a task split off starts with the local brief. The sources' directories
+  stay in `tasks/` (a later task of that name moves one aside: `brief::ensure`).
+  The target's or new task's directory is made at once (`ensure_moved_dirs`):
+  the note names it. A moved Claude agent keeps what its spawn granted (task
+  directory, readable worktrees: `Agent::readable`, which `change_note` passes
+  on, so the note says which peers it can read) until its next start. A drop
+  of one member checks under its claim that the member is still in the task it
+  claimed.
 
 ## Build & check
 
@@ -349,12 +384,16 @@ cargo test
 
 - Unit tests are inline in each module (~340 across all crates)
 - Integration tests in `crates/tam-daemon/tests/` (~60 async tests, real
-  sockets/PTYs/git repos) and `crates/tam-cli/tests/` (`tam hook-notify`
+  sockets/PTYs/git repos; `merge.rs`: merge/split replies, events and what
+  fake Claude agents are told at their next prompt or tool call) and `crates/tam-cli/tests/` (`tam hook-notify`
   against a daemon, session resume with a fake `claude`; one test per file:
   they set process environment; `tam msg`/`inbox-wait`/`history` against a
   daemon, child processes with temp XDG dirs and no
   `TAM_AGENT_ID`/`TAM_SOCKET`; `tam peers` and the start note on real git
   worktrees, with a fake `claude` and an `sh` agent running `tam peers`;
+  `merge_split.rs`: `tam merge`/`tam split` text, `--json` and exit statuses;
+  `merge_note.rs`: after a merge, the real `tam hook-notify` prints the note
+  once, at the next tool call or prompt;
   `noninteractive.rs`:
   new/wait/result/ps --json with no terminal and a fake `claude`;
   `exit_status.rs`: exit statuses and a closed stdout; `brief.rs`: `tam new

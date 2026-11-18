@@ -76,6 +76,7 @@ tam
 - **Desktop notifications** — configurable alerts when agents need input or hit permission prompts
 - **Messages** — `tam msg` sends a message to a running session without attaching, from you or from another agent, and can wait for the reply
 - **Peers** — an agent knows the other members of its task (their names, repositories and worktrees) and reaches them with `tam msg`; `tam peers` shows what their agents are doing
+- **Merge and split** — `tam merge` makes tasks started separately one task, so their running agents become peers; `tam split` moves a member back out. Nothing stops or moves on disk
 - **Custom TUI commands** — bind keys to shell commands (open editor, run tests, etc.)
 
 ## Commands
@@ -112,6 +113,9 @@ tam adopt PATH -n NAME         ... named NAME (default: its branch)
 tam adopt PATH --join TASK     ... or a new member of an existing task
 tam repair NAME                Recreate a worktree deleted outside tam
 
+tam merge INTO FROM...         Move the members of tasks FROM into task INTO (FROM tasks go)
+tam split TASK/MEMBER [NAME]   Move one member out into a task of its own (default: its branch)
+
 NAME is a task name, or TASK/MEMBER for one member of the task.
 ```
 
@@ -122,6 +126,8 @@ The daemon checks every task's worktree against git (`git worktree list`) when i
 `tam new` names a repository by a path to it (or to any directory in it), or by its project name as `tam ls` and `tam pick` show it (e.g. `api`, or `mnemo (work)` when two projects share a name). It is all or nothing: every repository is checked first (branch free, worktree directory free, `-s REF` present), and if a worktree still cannot be created, the ones created before it are removed again, with the branches created for them. What cannot be removed without losing work is kept, and the error says where. With several repositories, `tam new` starts an agent in each (`-p`: each gets the prompt) and attaches to the first one's (with `-d`, or without a terminal, it attaches to none and prints how to); `tam run`, `tam attach` and the preview act on one member (`NAME/REPO`); `tam stop` and `tam drop` act on the whole task, or on one member given as `NAME/REPO`. Git runs in the environment of the `tam` command that asked (checkout hooks and filters such as git-lfs see your `PATH`), for `tam repair` too.
 
 `tam adopt` takes over a worktree made by hand (`git worktree add`), from the worktree or any directory in it: it must be a linked worktree (not the main checkout) on a branch. From then on it is a task like any other: `tam drop` removes it.
+
+`tam merge` and `tam split` change which task a member belongs to, and nothing else: worktrees, branches, sessions, run history, messages and running agents stay as they are. Started as two tasks, a backend and a frontend become one with `tam merge backend frontend`: the members of `frontend` join `backend` after its own, and `frontend` is gone. A member keeps its short name (its repository) unless the task has one by that name already; it is then `<repo>-<branch>`. Names through a task merged away (`frontend`, `frontend/web`) no longer resolve; member ids still do. `tam split backend/web` is the inverse: the member goes to a new task named after its branch, or NAME when a task has that name already. The only member of a task cannot be split out of it. Neither runs while one of the tasks is being dropped. Running Claude agents of the members involved learn of it at their next prompt or tool call: what changed, then their task and peers as they are now (an idle agent is not woken for it). Other agents are not told; `tam peers` shows their peers. The merged task keeps its brief (see Brief), and a task split off starts with the local `brief.md`; the directories of the tasks merged away stay in `~/.local/share/tam/tasks/`.
 
 ### Observing
 
@@ -150,7 +156,7 @@ tam peers --all                ...of every task (--json: machine-readable)
 
 A Claude agent gets a message right away: when idle it wakes up, when busy it reads it at its next step (after a pending permission prompt is answered). Other agents get it typed in once idle. A member with no running agent gets it when its next agent starts. Sent from inside an agent TAM started, a message comes from that agent, which the recipient can answer with `tam msg`; otherwise it comes from you. The reply `--wait` prints is the recipient's next message back, or its response at the end of the turn that got the message. Two agents answering each other are stopped after 6 messages, until you prompt one of them; an agent sends at most 20 messages per 10 minutes.
 
-An agent TAM starts knows its task. A Claude agent is told when its session starts (again on resume, `/clear` and compaction): its task, its name, the other members with their repositories and worktrees, and the task's brief and scratch directory (see Brief), so a backend and a frontend session can agree on an API without you relaying. Other agents have their member id in `$TAM_AGENT_ID` and can run `tam peers`. From an agent, `tam msg`, `tam run`, `tam stop` and `tam attach` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
+An agent TAM starts knows its task. A Claude agent is told when its session starts (again on resume, `/clear` and compaction): its task, its name, the other members with their repositories and worktrees, and the task's brief and scratch directory (see Brief), so a backend and a frontend session can agree on an API without you relaying. After `tam merge` or `tam split` changed its task, it is told again at its next prompt or tool call. Other agents have their member id in `$TAM_AGENT_ID` and can run `tam peers`. From an agent, `tam msg`, `tam run`, `tam stop`, `tam attach` and `tam split` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
 
 ### Brief
 
@@ -177,6 +183,8 @@ tam wait NAME                  Wait until the task's agents stop working; print 
 tam wait NAME -u input -t 30m  ... until they wait for input, for at most 30 minutes
 tam result NAME                Print the last response of the task's agents
 tam ps --json                  Every task, as JSON
+tam merge INTO FROM --json     Merge tasks; print who moved where
+tam split TASK/MEMBER --json   Split a member out; print who moved where
 ```
 
 `tam new` and `tam run` attach only when stdin and stdout are terminals: otherwise they start the agent and say so. `tam wait` returns once each agent is in one of the `--until` states, comma-separated: `working`, `blocked`, `input`, `idle`, `question`, `error`, `exit` (no agent runs). The default is any state but `working`. `input` takes in `idle`, since agents without hooks never report `input`. It gives up at once when an agent exits or its turn fails, unless `--until` takes `exit` or `error`. `tam result` prints the response that ended the agent's last turn, in full; it is still there once the agent exited, or the daemon restarted. There is none while a turn runs, before the first turn of a run ends, after a failed or interrupted turn, and for agents other than Claude. For `wait` and `result`, NAME is a task (all its members), TASK/MEMBER or a member id. Both report what they find: right after `tam msg`, an agent that has not picked the message up yet is still `input`, with its previous response. `tam msg --wait` waits for the reply instead, and `response_at` tells when a response came.
@@ -186,7 +194,7 @@ Claude asks whether to trust a folder it does not know yet, and runs no hook unt
 | Exit status | Meaning | `error.kind` |
 |---|---|---|
 | 0 | Done | |
-| 1 | Failed; `tam wait` gave up; `tam result` has no response | `failed`, `unreachable`, `no_result` |
+| 1 | Failed; `tam wait` gave up; `tam result` has no response; a merge or split refused | `failed`, `unreachable`, `no_result` |
 | 2 | Invalid arguments (reported as text by the argument parser) | |
 | 3 | No such task or member, or a task name where one member is needed | `not_found` |
 | 4 | `tam wait` timed out | `timeout` |
@@ -303,6 +311,45 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
       "turn_error": null,
       "response": "Fixed the bug: …",
       "response_at": 1763400000
+    }
+  ],
+  "error": null
+}
+```
+
+`tam merge --json` and `tam split --json`: `task` is the merged task, or the new one; `from` the tasks merged into it (gone now), or the task split from. `members` are the merged task's members, or the member split out followed by those left in its task. `previous_label` is how a member was named before (names that went with it no longer resolve), `moved` whether it changed task, `agent` its running agent (it keeps running), `notified` whether that agent is told at its next prompt or tool call.
+
+```json
+{
+  "schema_version": 1,
+  "task": "backend",
+  "from": ["frontend"],
+  "members": [
+    {
+      "id": "m-1a2b3c4d",
+      "task": "backend",
+      "name": "api",
+      "label": "backend/api",
+      "previous_label": "backend",
+      "moved": false,
+      "repo": "api",
+      "branch": "backend",
+      "dir": "/home/me/worktrees/api--backend",
+      "agent": "claude",
+      "notified": true
+    },
+    {
+      "id": "m-5e6f7a8b",
+      "task": "backend",
+      "name": "web",
+      "label": "backend/web",
+      "previous_label": "frontend",
+      "moved": true,
+      "repo": "web",
+      "branch": "frontend",
+      "dir": "/home/me/worktrees/web--frontend",
+      "agent": null,
+      "notified": false
     }
   ],
   "error": null

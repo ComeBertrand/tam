@@ -11,6 +11,7 @@ use crate::task::{Member, Task};
 
 use ratatui::layout::Rect;
 
+use super::answer::AnswerDialog;
 use super::branch::{self, BranchState, Observation};
 use super::fuzzy::fuzzy;
 use super::input::TextInput;
@@ -62,6 +63,17 @@ pub enum Mode {
     },
     /// The keys, custom commands included; any key closes it.
     Help,
+    /// The request a member's agent waits on, to answer (`a`).
+    Answer(AnswerDialog),
+    /// A message to a member's agent (`m`), sent as `tam msg` sends it.
+    Message {
+        /// The member's id, and how to name it.
+        member: String,
+        label: String,
+        /// How the message reaches the agent, said under the text.
+        how: String,
+        text: TextInput,
+    },
 }
 
 /// How the task list is ordered.
@@ -501,6 +513,20 @@ impl App {
             }
         }
         self.clamp_selection();
+    }
+
+    /// The answer dialog's request is no longer the one its agent waits on
+    /// (answered or changed meanwhile, or the agent is gone): it can take
+    /// no answer.
+    pub fn answer_stale(&self) -> bool {
+        let Mode::Answer(dialog) = &self.mode else {
+            return false;
+        };
+        let current = self
+            .find_member(&dialog.agent)
+            .and_then(|(_, m)| m.agent_info.as_ref())
+            .and_then(|a| a.detail.ask.as_ref());
+        current.is_none_or(|ask| ask.id != dialog.ask.id)
     }
 
     /// The member an agent runs for (agent ids are member ids).

@@ -6,7 +6,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use tam_proto::{AgentInfo, AgentState, MemberHealth, MessageInfo, RunInfo};
+use tam_proto::{AgentInfo, AgentState, Ask, AskKind, MemberHealth, MessageInfo, RunInfo};
 
 use crate::task::{Member, Task, TaskStatus};
 
@@ -183,12 +183,19 @@ fn agent_lines(
     let dim = Style::new().fg(Color::DarkGray);
     let strong = Style::new().add_modifier(Modifier::BOLD);
     let mut body = Vec::new();
+    let waiting = matches!(agent.state, AgentState::Blocked | AgentState::Question);
+    // A request it still waits on while its state says otherwise (a
+    // parallel tool call ended meanwhile): what to answer comes first.
+    if let Some(ask) = detail.ask.as_ref().filter(|_| !waiting) {
+        ask_lines(ask, &mut body);
+    }
     let about = match agent.state {
         AgentState::Blocked => {
             let pending = detail.pending.as_ref();
-            match pending.filter(|p| !p.summary.is_empty()) {
-                Some(p) => body.push((p.summary.clone(), strong)),
-                None => body.push(("(the request is on its screen)".into(), dim)),
+            match (&detail.ask, pending.filter(|p| !p.summary.is_empty())) {
+                (Some(ask), _) => ask_lines(ask, &mut body),
+                (None, Some(p)) => body.push((p.summary.clone(), strong)),
+                (None, None) => body.push(("(the request is on its screen)".into(), dim)),
             }
             Some(match pending.and_then(|p| p.tool.as_deref()) {
                 Some("ExitPlanMode") => "plan to approve".into(),
@@ -197,9 +204,13 @@ fn agent_lines(
             })
         }
         AgentState::Question => {
-            match detail.pending.as_ref().filter(|p| !p.summary.is_empty()) {
-                Some(p) => body.push((p.summary.clone(), strong)),
-                None => body.push(("(the question is on its screen)".into(), dim)),
+            match (
+                &detail.ask,
+                detail.pending.as_ref().filter(|p| !p.summary.is_empty()),
+            ) {
+                (Some(ask), _) => ask_lines(ask, &mut body),
+                (None, Some(p)) => body.push((p.summary.clone(), strong)),
+                (None, None) => body.push(("(the question is on its screen)".into(), dim)),
             }
             None
         }
@@ -216,13 +227,26 @@ fn agent_lines(
             }
             None => "waiting for a prompt".into(),
         }),
-        AgentState::Working | AgentState::Idle => None,
+        AgentState::Working | AgentState::Idle => detail
+            .ask
+            .as_ref()
+            .map(|ask| format!("waits on a permission for {}", ask.tool)),
     };
     if let Some(about) = about {
         spans.push(Span::raw(" · "));
         spans.push(Span::raw(about));
     }
     spans.push(Span::styled(format!("  ({})", agent.provider), dim));
+    // How to answer what it waits on: here, or in its terminal.
+    match &detail.ask {
+        Some(_) => spans.extend([
+            Span::raw("  "),
+            Span::styled("a", strong),
+            Span::styled(": answer", dim),
+        ]),
+        None if waiting => spans.push(Span::styled("  answer in its terminal (enter)", dim)),
+        None => {}
+    }
     if let Some(denied) = &detail.denied {
         let mut text = format!("auto mode refused {}", denied.tool);
         if let Some(summary) = &denied.summary {
@@ -234,6 +258,47 @@ fn agent_lines(
         body.push((text, Style::new().fg(Color::Yellow)));
     }
     (Line::from(spans), body)
+}
+
+/// The request an agent waits on, in full, as body rows: the tool's input,
+/// the plan, or the questions with their options (`a` answers it).
+fn ask_lines(ask: &Ask, body: &mut Vec<(String, Style)>) {
+    let dim = Style::new().fg(Color::DarkGray);
+    let strong = Style::new().add_modifier(Modifier::BOLD);
+    let cut = |body: &mut Vec<(String, Style)>, cut: bool| {
+        if cut {
+            body.push(("(cut: its terminal shows the rest)".into(), dim));
+        }
+    };
+    match &ask.kind {
+        AskKind::Permission { input, cut: c } => {
+            body.extend(input.lines().map(|l| (l.to_string(), strong)));
+            cut(body, *c);
+        }
+        AskKind::Plan { plan, cut: c } => {
+            body.extend(plan.lines().map(|l| (l.to_string(), Style::new())));
+            cut(body, *c);
+        }
+        AskKind::Questions { questions } => {
+            for q in questions {
+                let several = if q.multi_select {
+                    " (several answers)"
+                } else {
+                    ""
+                };
+                body.push((format!("{}{several}", q.question), strong));
+                for (i, option) in q.options.iter().enumerate() {
+                    let text = match &option.description {
+                        Some(d) if *d != option.label => {
+                            format!("{}. {} — {d}", i + 1, option.label)
+                        }
+                        _ => format!("{}. {}", i + 1, option.label),
+                    };
+                    body.push((text, Style::new()));
+                }
+            }
+        }
+    }
 }
 
 /// Headline and body of a member without an agent: its last run, or what
@@ -398,7 +463,7 @@ pub fn age(secs: u64) -> String {
 
 /// Control characters (from an agent's text) as spaces: a terminal would
 /// act on them.
-fn clean(text: &str) -> String {
+pub(super) fn clean(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
         .collect()
@@ -410,7 +475,7 @@ pub(super) fn one_line(text: &str) -> String {
 }
 
 /// Columns `text` takes on a terminal.
-fn width_of(text: &str) -> usize {
+pub(super) fn width_of(text: &str) -> usize {
     Span::raw(text).width()
 }
 

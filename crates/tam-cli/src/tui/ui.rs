@@ -12,7 +12,7 @@ use crate::task::TaskStatus;
 use super::app::{App, MemberChoice, Mode, Order, PaneTab, PickerState};
 use super::input::TextInput;
 use super::peek::{Peek, ScreenView};
-use super::{fuzzy, table, triage};
+use super::{answer, fuzzy, table, triage};
 
 /// The task list's narrowest and widest beside the pane.
 const LIST_MIN: u16 = 50;
@@ -56,8 +56,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Mode::NewTaskPickProject(picker) => Some(render_picker_popup(frame, picker)),
         _ => None,
     };
+    let stale = app.answer_stale();
+    if let Mode::Answer(dialog) = &mut app.mode {
+        answer::render(frame, dialog, stale);
+    }
     match &app.mode {
-        Mode::Normal | Mode::NewTaskPickProject(_) => {}
+        Mode::Normal | Mode::NewTaskPickProject(_) | Mode::Answer(_) => {}
+        Mode::Message {
+            label, how, text, ..
+        } => render_message_popup(frame, label, how, text),
         Mode::Help => render_help_popup(frame, app),
         Mode::NewTaskEnterName { name, project_dirs } => {
             let joins = app.tasks.iter().any(|t| t.name == name.value());
@@ -246,6 +253,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(" any", Style::new().bold()),
                 Span::raw(":close"),
             ],
+            Mode::Answer(ref dialog) => {
+                let mut hints = vec![Span::raw(" ")];
+                for (key, what) in dialog.hints(app.answer_stale()) {
+                    hints.push(Span::styled(key, Style::new().bold()));
+                    hints.push(Span::raw(format!(":{what}  ")));
+                }
+                hints
+            }
+            Mode::Message { .. } => vec![
+                Span::styled(" enter", Style::new().bold()),
+                Span::raw(":send  "),
+                Span::styled("esc", Style::new().bold()),
+                Span::raw(":cancel"),
+            ],
             Mode::ConfirmRepairOrDrop {
                 repairable,
                 in_place,
@@ -302,13 +323,23 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
     let has_agent = app
         .focused_member()
         .is_some_and(|(_, m)| m.agent_info.is_some());
+    let asks = app
+        .focused_member()
+        .and_then(|(_, m)| m.agent_info.as_ref())
+        .is_some_and(|a| a.detail.ask.is_some());
     let mut hints = Vec::new();
+    if asks {
+        hints.push(("a", "answer".into(), 0));
+    }
     if has_agent {
         hints.push(("enter", "attach".into(), 0));
         hints.push(("s", "stop".into(), 1));
     } else if selected.is_some() {
         hints.push(("r", "run".into(), 0));
         hints.push(("R", "new session".into(), 2));
+    }
+    if selected.is_some() {
+        hints.push(("m", "message".into(), 2));
     }
     if let Some(peek) = &app.peek {
         if selected.is_some_and(|t| t.members.len() > 1) {
@@ -648,6 +679,35 @@ fn render_new_task_popup(
     frame.render_widget(where_line, where_row);
 }
 
+/// A message to a member's agent: the text, and how it reaches the agent.
+fn render_message_popup(frame: &mut Frame, label: &str, how: &str, text: &TextInput) {
+    // 2 content rows + 2 border + 2 vertical padding = 6
+    let width = (Span::raw(how).width() as u16 + 8).clamp(60, 90);
+    let area = frame
+        .area()
+        .centered(Constraint::Length(width), Constraint::Length(6));
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(" Message to {label} "))
+        .title_style(Style::new().bold().fg(Color::Cyan))
+        .padding(Padding::new(2, 2, 1, 1));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [text_row, how_row] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let [prompt, input] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(text_row);
+    frame.render_widget(Span::styled("> ", Style::new().fg(Color::Cyan)), prompt);
+    text.render(frame, input, Style::new(), true);
+    frame.render_widget(Line::from(how).fg(Color::DarkGray), how_row);
+}
+
 fn render_enter_path_popup(frame: &mut Frame, path: &TextInput) {
     // 1 content row + 2 border + 2 vertical padding = 5
     let area = frame
@@ -685,6 +745,8 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
                 entry("r", "run, resuming"),
                 entry("R", "run, new session"),
                 entry("s", "stop the agent"),
+                entry("a", "answer what it asks"),
+                entry("m", "message its agent"),
                 entry("d", "drop (or recreate)"),
                 entry("n", "new task"),
             ],
@@ -1054,7 +1116,8 @@ pub fn shorten_home(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tam_proto::{AgentError, DeniedTool, Pending};
+    use crate::tui::answer::{AnswerDialog, Step};
+    use tam_proto::{AgentError, Ask, AskKind, AskOption, AskQuestion, DeniedTool, Pending};
 
     fn text(state: AgentState, d: &AgentDetail) -> Option<String> {
         agent_detail_line(state, d).map(|(t, _)| t)
@@ -1441,6 +1504,303 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("tab:triage"), "{s}");
+    }
+
+    /// Blocked on `ask`, which the dashboard can answer.
+    fn asking(ask: Ask) -> AgentDetail {
+        AgentDetail {
+            pending: Some(Pending {
+                tool: Some(ask.tool.clone()),
+                summary: "(summary)".into(),
+            }),
+            ask: Some(ask),
+            ..Default::default()
+        }
+    }
+
+    fn bash(input: &str) -> Ask {
+        Ask {
+            id: "ask-1".into(),
+            tool: "Bash".into(),
+            kind: AskKind::Permission {
+                input: input.into(),
+                cut: false,
+            },
+        }
+    }
+
+    fn colors_and_size() -> Ask {
+        let option = |label: &str, description: Option<&str>| AskOption {
+            label: label.into(),
+            description: description.map(str::to_string),
+        };
+        Ask {
+            id: "ask-2".into(),
+            tool: "AskUserQuestion".into(),
+            kind: AskKind::Questions {
+                questions: vec![
+                    AskQuestion {
+                        question: "Which colors?".into(),
+                        header: Some("Colors".into()),
+                        options: vec![option("Red", Some("warm")), option("Blue", None)],
+                        multi_select: true,
+                    },
+                    AskQuestion {
+                        question: "Which size?".into(),
+                        header: Some("Size".into()),
+                        options: vec![option("Small", Some("Small")), option("Large", None)],
+                        multi_select: false,
+                    },
+                ],
+            },
+        }
+    }
+
+    /// The dashboard with the answer dialog open on `ask`, as drawn.
+    fn answering(state: AgentState, ask: Ask) -> App {
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", state, 30, asking(ask.clone()))],
+        );
+        app.mode = Mode::Answer(AnswerDialog::new("m-1".into(), "feat".into(), ask));
+        app
+    }
+
+    fn dialog(app: &mut App) -> &mut AnswerDialog {
+        match &mut app.mode {
+            Mode::Answer(dialog) => dialog,
+            _ => panic!("no answer dialog"),
+        }
+    }
+
+    #[test]
+    fn triage_shows_the_whole_request_and_how_to_answer_it() {
+        let input = "command: cargo test --workspace\ndescription: Run the tests";
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in(
+                "m-1",
+                AgentState::Blocked,
+                30,
+                asking(bash(input)),
+            )],
+        );
+        let s = screen(&mut app, 100, 34);
+        show("triage, answerable", &s);
+        assert!(
+            s.contains("│▲ blocked for 30s · permission for Bash  (claude)  a: answer"),
+            "{s}"
+        );
+        assert!(s.contains("│  command: cargo test --workspace"), "{s}");
+        assert!(s.contains("│  description: Run the tests"), "{s}");
+        assert!(s.contains(" a:answer "), "{s}");
+
+        // Questions: each with its options.
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in(
+                "m-1",
+                AgentState::Question,
+                30,
+                asking(colors_and_size()),
+            )],
+        );
+        let s = screen(&mut app, 100, 34);
+        assert!(s.contains("│  Which colors? (several answers)"), "{s}");
+        assert!(s.contains("│  1. Red — warm"), "{s}");
+        assert!(s.contains("│  2. Large"), "{s}");
+        // A description that only repeats its label is left out.
+        assert!(
+            s.contains("│  1. Small\n") || s.contains("│  1. Small "),
+            "{s}"
+        );
+        assert!(!s.contains("Small — Small"), "{s}");
+
+        // Still waiting while a parallel tool call ended (state working).
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", AgentState::Working, 3, asking(bash(input)))],
+        );
+        let s = screen(&mut app, 100, 34);
+        assert!(
+            s.contains("│● working for 3s · waits on a permission for Bash  (claude)  a: answer"),
+            "{s}"
+        );
+        assert!(s.contains("│  command: cargo test --workspace"), "{s}");
+
+        // Nothing the dashboard can answer (its hook is gone): the terminal.
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in("m-1", AgentState::Blocked, 30, blocked())],
+        );
+        let s = screen(&mut app, 100, 34);
+        assert!(
+            s.contains("(claude)  answer in its terminal (enter)"),
+            "{s}"
+        );
+        assert!(!s.contains("a:answer"), "{s}");
+    }
+
+    #[test]
+    fn the_answer_dialog_shows_the_request_and_when_it_is_too_late() {
+        let input = "command: rm -rf build\ndescription: Clean";
+        let mut app = answering(AgentState::Blocked, bash(input));
+        let s = screen(&mut app, 100, 30);
+        show("answer: permission", &s);
+        assert!(s.contains("╭ Answer feat ─"), "{s}");
+        assert!(s.contains("│  Allow Bash to run with this input?"), "{s}");
+        assert!(s.contains("│  command: rm -rf build"), "{s}");
+        assert!(s.contains("│  description: Clean"), "{s}");
+        assert!(s.contains("│  y allow once · n say no · esc cancel"), "{s}");
+        assert!(s.contains(" y:allow once  n:say no"), "{s}");
+        assert!(dialog(&mut app).shown);
+
+        // Saying no: the reason being typed, at the cursor.
+        dialog(&mut app).step = Step::Reason(TextInput::from("use make clean"));
+        let (s, cursor) = screen_and_cursor(&mut app, 100, 30);
+        show("answer: reason", &s);
+        assert!(
+            s.contains("│  Why not? Optional: the agent reads it"),
+            "{s}"
+        );
+        assert!(s.contains("│  > use make clean"), "{s}");
+        assert!(s.contains(" enter:send the no  esc:back"), "{s}");
+        let (x, y) = cursor.expect("the cursor where one types");
+        let row = s.lines().nth(y as usize).unwrap();
+        let typed = "> use make clean";
+        let start = row.find(typed).expect("the cursor on the reason's row");
+        assert_eq!(x as usize, row[..start].chars().count() + typed.len());
+
+        // The request is answered in the terminal meanwhile: nothing will
+        // be sent.
+        let mut info = app
+            .find_member("m-1")
+            .unwrap()
+            .1
+            .agent_info
+            .clone()
+            .unwrap();
+        info.detail.ask = None;
+        app.update_agent(info);
+        let s = screen(&mut app, 100, 30);
+        show("answer: too late", &s);
+        assert!(
+            s.contains("│  Answered or changed meanwhile: nothing will be sent."),
+            "{s}"
+        );
+        assert!(s.contains(" any:close"), "{s}");
+    }
+
+    #[test]
+    fn a_request_too_long_to_show_can_only_be_said_no_to() {
+        let ask = Ask {
+            kind: AskKind::Permission {
+                input: "content: …".into(),
+                cut: true,
+            },
+            ..bash("")
+        };
+        let mut app = answering(AgentState::Blocked, ask);
+        let s = screen(&mut app, 100, 30);
+        show("answer: cut", &s);
+        assert!(
+            s.contains("│  (cut here: its terminal shows the rest)"),
+            "{s}"
+        );
+        assert!(
+            s.contains("│  Too long to show in full: allow it in its terminal (enter attaches)."),
+            "{s}"
+        );
+        assert!(s.contains("│  n say no · esc cancel"), "{s}");
+        assert!(!s.contains("allow once"), "{s}");
+    }
+
+    #[test]
+    fn a_long_plan_scrolls_in_the_dialog() {
+        let plan: String = (1..=60).map(|i| format!("{i}. step {i}\n")).collect();
+        let ask = Ask {
+            id: "ask-3".into(),
+            tool: "ExitPlanMode".into(),
+            kind: AskKind::Plan { plan, cut: false },
+        };
+        let mut app = answering(AgentState::Blocked, ask);
+        let s = screen(&mut app, 100, 30);
+        show("answer: plan", &s);
+        assert!(s.contains("│  Approve this plan?"), "{s}");
+        assert!(s.contains("leaves plan mode; edits keep asking"), "{s}");
+        assert!(s.contains("│  1. step 1 "), "{s}");
+        assert!(!s.contains("step 60"), "{s}");
+        assert!(s.contains("│  y approve · n say no · esc cancel"), "{s}");
+        assert!(s.contains(" rows 1–21 of 60 "), "{s}");
+        // To the end: the last step, and the plan is cut.
+        dialog(&mut app).scroll = usize::MAX;
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("│  60. step 60"), "{s}");
+        assert!(s.contains(" rows 40–60 of 60 "), "{s}");
+    }
+
+    #[test]
+    fn the_question_dialog_ticks_options_and_reviews_the_answers() {
+        let mut app = answering(AgentState::Question, colors_and_size());
+        let s = screen(&mut app, 100, 30);
+        show("answer: questions", &s);
+        assert!(s.contains("│  Colors │ Size │ Send"), "{s}");
+        assert!(s.contains("│  Which colors?"), "{s}");
+        assert!(s.contains("│  Several answers can be ticked."), "{s}");
+        assert!(s.contains("│  ❯ 1. [ ] Red"), "{s}");
+        assert!(s.contains("│           warm"), "{s}");
+        assert!(s.contains("│    2. [ ] Blue"), "{s}");
+        assert!(s.contains("│    3. Type an answer"), "{s}");
+        assert!(
+            s.contains("space tick · enter done · ←/→ question · esc cancel"),
+            "{s}"
+        );
+
+        let Step::Questions(q) = &mut dialog(&mut app).step else {
+            panic!()
+        };
+        q.answers[0].chosen = vec!["Red".into()];
+        q.answers[0].other = Some("Teal".into());
+        q.answers[1].chosen = vec!["Large".into()];
+        q.current = 2;
+        let s = screen(&mut app, 100, 30);
+        show("answer: review", &s);
+        assert!(s.contains("│  ✓ Colors │ ✓ Size │ Send"), "{s}");
+        assert!(s.contains("│  Send these answers?"), "{s}");
+        assert!(s.contains("│    → Red, Teal"), "{s}");
+        assert!(s.contains("│    → Large"), "{s}");
+    }
+
+    #[test]
+    fn the_message_prompt_says_how_the_message_goes() {
+        let mut app = triage_app(
+            vec![member_info("m-1", "app")],
+            vec![agent_in(
+                "m-1",
+                AgentState::Input,
+                30,
+                AgentDetail::default(),
+            )],
+        );
+        app.mode = Mode::Message {
+            member: "m-1".into(),
+            label: "feat".into(),
+            how: "Claude reads it at its next step, at once when idle.".into(),
+            text: TextInput::from("also run clippy"),
+        };
+        let s = screen(&mut app, 100, 30);
+        show("message", &s);
+        assert!(s.contains("╭ Message to feat ─"), "{s}");
+        assert!(s.contains("│  > also run clippy"), "{s}");
+        assert!(
+            s.contains("│  Claude reads it at its next step, at once when idle."),
+            "{s}"
+        );
+        assert!(s.contains(" enter:send  esc:cancel"), "{s}");
+        // The dashboard's footer offers it too.
+        app.mode = Mode::Normal;
+        let s = screen(&mut app, 120, 30);
+        assert!(s.contains("m:message"), "{s}");
     }
 
     #[test]
@@ -2197,6 +2557,22 @@ mod tests {
                 Mode::Notice {
                     title: "Drop Failed".into(),
                     lines: vec!["a reason".into()],
+                },
+                Mode::Answer(AnswerDialog::new(
+                    "m-5".into(),
+                    "unit-pricing/frontend".into(),
+                    bash(&"a long command ".repeat(40)),
+                )),
+                Mode::Answer(AnswerDialog::new(
+                    "m-5".into(),
+                    "unit-pricing/frontend".into(),
+                    colors_and_size(),
+                )),
+                Mode::Message {
+                    member: "m-5".into(),
+                    label: "unit-pricing/frontend".into(),
+                    how: "Typed into its terminal once it is idle.".into(),
+                    text: TextInput::from("a message"),
                 },
             ]
         };

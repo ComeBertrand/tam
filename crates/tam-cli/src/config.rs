@@ -155,7 +155,9 @@ pub fn run_custom_command(
     Ok(())
 }
 
-const RESERVED_KEYS: &[char] = &['q', 'j', 'k', 'n', 'r', 'R', 's', 'p', 'd', '/', 'g', '?'];
+const RESERVED_KEYS: &[char] = &[
+    'q', 'j', 'k', 'n', 'r', 'R', 's', 'p', 'd', '/', 'g', '?', 'a', 'm',
+];
 
 fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
@@ -329,8 +331,8 @@ finder = "fzf"
     }
 
     #[test]
-    fn run_keys_are_reserved() {
-        for key in ["r", "R"] {
+    fn run_and_reply_keys_are_reserved() {
+        for key in ["r", "R", "a", "m"] {
             let toml =
                 format!("[[tui.commands]]\nname = \"x\"\nkey = \"{key}\"\ncommand = \"true\"\n");
             let err = parse_config(&toml).unwrap_err().to_string();

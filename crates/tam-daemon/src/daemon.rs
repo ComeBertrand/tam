@@ -819,6 +819,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                     resume_session,
                     prompt,
                     member,
+                    launch: crate::agent::Launch::default(),
                 },
             )
             .await
@@ -914,6 +915,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             session,
             args,
             prompt,
+            env,
         } => {
             handle_run_agent(
                 state,
@@ -924,6 +926,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                     session,
                     args,
                     prompt,
+                    launch: crate::agent::Launch { env },
                 },
             )
             .await
@@ -1006,6 +1009,8 @@ struct SpawnSpec {
     resume_session: Option<String>,
     prompt: Option<String>,
     member: Option<String>,
+    /// The client's environment (`RunAgent`); never kept.
+    launch: crate::agent::Launch,
 }
 
 async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Response {
@@ -1018,6 +1023,7 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         resume_session,
         prompt,
         member,
+        launch,
     } = spec;
 
     // A member's agent runs in its worktree, under the member id.
@@ -1095,6 +1101,7 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         resume_session.as_deref(),
         prompt.as_deref(),
         &env_vars,
+        &launch,
     ) {
         Ok(mut agent) => {
             info!(id = %id, provider = %provider, dir = %dir.display(), "spawned agent");
@@ -1127,6 +1134,8 @@ struct RunSpec {
     session: SessionChoice,
     args: Vec<String>,
     prompt: Option<String>,
+    /// The client's environment; never kept.
+    launch: crate::agent::Launch,
 }
 
 /// Start a member's agent: the requested agent, else the member's last one,
@@ -1139,6 +1148,7 @@ async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Res
         session,
         args,
         prompt,
+        launch,
     } = spec;
 
     let (label, provider, current) = {
@@ -1204,6 +1214,7 @@ async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Res
             resume_session: resume_session.clone(),
             prompt,
             member: Some(member),
+            launch,
         },
     )
     .await;

@@ -263,8 +263,8 @@ impl Client {
     }
 
     /// Start a member's agent (`provider`: else the member's last agent, else
-    /// `default_provider`) in the chosen session. Returns the agent id and
-    /// the session it resumed, if any.
+    /// `default_provider`) in the chosen session, in our environment.
+    /// Returns the agent id and the session it resumed, if any.
     pub async fn run_agent(
         &mut self,
         member: &str,
@@ -281,6 +281,8 @@ impl Client {
             session,
             args,
             prompt,
+            // The agent runs where we are, not where the daemon started.
+            env: crate::repos::agent_env(),
         };
         match self.send(request).await? {
             Response::Running { id, resumed } => Ok((id, resumed)),

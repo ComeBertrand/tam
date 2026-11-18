@@ -92,6 +92,7 @@ impl Harness {
             session,
             args: vec![],
             prompt: None,
+            env: Default::default(),
         };
         let resumed = match send(&mut self.stream, &request).await {
             Response::Running { id, resumed } => {

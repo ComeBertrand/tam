@@ -111,6 +111,27 @@ adopt). `tam-cli` depends on all three.
   a partly read line when `select!` cancels it.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
   daemon exits after 30s with no agents and no clients.
+- **Agents run in their caller's environment (#50)** — not the daemon's
+  (inherited from whichever shell started it, maybe days ago).
+  `RunAgent.env` (`tam_proto::AgentEnv`: its `Debug` shows a count only) is
+  filled by `Client::run_agent` itself with `repos::agent_env()`, so `tam
+  new`, `tam run` and the dashboard all send theirs: `git_env` without
+  `repos::NOT_FOR_AGENTS` (a calling agent's `TAM_AGENT_ID`/`TAM_SOCKET`;
+  the variables a Claude session sets for its commands, by name, since its
+  settings such as `CLAUDE_CONFIG_DIR` must pass: a session started with
+  them counts as nested and writes no transcript, and the messaging token
+  is a secret; the caller's pane or window, `TMUX`, `ZELLIJ*`, …;
+  `COLUMNS`/`LINES`; `PWD`/`OLDPWD`). `Agent::spawn` applies it
+  (`agent::Launch`): `env_clear`, the client's variables (the program is
+  looked up on its `PATH`), `TERM=xterm-256color` if it has none or `dumb`,
+  `PWD` the worktree, then `TAM_AGENT_ID`/`TAM_SOCKET`, whatever the client
+  sent. Empty (`Spawn`, tests): the daemon's. Held until the process starts,
+  never kept: not in `Agent`, the ledger, logs, events or errors. A resumed
+  session takes its caller's too: nothing is remembered. An agent's own
+  `tam` commands reach this daemon through the caller's `XDG_RUNTIME_DIR`
+  (as the caller did); its hooks through `$TAM_SOCKET`. Known limit: the
+  daemon still looks for Claude transcripts (resume check, context) under
+  its own `HOME`/`CLAUDE_CONFIG_DIR`.
 - **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
   detection, generic/codex use PTY heuristic (5s idle timeout). Claude's hooks
   are injected per spawn (`claude --settings`) and run `tam hook-notify`, which
@@ -501,6 +522,11 @@ cargo test
   --brief` with a pattern, `tam brief`, a written brief kept on drop). The
   daemon's `tests/brief.rs` checks the settings a fake `claude` gets and
   the start note.
+- `agent_env.rs`, in both crates: the daemon's runs an agent found only on
+  the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
+  value) in replies, events, errors and every file next to the ledger,
+  before and after a restart; the CLI's has `tam new` and `tam run` from
+  shells other than the daemon's (a fake `claude` only on theirs).
 - Tests that shell out to git need a real git repo (use tempdir fixtures)
 
 ## Commits

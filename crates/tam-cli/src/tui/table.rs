@@ -380,7 +380,7 @@ fn status_cell(status: TaskStatus, spin: Option<usize>) -> Line<'static> {
             format!(" {} ", status.to_string().to_uppercase()),
             theme::get().chip(color),
         )),
-        TaskStatus::Input => Line::styled(text, style.add_modifier(Modifier::BOLD)),
+        TaskStatus::Ready => Line::styled(text, style.add_modifier(Modifier::BOLD)),
         _ => Line::styled(text, style),
     }
 }
@@ -456,7 +456,7 @@ fn note_cell(member: &Member) -> Line<'static> {
                 return Line::styled(one_line(&text), Style::new().fg(color));
             }
             match (&agent.detail.last_message, agent.state) {
-                (Some(message), AgentState::Input) => {
+                (Some(message), AgentState::Ready) => {
                     Line::styled(one_line(first_line(message)), dim)
                 }
                 _ => Line::default(),

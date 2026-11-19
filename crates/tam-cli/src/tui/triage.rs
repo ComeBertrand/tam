@@ -228,7 +228,7 @@ fn agent_lines(
             }
             format!("turn failed: {}", e.kind)
         }),
-        AgentState::Input => Some(match &detail.last_message {
+        AgentState::Ready => Some(match &detail.last_message {
             Some(message) => {
                 body.push((message.clone(), Style::new()));
                 "turn finished".into()

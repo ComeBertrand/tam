@@ -97,7 +97,7 @@ impl Theme {
     pub fn status(&self, status: &TaskStatus) -> Color {
         match status {
             TaskStatus::Run => self.run,
-            TaskStatus::Input => self.warn,
+            TaskStatus::Ready => self.warn,
             TaskStatus::Block => self.block,
             TaskStatus::Question => self.question,
             TaskStatus::Error | TaskStatus::Gone => self.bad,

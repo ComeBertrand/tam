@@ -41,7 +41,7 @@ Instead, TAM **derives status from observable facts** every time you look:
 | Status | How it's determined |
 |---|---|
 | `run` | Agent process is alive, producing output |
-| `input` | Agent alive, waiting for user prompt |
+| `ready` | Agent alive, waiting for user prompt |
 | `block` | Agent alive, waiting for permission |
 | `idle` | No agent running, task exists |
 | `merged` | No agent running, branch is merged into default branch |
@@ -158,7 +158,7 @@ ignore = [".*", "node_modules", "target"]
 
 [notify]
 command = "notify-send 'tam: {task}' '{kind}: {message}'"
-on_states = ["input", "blocked", "question", "error"]
+on_states = ["ready", "blocked", "question", "error"]
 
 [session]
 finder = "fzf"                              # for tam pick
@@ -297,7 +297,7 @@ myapp + web
  enter:attach  s:stop  d:drop  n:new  p:peek  /:filter  g:attention first  q:quit
 ```
 
-The header shows the task count and how many need the user (input, blocked, question or error), and how the list is ordered. Tasks are grouped under a header row per repository (a task in several under one header naming them), the most urgent first in each (blocked/question, error, input, running, idle, stale, gone); `g` switches to attention first, one list across repositories with a REPO column. A task with several members has a row per member below its own (which shows the most urgent member's status); `▸` marks the member the keys act on. Single-member tasks stay one row. The footer shows the keys that fit, the most useful first, updated for the selected task.
+The header shows the task count and how many need the user (ready, blocked, question or error), and how the list is ordered. Tasks are grouped under a header row per repository (a task in several under one header naming them), the most urgent first in each (blocked/question, error, input, running, idle, stale, gone); `g` switches to attention first, one list across repositories with a REPO column. A task with several members has a row per member below its own (which shows the most urgent member's status); `▸` marks the member the keys act on. Single-member tasks stay one row. The footer shows the keys that fit, the most useful first, updated for the selected task.
 
 ### Task table columns
 

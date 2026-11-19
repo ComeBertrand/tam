@@ -275,7 +275,7 @@ fn member_state(until: Until) -> MemberState {
     match until {
         Until::Working => MemberState::Working,
         Until::Blocked => MemberState::Blocked,
-        Until::Input => MemberState::Input,
+        Until::Ready => MemberState::Ready,
         Until::Idle => MemberState::Idle,
         Until::Question => MemberState::Question,
         Until::Error => MemberState::Error,
@@ -533,15 +533,15 @@ mod tests {
         assert_eq!(state_line(&o), "feat: exit (stopped)");
         o.exit_code = Some(2);
         assert_eq!(
-            gave_up(&o, &[MemberState::Input, MemberState::Question]),
-            "'feat' will not get to input or question without someone acting: its agent exited (exit 2)"
+            gave_up(&o, &[MemberState::Ready, MemberState::Question]),
+            "'feat' will not get to ready or question without someone acting: its agent exited (exit 2)"
         );
         o.provider = None;
         assert_eq!(state_line(&o), "feat: exit (no agent ran)");
-        assert_eq!(state_line(&outcome(MemberState::Input)), "feat: input");
+        assert_eq!(state_line(&outcome(MemberState::Ready)), "feat: ready");
         assert_eq!(
-            gave_up(&o, &[MemberState::Input]),
-            "'feat' will not get to input without someone acting: no agent ran in it"
+            gave_up(&o, &[MemberState::Ready]),
+            "'feat' will not get to ready without someone acting: no agent ran in it"
         );
     }
 
@@ -554,10 +554,10 @@ mod tests {
             no_response(&o),
             "no response from 'feat': no agent ran in it"
         );
-        let o = outcome(MemberState::Input);
+        let o = outcome(MemberState::Ready);
         assert!(no_response(&o).contains("only Claude"));
         // With one, the outcome renders it whole.
-        let mut o = outcome(MemberState::Input);
+        let mut o = outcome(MemberState::Ready);
         o.response = Some(AgentResponse {
             text: "done".into(),
             at: 3,
@@ -599,7 +599,7 @@ mod tests {
                 json,
             }) => {
                 assert_eq!(name.as_deref(), Some("feat"));
-                assert_eq!(until, [Until::Input, Until::Exit]);
+                assert_eq!(until, [Until::Ready, Until::Exit]);
                 assert_eq!(timeout, Some(Duration::from_secs(900)));
                 assert!(json);
             }

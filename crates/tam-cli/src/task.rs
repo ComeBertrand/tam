@@ -12,7 +12,7 @@ pub enum TaskStatus {
     /// Agent process is alive, producing output
     Run,
     /// Agent alive, waiting for user prompt
-    Input,
+    Ready,
     /// Agent alive, waiting for permission
     Block,
     /// Agent alive, asked the user a question
@@ -31,7 +31,7 @@ impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Run => write!(f, "run"),
-            Self::Input => write!(f, "input"),
+            Self::Ready => write!(f, "ready"),
             Self::Block => write!(f, "block"),
             Self::Question => write!(f, "question"),
             Self::Error => write!(f, "error"),
@@ -48,7 +48,7 @@ impl TaskStatus {
         match self {
             Self::Block | Self::Question => 0,
             Self::Error => 1,
-            Self::Input => 2,
+            Self::Ready => 2,
             Self::Run => 3,
             Self::Idle => 4,
             Self::Stale => 5,
@@ -60,7 +60,7 @@ impl TaskStatus {
     pub fn needs_attention(&self) -> bool {
         matches!(
             self,
-            Self::Input | Self::Block | Self::Question | Self::Error
+            Self::Ready | Self::Block | Self::Question | Self::Error
         )
     }
 
@@ -68,7 +68,7 @@ impl TaskStatus {
     pub fn indicator(&self) -> &'static str {
         match self {
             Self::Run => "● run",
-            Self::Input => "◆ input",
+            Self::Ready => "◆ ready",
             Self::Block => "▲ block",
             Self::Question => "? question",
             Self::Error => "✗ error",
@@ -110,7 +110,7 @@ impl Member {
         if let Some(ref info) = self.agent_info {
             return match info.state {
                 AgentState::Working => TaskStatus::Run,
-                AgentState::Input => TaskStatus::Input,
+                AgentState::Ready => TaskStatus::Ready,
                 AgentState::Blocked => TaskStatus::Block,
                 AgentState::Idle => TaskStatus::Idle,
                 AgentState::Question => TaskStatus::Question,
@@ -321,7 +321,7 @@ mod tests {
     fn status_follows_agent_state() {
         for (state, status) in [
             (AgentState::Working, TaskStatus::Run),
-            (AgentState::Input, TaskStatus::Input),
+            (AgentState::Ready, TaskStatus::Ready),
             (AgentState::Blocked, TaskStatus::Block),
             (AgentState::Question, TaskStatus::Question),
             (AgentState::Error, TaskStatus::Error),
@@ -394,13 +394,13 @@ mod tests {
         );
         assert_eq!(task.status(), TaskStatus::Block);
         assert_eq!(task.member_label(&task.members[1]), "feat/web");
-        let task = Task::from_info(snapshot, &[agent("m-2", AgentState::Input)]);
-        assert_eq!(task.status(), TaskStatus::Input);
+        let task = Task::from_info(snapshot, &[agent("m-2", AgentState::Ready)]);
+        assert_eq!(task.status(), TaskStatus::Ready);
     }
 
     #[test]
     fn update_info_keeps_member_state() {
-        let mut task = Task::from_info(test_snapshot(), &[agent("m-1", AgentState::Input)]);
+        let mut task = Task::from_info(test_snapshot(), &[agent("m-1", AgentState::Ready)]);
         let mut info = test_snapshot();
         info.run_count = 4;
         info.members.push(member_info("m-2", "web", "/tmp"));
@@ -419,8 +419,8 @@ mod tests {
 
     #[test]
     fn sort_priority_ordering() {
-        assert!(TaskStatus::Block.sort_priority() < TaskStatus::Input.sort_priority());
-        assert!(TaskStatus::Input.sort_priority() < TaskStatus::Run.sort_priority());
+        assert!(TaskStatus::Block.sort_priority() < TaskStatus::Ready.sort_priority());
+        assert!(TaskStatus::Ready.sort_priority() < TaskStatus::Run.sort_priority());
         assert!(TaskStatus::Run.sort_priority() < TaskStatus::Idle.sort_priority());
         assert!(TaskStatus::Idle.sort_priority() < TaskStatus::Stale.sort_priority());
     }
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn indicator_strings() {
         assert_eq!(TaskStatus::Run.indicator(), "● run");
-        assert_eq!(TaskStatus::Input.indicator(), "◆ input");
+        assert_eq!(TaskStatus::Ready.indicator(), "◆ ready");
         assert_eq!(TaskStatus::Stale.indicator(), "◌ stale");
     }
 

@@ -57,7 +57,7 @@ tam
 | Status | Meaning |
 |---|---|
 | `● run` | Agent producing output |
-| `◆ input` | Agent waiting for user prompt |
+| `◆ ready` | Agent waiting for user prompt |
 | `▲ block` | Agent waiting for permission (or plan approval) |
 | `? question` | Agent asked the user a question |
 | `✗ error` | Agent's last turn failed (API error, rate limit…) |
@@ -180,16 +180,16 @@ For agents and scripts: nothing waits on a terminal, exit statuses tell what hap
 tam new NAME -p TEXT -d --json Create a task, start its agent on a prompt, print a receipt
 tam run NAME -p TEXT -d --json Start the agent on a prompt, print a receipt
 tam wait NAME                  Wait until the task's agents stop working; print their states
-tam wait NAME -u input -t 30m  ... until they wait for input, for at most 30 minutes
+tam wait NAME -u ready -t 30m  ... until they wait for input, for at most 30 minutes
 tam result NAME                Print the last response of the task's agents
 tam ps --json                  Every task, as JSON
 tam merge INTO FROM --json     Merge tasks; print who moved where
 tam split TASK/MEMBER --json   Split a member out; print who moved where
 ```
 
-`tam new` and `tam run` attach only when stdin and stdout are terminals: otherwise they start the agent and say so. `tam wait` returns once each agent is in one of the `--until` states, comma-separated: `working`, `blocked`, `input`, `idle`, `question`, `error`, `exit` (no agent runs). The default is any state but `working`. `input` takes in `idle`, since agents without hooks never report `input`. It gives up at once when an agent exits or its turn fails, unless `--until` takes `exit` or `error`. `tam result` prints the response that ended the agent's last turn, in full; it is still there once the agent exited, or the daemon restarted. There is none while a turn runs, before the first turn of a run ends, after a failed or interrupted turn, and for agents other than Claude. For `wait` and `result`, NAME is a task (all its members), TASK/MEMBER or a member id. Both report what they find: right after `tam msg`, an agent that has not picked the message up yet is still `input`, with its previous response. `tam msg --wait` waits for the reply instead, and `response_at` tells when a response came.
+`tam new` and `tam run` attach only when stdin and stdout are terminals: otherwise they start the agent and say so. `tam wait` returns once each agent is in one of the `--until` states, comma-separated: `working`, `blocked`, `ready`, `idle`, `question`, `error`, `exit` (no agent runs). The default is any state but `working`. `ready` (`input`, its former name, still works) takes in `idle`, since agents without hooks never report `ready`. It gives up at once when an agent exits or its turn fails, unless `--until` takes `exit` or `error`. `tam result` prints the response that ended the agent's last turn, in full; it is still there once the agent exited, or the daemon restarted. There is none while a turn runs, before the first turn of a run ends, after a failed or interrupted turn, and for agents other than Claude. For `wait` and `result`, NAME is a task (all its members), TASK/MEMBER or a member id. Both report what they find: right after `tam msg`, an agent that has not picked the message up yet is still `ready`, with its previous response. `tam msg --wait` waits for the reply instead, and `response_at` tells when a response came.
 
-Claude asks whether to trust a folder it does not know yet, and runs no hook until it is answered: a detached agent in a new worktree waits there (`tam wait` sees `input` after 10s, and `tam result` has nothing). Attach once to answer it.
+Claude asks whether to trust a folder it does not know yet, and runs no hook until it is answered: a detached agent in a new worktree waits there (`tam wait` sees `ready` after 10s, and `tam result` has nothing). Attach once to answer it.
 
 | Exit status | Meaning | `error.kind` |
 |---|---|---|
@@ -210,7 +210,7 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
   "tasks": [
     {
       "name": "feat",
-      "status": "input",
+      "status": "ready",
       "dir": "/home/me/worktrees/app--feat",
       "agent": "claude",
       "context_percent": 34,
@@ -224,12 +224,12 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
           "repo": "app",
           "branch": "feat",
           "dir": "/home/me/worktrees/app--feat",
-          "status": "input",
+          "status": "ready",
           "agent": "claude",
           "health": { "state": "ok", "branch": "feat" },
           "label": "feat",
           "repo_root": "/home/me/src/app",
-          "state": "input",
+          "state": "ready",
           "pid": 4242,
           "viewers": 0,
           "context_percent": 34,
@@ -252,7 +252,7 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
 }
 ```
 
-- `status` (of a task: its most urgent member's) is `run`, `input`, `block`, `question`, `error`, `idle`, `stale` or `gone`. `state` is the running agent's: `working`, `blocked`, `input`, `idle`, `question` or `error`; `null` without one. A task's `dir`, `agent` and `context_percent` are its first member's.
+- `status` (of a task: its most urgent member's) is `run`, `ready`, `block`, `question`, `error`, `idle`, `stale` or `gone`. `state` is the running agent's: `working`, `blocked`, `ready`, `idle`, `question` or `error`; `null` without one. A task's `dir`, `agent` and `context_percent` are its first member's.
 - `pending` (while `blocked` or `question`) is `{"tool", "summary"}`, `turn_error` (while `error`) `{"kind", "message"}`, `denied` (the last tool call auto mode refused in this turn) `{"tool", "summary", "reason"}`.
 - `session_id` is the running agent's session, else the last run's. `last_message` is the start of the agent's last response: `tam result` has all of it. A run's `exit_code` is -1 when it was stopped.
 - `health` is what the daemon saw in git: `{"state": "ok", "branch"}`, `{"state": "gone", "cannot_repair"}` or `{"state": "broken", "problem"}`; `null` until checked.
@@ -303,7 +303,7 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
       "id": "m-1a2b3c4d",
       "name": "app",
       "label": "feat",
-      "state": "input",
+      "state": "ready",
       "agent": "claude",
       "session_id": "8c1f2a90-…",
       "exit_code": null,
@@ -375,11 +375,11 @@ Running `tam` with no arguments opens the dashboard:
  ○ idle       2d nav                    =      -
  ∅ gone       3d old-banner                    -
  rustpallet ───────────────────────────────────────────────────
- ◆ input     12m offload-explain        ↑3 ↓1  claude  55% ━━━━
+ ◆ ready     12m offload-explain        ↑3 ↓1  claude  55% ━━━━
  enter:attach  s:stop  d:drop  n:new  /:filter  ?:help  q:quit
 ```
 
-Tasks are grouped by repository (a task in several under one header naming them, e.g. `backend + frontend`), the most urgent first in each (blocked/question → error → input → running → idle → stale → gone), then by name. `t` lists them most urgent first across repositories instead, with a REPO column. A task with several members has a row per member below its own, which shows its name alone: each member's row has its status. An agent waiting on your answer (a permission, a question, a failed turn) shows as a filled label, a working one as a spinner, and CTX is how full its context is; `▸` marks the member the keys act on. Next to the status, how long it has been in it (without an agent: since the task's last activity). BRANCH compares each worktree with the default branch: `↑` commits ahead, `↓` behind, `*` paths with uncommitted changes, `=` none of them (`…` until git was asked). Git is asked, read-only and one worktree at a time, about every worktree once a minute and after its agent's state changes, and every 10 seconds about the one the pane shows. When the list is above the pane and at least 100 columns wide, a last column says what each member waits on. Columns the width cannot hold go first (AGENT, then CTX), task names last.
+Tasks are grouped by repository (a task in several under one header naming them, e.g. `backend + frontend`), the most urgent first in each (blocked/question → error → ready → running → idle → stale → gone), then by name. `t` lists them most urgent first across repositories instead, with a REPO column. A task with several members has a row per member below its own, which shows its name alone: each member's row has its status. An agent waiting on your answer (a permission, a question, a failed turn) shows as a filled label, a working one as a spinner, and CTX is how full its context is; `▸` marks the member the keys act on. Next to the status, how long it has been in it (without an agent: since the task's last activity). BRANCH compares each worktree with the default branch: `↑` commits ahead, `↓` behind, `*` paths with uncommitted changes, `=` none of them (`…` until git was asked). Git is asked, read-only and one worktree at a time, about every worktree once a minute and after its agent's state changes, and every 10 seconds about the one the pane shows. When the list is above the pane and at least 100 columns wide, a last column says what each member waits on. Columns the width cannot hold go first (AGENT, then CTX), task names last.
 
 Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task (`tab` picks several repositories, `ctrl-n`/`ctrl-p` move in the list; an existing task's name adds them to it), `r` runs the agent in its current session, `R` in a new session, `s` stops, `a` answers what its agent asks, `m` sends it a message, `d` drops (then `y` keeps the branch, `b` deletes it; in a task with several members, `m` drops the focused member only, `M` with its branch; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), the pane, always shown, tells what the member needs from you and shows its agent's screen, which takes the pane's size (`h`/`l` or `←`/`→` move to another member of the task, `PgUp`/`PgDn` or `ctrl-u`/`ctrl-d` scroll through its history, `Home` goes to the oldest line, `End` back to live), `gg`/`G` go to the first/last task, `/` filters, `t` switches between grouped by repository and attention first, `?` lists every key (custom commands included), `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard. The footer shows the keys that fit.
 
@@ -422,7 +422,7 @@ ignore = [".*", "node_modules", "target"]
 
 [notify]
 command = "notify-send 'tam: {task}' '{kind}: {message}'"
-on_states = ["input", "blocked", "question", "error"]   # default
+on_states = ["ready", "blocked", "question", "error"]   # default
 
 [session]
 finder = "fzf"
@@ -470,7 +470,7 @@ commands = ["npm install"]
 | **Codex** | PTY heuristic (5s idle) | Reads session JSONL | None |
 | **Any CLI** | PTY heuristic (5s idle) | None | None |
 
-Claude Code reports state changes through hooks that TAM injects into each agent it spawns (`claude --settings`, nothing is written to your Claude settings): TAM knows the moment an agent finishes, asks a question, needs a permission or fails on an API error. The permission hook also waits, up to a day, for an answer from the dashboard (`a`); Claude shows its own dialog meanwhile, and once the hook gives up the dialog is still there, nothing approved. Claude runs no hooks until a folder is trusted, so a new worktree shows `input` while Claude's trust prompt waits. An interrupted turn fires no hook; TAM takes a working agent silent for 10s as back at the prompt. If you ran `tam init --agent claude` with an older version, run it again to remove the global hooks it installed. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
+Claude Code reports state changes through hooks that TAM injects into each agent it spawns (`claude --settings`, nothing is written to your Claude settings): TAM knows the moment an agent finishes, asks a question, needs a permission or fails on an API error. The permission hook also waits, up to a day, for an answer from the dashboard (`a`); Claude shows its own dialog meanwhile, and once the hook gives up the dialog is still there, nothing approved. Claude runs no hooks until a folder is trusted, so a new worktree shows `ready` while Claude's trust prompt waits. An interrupted turn fires no hook; TAM takes a working agent silent for 10s as back at the prompt. If you ran `tam init --agent claude` with an older version, run it again to remove the global hooks it installed. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
 
 Each task member has a current session per agent, which `tam run` and `r` resume: for Claude Code, the last session the agent had a turn in, as its hooks report it (so a `/clear` followed by a prompt moves it). `tam run --new-session` and `R` start a new one, which becomes current once you use it. A session whose transcript Claude deleted is not resumed: TAM says so and you start a new one. Codex and other agents report no sessions: they start a new session unless given one (`tam run --session ID`, codex only).
 

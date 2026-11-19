@@ -1867,7 +1867,7 @@ mod tests {
 
     #[test]
     fn member_keys_act_on_the_member_that_needs_the_user() {
-        use tam_proto::AgentState::{Blocked, Input, Working};
+        use tam_proto::AgentState::{Blocked, Ready, Working};
         let mut app = two_member_app(&[("m-1", Working), ("m-2", Blocked)]);
         app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
         app.sync_focus();
@@ -1960,7 +1960,7 @@ mod tests {
             handle_normal_key(press('r'), &mut app, &config),
             Action::RunAgent { ref member } if member == "m-1"
         ));
-        app.update_state("m-2", Input);
+        app.update_state("m-2", Ready);
         app.cycle_member(1);
         assert!(matches!(
             handle_normal_key(press('s'), &mut app, &config),
@@ -2424,7 +2424,7 @@ mod tests {
 
         // The oldest look goes first; a state change asks for a new one.
         looked(&mut app, "m-3", 90);
-        app.update_state("m-1", tam_proto::AgentState::Input);
+        app.update_state("m-1", tam_proto::AgentState::Ready);
         assert_eq!(app.branch_due().map(|(id, _)| id).as_deref(), Some("m-1"));
         looked(&mut app, "m-1", 0);
         assert_eq!(app.branch_due().map(|(id, _)| id).as_deref(), Some("m-3"));

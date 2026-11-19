@@ -306,7 +306,7 @@ pub enum Commands {
     /// Wait until the agents of a task (or of one member) stop working
     ///
     /// Done once each agent is in one of the --until states (default: any
-    /// but working; input also takes idle, the state of agents without
+    /// but working; ready also takes idle, the state of agents without
     /// hooks). Gives up at once when an agent exits or its turn fails,
     /// unless --until takes exit or error. Exit status: 0 done, 1 gave up,
     /// 3 no such task or member, 4 timed out, 5 daemon unreachable.
@@ -417,7 +417,9 @@ pub enum Commands {
 pub enum Until {
     Working,
     Blocked,
-    Input,
+    /// Waits for a prompt (`input` is its former name).
+    #[value(alias = "input")]
+    Ready,
     Idle,
     Question,
     Error,

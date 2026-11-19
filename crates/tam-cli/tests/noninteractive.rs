@@ -213,7 +213,7 @@ async fn a_task_driven_without_a_terminal() {
     assert_eq!(args.last().unwrap(), "fix the bug");
 
     // Still working: the wait runs out (Claude's silence fallback would only
-    // call it input after 10s).
+    // call it ready after 10s).
     let out = output(tam(
         root,
         &repo,
@@ -221,7 +221,7 @@ async fn a_task_driven_without_a_terminal() {
             "wait",
             "feat",
             "--until",
-            "input",
+            "ready",
             "--timeout",
             "1",
             "--json",
@@ -255,14 +255,14 @@ async fn a_task_driven_without_a_terminal() {
     let doc = json(&out);
     assert!(doc["error"].is_null());
     let outcome = &doc["members"][0];
-    assert_eq!(outcome["state"], "input");
+    assert_eq!(outcome["state"], "ready");
     assert_eq!(outcome["session_id"], "s1");
     assert_eq!(outcome["response"], response.trim());
     assert!(outcome["response_at"].as_u64().unwrap() > 0);
     // Plain, the state alone.
     let out = output(tam(root, &repo, &["wait", "feat"])).await;
     ok(&out);
-    assert_eq!(stdout(&out), "feat: input\n");
+    assert_eq!(stdout(&out), "feat: ready\n");
 
     let out = output(tam(root, &repo, &["result", "feat"])).await;
     ok(&out);
@@ -291,7 +291,7 @@ async fn a_task_driven_without_a_terminal() {
     );
     assert_eq!(
         (&task["status"], &task["agent"]),
-        (&"input".into(), &"claude".into())
+        (&"ready".into(), &"claude".into())
     );
     let m = &task["members"][0];
     assert_eq!(
@@ -320,7 +320,7 @@ async fn a_task_driven_without_a_terminal() {
         ])
     );
     assert_eq!(m["id"], member.as_str());
-    assert_eq!(m["state"], "input");
+    assert_eq!(m["state"], "ready");
     assert_eq!(m["session_id"], "s1");
     assert_eq!(m["last_run"]["provider"], "claude");
     assert!(m["last_run"]["ended_at"].is_null());
@@ -415,7 +415,7 @@ async fn a_task_driven_without_a_terminal() {
     ok(&out);
     assert_eq!(
         stdout(&out),
-        "feat/app: input\nfeat/web: exit (no agent ran)\n"
+        "feat/app: ready\nfeat/web: exit (no agent ran)\n"
     );
     let out = output(tam(root, &repo, &["result", "feat"])).await;
     assert_eq!(out.status.code(), Some(1));

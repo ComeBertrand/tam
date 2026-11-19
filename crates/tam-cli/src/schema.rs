@@ -74,7 +74,7 @@ pub struct PsMember {
     pub repo: String,
     pub branch: String,
     pub dir: PathBuf,
-    /// `run`, `input`, `block`, `question`, `error`, `idle`, `stale`, `gone`.
+    /// `run`, `ready`, `block`, `question`, `error`, `idle`, `stale`, `gone`.
     pub status: String,
     /// The agent (provider) running for the member.
     pub agent: Option<String>,
@@ -85,7 +85,7 @@ pub struct PsMember {
     /// has several.
     pub label: String,
     pub repo_root: Option<PathBuf>,
-    /// The running agent's state: `working`, `blocked`, `input`, `idle`,
+    /// The running agent's state: `working`, `blocked`, `ready`, `idle`,
     /// `question`, `error`.
     pub state: Option<String>,
     pub pid: Option<u32>,
@@ -183,7 +183,7 @@ pub struct Outcome {
     pub id: String,
     pub name: String,
     pub label: String,
-    /// `working`, `blocked`, `input`, `idle`, `question`, `error`, or `exit`
+    /// `working`, `blocked`, `ready`, `idle`, `question`, `error`, or `exit`
     /// when no agent runs for the member.
     pub state: String,
     /// The running agent (provider), else the agent of the last run.

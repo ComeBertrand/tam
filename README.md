@@ -364,13 +364,13 @@ Running `tam` with no arguments opens the dashboard:
  tam  7 tasks  3 need you                                         by repository
  STATUS          TASK                   BRANCH AGENT  CTX
  backend ──────────────────────────────────────────────────────
-▌ BLOCK       3m fix-allotment-rounding ↑2 *1  claude  67% ━━━━
+▌▲ block      3m fix-allotment-rounding ↑2 *1  claude  67% ━━━━
  ⠹ run       20s perf                   =      claude  31% ━━━━
  ◌ stale     45d spike-cache            ↑5 ↓12 -
  backend + frontend ───────────────────────────────────────────
                  unit-pricing
  ⠹ run        1m  ├ backend             ↑1 *3  claude  12% ━━━━
-  QUESTION    5m  └▸frontend            ↑1     claude  40% ━━━━
+ ? question   5m  └▸frontend            ↑1     claude  40% ━━━━
  frontend ─────────────────────────────────────────────────────
  ○ idle       2d nav                    =      -
  ∅ gone       3d old-banner                    -
@@ -379,7 +379,7 @@ Running `tam` with no arguments opens the dashboard:
  enter:attach  s:stop  d:drop  n:new  /:filter  ?:help  q:quit
 ```
 
-Tasks are grouped by repository (a task in several under one header naming them, e.g. `backend + frontend`), the most urgent first in each (blocked/question → error → ready → running → idle → stale → gone), then by name. `t` lists them most urgent first across repositories instead, with a REPO column. A task with several members has a row per member below its own, which shows its name alone: each member's row has its status. An agent waiting on your answer (a permission, a question, a failed turn) shows as a filled label, a working one as a spinner, and CTX is how full its context is; `▸` marks the member the keys act on. Next to the status, how long it has been in it (without an agent: since the task's last activity). BRANCH compares each worktree with the default branch: `↑` commits ahead, `↓` behind, `*` paths with uncommitted changes, `=` none of them (`…` until git was asked). Git is asked, read-only and one worktree at a time, about every worktree once a minute and after its agent's state changes, and every 10 seconds about the one the pane shows. When the list is above the pane and at least 100 columns wide, a last column says what each member waits on. Columns the width cannot hold go first (AGENT, then CTX), task names last.
+Tasks are grouped by repository (a task in several under one header naming them, e.g. `backend + frontend`), the most urgent first in each (blocked/question → error → ready → running → idle → stale → gone), then by name. `t` lists them most urgent first across repositories instead, with a REPO column. A task with several members has a row per member below its own, which shows its name alone: each member's row has its status. A working agent's mark is a spinner, and CTX is how full its context is; `▸` marks the member the keys act on. Next to the status, how long it has been in it (without an agent: since the task's last activity). BRANCH compares each worktree with the default branch: `↑` commits ahead, `↓` behind, `*` paths with uncommitted changes, `=` none of them (`…` until git was asked). Git is asked, read-only and one worktree at a time, about every worktree once a minute and after its agent's state changes, and every 10 seconds about the one the pane shows. When the list is above the pane and at least 100 columns wide, a last column says what each member waits on. Columns the width cannot hold go first (AGENT, then CTX), task names last.
 
 Keys: `j`/`k` navigate, `enter` attaches, `n` creates a task (`tab` picks several repositories, `ctrl-n`/`ctrl-p` move in the list; an existing task's name adds them to it), `r` runs the agent in its current session, `R` in a new session, `s` stops, `a` answers what its agent asks, `m` sends it a message, `d` drops (then `y` keeps the branch, `b` deletes it; in a task with several members, `m` drops the focused member only, `M` with its branch; work that would be lost is shown for a second confirmation; on a `gone` task, `r` recreates the worktree instead), the pane, always shown, tells what the member needs from you and shows its agent's screen, which takes the pane's size (`h`/`l` or `←`/`→` move to another member of the task, `PgUp`/`PgDn` or `ctrl-u`/`ctrl-d` scroll through its history, `Home` goes to the oldest line, `End` back to live), `gg`/`G` go to the first/last task, `/` filters, `t` switches between grouped by repository and attention first, `?` lists every key (custom commands included), `q` quits. When attached to an agent, `ctrl-]` detaches and returns to the dashboard. The footer shows the keys that fit.
 

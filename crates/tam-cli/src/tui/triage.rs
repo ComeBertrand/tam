@@ -171,17 +171,10 @@ fn agent_lines(
     let status = task.member_status(member);
     let (_, color) = status_display(&status);
     let detail = &agent.detail;
-    let mut spans = vec![match agent.state {
-        // Stuck on the user: a filled label, as in the list.
-        AgentState::Blocked | AgentState::Question | AgentState::Error => Span::styled(
-            format!(" {} ", agent.state.to_string().to_uppercase()),
-            theme::get().chip(color),
-        ),
-        _ => Span::styled(
-            format!("{} {}", glyph(status), agent.state),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
-        ),
-    }];
+    let mut spans = vec![Span::styled(
+        format!("{} {}", glyph(status), agent.state),
+        Style::new().fg(color).add_modifier(Modifier::BOLD),
+    )];
     if let Some(since) = agent.state_since {
         spans.push(Span::raw(format!(
             " for {}",

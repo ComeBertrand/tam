@@ -1508,7 +1508,7 @@ mod tests {
         assert!(s.contains("╭ feat ─"), "{s}");
         assert!(s.contains("triage │ terminal"), "{s}");
         assert!(
-            s.contains("│ BLOCKED  for 3m · permission for Bash  (claude)"),
+            s.contains("│▲ blocked for 3m · permission for Bash  (claude)"),
             "{s}"
         );
         assert!(
@@ -1641,7 +1641,7 @@ mod tests {
         let s = screen(&mut app, 100, 34);
         show("triage, answerable", &s);
         assert!(
-            s.contains("│ BLOCKED  for 30s · permission for Bash  (claude)  a: answer"),
+            s.contains("│▲ blocked for 30s · permission for Bash  (claude)  a: answer"),
             "{s}"
         );
         assert!(s.contains("│  command: cargo test --workspace"), "{s}");
@@ -1870,7 +1870,7 @@ mod tests {
             vec![agent_in("m-1", AgentState::Question, 45, question)],
         );
         let s = screen(&mut app, 100, 30);
-        assert!(s.contains("QUESTION  for 45s  (claude)"), "{s}");
+        assert!(s.contains("? question for 45s  (claude)"), "{s}");
         assert!(
             s.contains("│  Which database should the cache use? (+1 more)"),
             "{s}"
@@ -1890,7 +1890,10 @@ mod tests {
             vec![agent_in("m-1", AgentState::Error, 7200, error)],
         );
         let s = screen(&mut app, 100, 30);
-        assert!(s.contains("ERROR  for 2h · turn failed: rate_limit"), "{s}");
+        assert!(
+            s.contains("✗ error for 2h · turn failed: rate_limit"),
+            "{s}"
+        );
         assert!(s.contains("│  API Error: Rate limit reached"), "{s}");
 
         let denied = AgentDetail {
@@ -2009,7 +2012,7 @@ mod tests {
             s.contains("│▸ ▲ web  blocked 3m  permission · Bash: cargo test"),
             "{s}"
         );
-        assert!(s.contains("│ BLOCKED  for 3m · permission for Bash"), "{s}");
+        assert!(s.contains("│▲ blocked for 3m · permission for Bash"), "{s}");
         assert!(s.contains("h/l:member"), "{s}");
 
         // → shows the other one (and enter would attach to it).
@@ -2385,7 +2388,7 @@ mod tests {
         assert!(!s.contains("DIR"), "{s}");
         // The task name is not cut at 15 columns; time in state and branch.
         assert!(
-            s.contains("BLOCK       3m fix-allotment-rounding ↑2 *1  claude  67% ━━━━"),
+            s.contains("▲ block      3m fix-allotment-rounding ↑2 *1  claude  67% ━━━━"),
             "{s}"
         );
         assert!(s.contains("◌ stale     45d spike-cache"), "{s}");
@@ -2398,7 +2401,7 @@ mod tests {
             s.contains("● run        1m  ├ backend             ↑1 *3  claude  12% ━━━━"),
             "{s}"
         );
-        assert!(s.contains("QUESTION    5m  └ frontend"), "{s}");
+        assert!(s.contains("? question   5m  └ frontend"), "{s}");
 
         let s = screen(&mut app, 120, 44);
         show("120x44", &s);
@@ -2422,9 +2425,9 @@ mod tests {
         show("attention 80x24", &s);
         assert!(s.contains("attention first"), "{s}");
         let rows: Vec<&str> = s.lines().skip(2).collect();
-        assert!(rows[0].trim_start().starts_with("BLOCK"), "{s}");
+        assert!(rows[0].trim_start().starts_with("▲ block"), "{s}");
         assert!(rows[1].trim_start().starts_with("unit-pricing "), "{s}");
-        assert!(rows[3].trim_start().starts_with("QUESTION"), "{s}");
+        assert!(rows[3].trim_start().starts_with("? question"), "{s}");
         assert!(s.contains("REPO"), "{s}");
         assert!(s.contains("backend + frontend"), "{s}");
     }

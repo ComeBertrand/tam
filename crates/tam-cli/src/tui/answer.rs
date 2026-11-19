@@ -17,6 +17,7 @@ use ratatui::Frame;
 use tam_proto::{Ask, AskAnswer, AskKind, AskQuestion, QuestionAnswer};
 
 use super::input::TextInput;
+use super::theme;
 use super::triage::{clean, width_of};
 
 /// The dialog's widest.
@@ -404,6 +405,7 @@ pub fn render(frame: &mut Frame, dialog: &mut AnswerDialog, stale: bool) {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .style(theme::get().popup())
         .border_style(Style::new().fg(color))
         .title(format!(" Answer {} ", dialog.label))
         .title_style(Style::new().bold().fg(color))
@@ -412,7 +414,7 @@ pub fn render(frame: &mut Frame, dialog: &mut AnswerDialog, stale: bool) {
         let first = dialog.scroll + 1;
         let last = (dialog.scroll + body_rows).min(body.len());
         block = block.title_bottom(
-            Line::from(format!(" rows {first}–{last} of {} ", body.len())).fg(Color::DarkGray),
+            Line::from(format!(" rows {first}–{last} of {} ", body.len())).fg(theme::get().muted),
         );
     }
     let inner = block.inner(area);
@@ -435,7 +437,7 @@ pub fn render(frame: &mut Frame, dialog: &mut AnswerDialog, stale: bool) {
             Foot::Input(prompt, input) => {
                 let prompt_width = (width_of(prompt) as u16).min(inner.width);
                 frame.render_widget(
-                    Span::styled(prompt, Style::new().fg(Color::Cyan)),
+                    Span::styled(prompt, Style::new().fg(theme::get().accent)),
                     Rect::new(inner.x, y, prompt_width, 1),
                 );
                 let text = Rect::new(inner.x + prompt_width, y, inner.width - prompt_width, 1);
@@ -452,7 +454,7 @@ fn content(
     width: usize,
 ) -> (Color, Vec<Line<'static>>, Vec<Line<'static>>, Option<usize>) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::get().muted);
     let cut_note = |body: &mut Vec<Line<'static>>, cut: bool| {
         if cut {
             body.push(Line::styled("(cut here: its terminal shows the rest)", dim));
@@ -467,7 +469,7 @@ fn content(
             ])];
             let mut body: Vec<Line> = rows(input, width).into_iter().map(Line::raw).collect();
             cut_note(&mut body, *cut);
-            (Color::Red, head, body, None)
+            (theme::get().bad, head, body, None)
         }
         AskKind::Plan { plan, cut } => {
             let head = vec![
@@ -479,14 +481,14 @@ fn content(
             ];
             let mut body: Vec<Line> = rows(plan, width).into_iter().map(Line::raw).collect();
             cut_note(&mut body, *cut);
-            (Color::Red, head, body, None)
+            (theme::get().bad, head, body, None)
         }
         AskKind::Questions { questions } => {
             let Step::Questions(q) = &dialog.step else {
-                return (Color::Magenta, Vec::new(), Vec::new(), None);
+                return (theme::get().question, Vec::new(), Vec::new(), None);
             };
             let (head, body, highlight) = questions_view(questions, q, width);
-            (Color::Magenta, head, body, highlight)
+            (theme::get().question, head, body, highlight)
         }
     }
 }
@@ -499,7 +501,7 @@ fn questions_view(
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<Line<'static>>, Option<usize>) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::get().muted);
     let mut head = Vec::new();
     if questions.len() > 1 {
         let mut tabs = Vec::new();
@@ -588,7 +590,7 @@ fn questions_view(
                 " ".repeat(indent)
             };
             let style = if on {
-                bold.fg(Color::Magenta)
+                bold.fg(theme::get().question)
             } else {
                 Style::new()
             };
@@ -614,7 +616,7 @@ fn questions_view(
         None => "Type an answer".into(),
     };
     let style = if on {
-        bold.fg(Color::Magenta)
+        bold.fg(theme::get().question)
     } else {
         Style::new()
     };
@@ -633,11 +635,11 @@ fn foot(dialog: &AnswerDialog, stale: bool) -> Vec<Foot<'_>> {
         return vec![
             Foot::Line(Line::styled(
                 "Answered or changed meanwhile: nothing will be sent.",
-                Style::new().fg(Color::Yellow).bold(),
+                Style::new().fg(theme::get().warn).bold(),
             )),
             Foot::Line(Line::styled(
                 "Any key closes.",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(theme::get().muted),
             )),
         ];
     }
@@ -645,10 +647,10 @@ fn foot(dialog: &AnswerDialog, stale: bool) -> Vec<Foot<'_>> {
         Step::Decide if cut(&dialog.ask) => vec![
             Foot::Line(Line::styled(
                 "Too long to show in full: allow it in its terminal (enter attaches).",
-                Style::new().fg(Color::Yellow),
+                Style::new().fg(theme::get().warn),
             )),
             Foot::Line(Line::from(vec![
-                key("n", Color::Red),
+                key("n", theme::get().bad),
                 Span::raw(" say no · "),
                 key("esc", Color::Reset),
                 Span::raw(" cancel"),
@@ -660,9 +662,9 @@ fn foot(dialog: &AnswerDialog, stale: bool) -> Vec<Foot<'_>> {
                 _ => " allow once · ",
             };
             vec![Foot::Line(Line::from(vec![
-                key("y", Color::Green),
+                key("y", theme::get().ok),
                 Span::raw(allow),
-                key("n", Color::Red),
+                key("n", theme::get().bad),
                 Span::raw(" say no · "),
                 key("esc", Color::Reset),
                 Span::raw(" cancel"),

@@ -336,6 +336,20 @@ adopt). `tam-cli` depends on all three.
   fit (`ui::fit_hints`, by priority). `tam ps` (`ps.rs`) prints the same
   rows as text: a row per task, most urgent first, and below a task with
   several members a row per member (status, agent, worktree, context).
+- **Dashboard colours** — `tui/theme.rs`: colours by role (`theme::get()`),
+  never a `Color::` in the drawing code. `DARK` (24-bit) when `COLORTERM`
+  says truecolor or `[tui] theme = "dark"`, else `ANSI` (the terminal's 16
+  colours; what tests draw with). Backgrounds only on the header and footer
+  bars, the selected row, chips and dialogs: never behind the agent's screen
+  (`peek.rs` keeps the agent's colours). Dialogs draw over a dimmed dashboard
+  (`ui::render`, not the footer: it has their keys). A working agent's mark
+  is a spinner (`App::spin`, `None` in tests; the loop ticks every 120 ms
+  only while one works). What needs an answer (block, question, error) is a
+  filled label in the list and the pane's headline. The agent the pane
+  shows is given a terminal of the pane's size (`fit_agent`,
+  `Peek::wanted_size`: asked once per agent and size, again after an
+  attach). `ui::tests::dump_the_dashboard_in_colour` (ignored)
+  writes the fixture dashboard as ANSI text to `$TAM_UI_DUMP`.
 - **Dashboard input** — prompts (the filter, the picker's filter, the task
   name, the path) are `tui/input.rs` `TextInput`: cursor movement and
   editing, drawn with the terminal's cursor. `tui/fuzzy.rs` matches the

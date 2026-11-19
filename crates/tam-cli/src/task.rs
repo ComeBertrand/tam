@@ -68,13 +68,13 @@ impl TaskStatus {
     pub fn indicator(&self) -> &'static str {
         match self {
             Self::Run => "● run",
-            Self::Input => "▲ input",
+            Self::Input => "◆ input",
             Self::Block => "▲ block",
             Self::Question => "? question",
             Self::Error => "✗ error",
             Self::Idle => "○ idle",
             Self::Stale => "◌ stale",
-            Self::Gone => "✗ gone",
+            Self::Gone => "∅ gone",
         }
     }
 }
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn indicator_strings() {
         assert_eq!(TaskStatus::Run.indicator(), "● run");
-        assert_eq!(TaskStatus::Input.indicator(), "▲ input");
+        assert_eq!(TaskStatus::Input.indicator(), "◆ input");
         assert_eq!(TaskStatus::Stale.indicator(), "◌ stale");
     }
 

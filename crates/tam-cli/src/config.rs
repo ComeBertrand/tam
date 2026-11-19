@@ -27,6 +27,8 @@ pub struct SessionConfig {
 pub struct TuiConfig {
     #[serde(default)]
     pub commands: Vec<CustomCommand>,
+    /// `dark` (24-bit palette) or `ansi` (the terminal's 16 colours).
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +50,7 @@ pub struct Config {
     pub default_agent: String,
     pub finder: Option<String>,
     pub commands: Vec<CustomCommand>,
+    pub theme: Option<String>,
 }
 
 impl Default for Config {
@@ -56,6 +59,7 @@ impl Default for Config {
             default_agent: "claude".into(),
             finder: None,
             commands: Vec::new(),
+            theme: None,
         }
     }
 }
@@ -79,10 +83,19 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         .unwrap_or_default();
     validate_custom_commands(&commands)?;
 
+    let theme = file.tui.as_ref().and_then(|t| t.theme.clone());
+    if let Some(theme) = &theme {
+        anyhow::ensure!(
+            matches!(theme.as_str(), "dark" | "ansi"),
+            "tui.theme is 'dark' or 'ansi', not '{theme}'"
+        );
+    }
+
     Ok(Config {
         default_agent,
         finder,
         commands,
+        theme,
     })
 }
 

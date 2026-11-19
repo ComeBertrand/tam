@@ -12,7 +12,7 @@ use crate::task::TaskStatus;
 use super::app::{App, MemberChoice, Mode, Order, PaneTab, PickerState};
 use super::input::TextInput;
 use super::peek::{Peek, ScreenView};
-use super::{answer, fuzzy, table, triage};
+use super::{answer, fuzzy, table, theme, triage};
 
 /// The task list's narrowest and widest beside the pane.
 const LIST_MIN: u16 = 50;
@@ -50,7 +50,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     render_footer(frame, footer_area, app);
 
-    // Overlay popups
+    // Overlay popups, over a dimmed dashboard
+    if !matches!(app.mode, Mode::Normal) {
+        let dim = Style::reset().fg(theme::get().muted);
+        // Not the footer: it has the dialog's keys.
+        frame.buffer_mut().set_style(header_area.union(body), dim);
+    }
     app.hits.picker = match &mut app.mode {
         Mode::NewTaskPickProject(picker) => Some(render_picker_popup(frame, picker)),
         _ => None,
@@ -126,7 +131,10 @@ fn split(area: Rect, app: &App, filter: bool) -> (Rect, Option<Rect>) {
 fn render_filter(frame: &mut Frame, area: Rect, app: &App) {
     let [prompt, text] =
         Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
-    frame.render_widget(Span::styled(" / ", Style::new().fg(Color::Cyan)), prompt);
+    frame.render_widget(
+        Span::styled(" / ", Style::new().fg(theme::get().accent)),
+        prompt,
+    );
     app.filter.render(
         frame,
         text,
@@ -149,7 +157,7 @@ fn render_tasks(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let text = Paragraph::new(text)
         .alignment(HorizontalAlignment::Center)
-        .fg(Color::DarkGray);
+        .fg(theme::get().muted);
     let y = area.y + area.height / 2;
     frame.render_widget(text, Rect::new(area.x, y, area.width, 1));
 }
@@ -159,19 +167,21 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let total = app.tasks.len();
     let needs = app.needs_attention_count();
 
-    let mut spans = vec![Span::styled(" tam", Style::new().bold()), Span::raw(" — ")];
+    let t = theme::get();
+    frame.render_widget(Block::new().style(t.bar()), area);
+    let mut spans = vec![Span::styled(" tam ", t.chip(t.accent)), Span::raw(" ")];
 
     if total == 0 {
         spans.push(Span::raw("no tasks"));
     } else {
         spans.push(Span::raw(format!(
-            "{total} task{}",
+            "{total} task{} ",
             if total == 1 { "" } else { "s" }
         )));
         if needs > 0 {
             spans.push(Span::styled(
-                format!(" · {needs} need{} you", if needs == 1 { "s" } else { "" }),
-                Style::new().fg(Color::Yellow),
+                format!(" {needs} need{} you ", if needs == 1 { "s" } else { "" }),
+                t.chip(t.warn),
             ));
         }
     }
@@ -184,21 +194,24 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     };
     if total > 0 && used + 1 + order.len() <= area.width as usize {
         frame.render_widget(
-            Line::styled(order, Style::new().fg(Color::DarkGray)).right_aligned(),
+            Line::styled(order, Style::new().fg(theme::get().muted)).right_aligned(),
             area,
         );
     }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
+    let t = theme::get();
+    frame.render_widget(Block::new().style(t.bar()), area);
+    let key = Style::new().fg(t.accent).add_modifier(Modifier::BOLD);
     if let Some(msg) = app.status_message() {
-        let line = Line::from(format!(" {msg}")).fg(Color::Yellow);
+        let line = Line::from(format!(" {msg}")).fg(theme::get().warn);
         frame.render_widget(line, area);
     } else {
         let hints = match app.mode {
             Mode::Normal => {
                 let hints = normal_hints(app);
-                frame.render_widget(fit_hints(hints, area.width).fg(Color::DarkGray), area);
+                frame.render_widget(fit_hints(hints, area.width).fg(t.muted), area);
                 return;
             }
             Mode::NewTaskEnterName { .. } => vec![
@@ -304,7 +317,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::raw(":cancel"),
             ],
         };
-        frame.render_widget(Line::from(hints).fg(Color::DarkGray), area);
+        // The keys stand out, as in `fit_hints`.
+        let hints: Vec<Span> = hints
+            .into_iter()
+            .map(|s| {
+                if s.style.add_modifier.contains(Modifier::BOLD) {
+                    s.style(key)
+                } else {
+                    s
+                }
+            })
+            .collect();
+        frame.render_widget(Line::from(hints).fg(t.muted), area);
     }
 }
 
@@ -397,7 +421,10 @@ fn fit_hints(mut hints: Vec<Hint<'_>>, width: u16) -> Line<'static> {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(key.to_string(), Style::new().bold()));
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::new().fg(theme::get().accent).bold(),
+        ));
         spans.push(Span::raw(format!(":{what}")));
     }
     Line::from(spans)
@@ -418,14 +445,14 @@ pub(super) fn agent_detail_line(
         })
     };
     match state {
-        AgentState::Blocked => pending("permission", Color::Red),
-        AgentState::Question => pending("question", Color::Magenta),
+        AgentState::Blocked => pending("permission", theme::get().bad),
+        AgentState::Question => pending("question", theme::get().question),
         AgentState::Error => detail.error.as_ref().map(|e| {
             let text = match &e.message {
                 Some(m) => format!("error · {}: {}", e.kind, first_line(m)),
                 None => format!("error · {}", e.kind),
             };
-            (text, Color::Red)
+            (text, theme::get().bad)
         }),
         _ => detail.denied.as_ref().map(|d| {
             let mut text = format!("denied · {}", d.tool);
@@ -435,7 +462,7 @@ pub(super) fn agent_detail_line(
             if let Some(r) = &d.reason {
                 text.push_str(&format!(" ({})", first_line(r)));
             }
-            (text, Color::Yellow)
+            (text, theme::get().warn)
         }),
     }
 }
@@ -461,24 +488,24 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
         Some(n) => format!(" {label} · {n} lines into history "),
         None => format!(" {label} "),
     };
+    let t = theme::get();
     let tab = |name: &'static str, shown: bool| {
         if shown {
-            Span::styled(name, Style::new().bold())
+            Span::styled(name, t.chip(t.accent))
         } else {
-            Span::styled(name, Style::new().fg(Color::DarkGray))
+            Span::styled(name, Style::new().fg(t.muted))
         }
     };
     let tabs = Line::from(vec![
-        Span::raw(" "),
-        tab("triage", app.tab == PaneTab::Triage),
-        Span::styled(" │ ", Style::new().fg(Color::DarkGray)),
-        tab("terminal", app.tab == PaneTab::Terminal),
-        Span::raw(" "),
+        tab(" triage ", app.tab == PaneTab::Triage),
+        Span::styled("│", Style::new().fg(t.subtle)),
+        tab(" terminal ", app.tab == PaneTab::Terminal),
     ]);
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::DarkGray))
-        .title(title)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(t.subtle))
+        .title(Line::styled(title, Style::new().fg(t.accent).bold()))
         .title_top(tabs.right_aligned());
     if app.tab == PaneTab::Terminal {
         if let Some((text, color)) = agent.and_then(|a| agent_detail_line(a.state, &a.detail)) {
@@ -487,6 +514,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    peek.room = (inner.width, inner.height);
 
     let Some((task, member)) = focused.filter(|_| app.tab == PaneTab::Triage) else {
         render_screen(frame, inner, peek);
@@ -519,7 +547,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     }
     let rule = "─".repeat(inner.width as usize);
     frame.render_widget(
-        Line::styled(rule, Style::new().fg(Color::DarkGray)),
+        Line::styled(rule, Style::new().fg(theme::get().subtle)),
         Rect::new(inner.x, inner.y + used, inner.width, 1),
     );
     let screen = Rect::new(inner.x, inner.y + used + 1, inner.width, below);
@@ -544,7 +572,7 @@ fn render_screen(frame: &mut Frame, area: Rect, peek: &mut Peek) {
         (Some(_), None, Some(error)) => format!("(error: {error})"),
         (Some(_), None, None) => String::new(),
     };
-    frame.render_widget(Paragraph::new(message).fg(Color::DarkGray), area);
+    frame.render_widget(Paragraph::new(message).fg(theme::get().muted), area);
 }
 
 /// The project picker; returns where its items are and the first one
@@ -563,9 +591,10 @@ fn render_picker_popup(frame: &mut Frame, picker: &mut PickerState) -> (Rect, us
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().accent))
         .title(title)
-        .title_style(Style::new().bold().fg(Color::Cyan))
+        .title_style(Style::new().bold().fg(theme::get().accent))
         .padding(Padding::horizontal(1));
 
     let inner = block.inner(area);
@@ -575,7 +604,10 @@ fn render_picker_popup(frame: &mut Frame, picker: &mut PickerState) -> (Rect, us
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
     let [prompt, text] =
         Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(filter_area);
-    frame.render_widget(Span::styled("> ", Style::new().fg(Color::Cyan)), prompt);
+    frame.render_widget(
+        Span::styled("> ", Style::new().fg(theme::get().accent)),
+        prompt,
+    );
     picker.filter.render(frame, text, Style::new(), true);
 
     // The highlighted item in view, the list moving only as far as needed.
@@ -587,7 +619,7 @@ fn render_picker_popup(frame: &mut Frame, picker: &mut PickerState) -> (Rect, us
     } else if height > 0 && picker.selected >= offset + height {
         offset = picker.selected + 1 - height;
     }
-    let matched = Style::new().fg(Color::Cyan).bold();
+    let matched = Style::new().fg(theme::get().accent).bold();
     let items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
@@ -595,13 +627,16 @@ fn render_picker_popup(frame: &mut Frame, picker: &mut PickerState) -> (Rect, us
         .take(height)
         .map(|(i, (item, positions))| {
             let style = if i == picker.selected {
-                Style::new().add_modifier(Modifier::REVERSED)
+                theme::get().selection
             } else {
                 Style::new()
             };
             // Picked with tab: a mark, and the order they were picked in.
             let mark = match picker.marked.iter().position(|m| *m == item.id) {
-                Some(n) => Span::styled(format!("{} ", n + 1), Style::new().fg(Color::Cyan).bold()),
+                Some(n) => Span::styled(
+                    format!("{} ", n + 1),
+                    Style::new().fg(theme::get().accent).bold(),
+                ),
                 None if picker.marked.is_empty() => Span::raw(""),
                 None => Span::raw("  "),
             };
@@ -645,9 +680,10 @@ fn render_new_task_popup(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().accent))
         .title(" New Task ")
-        .title_style(Style::new().bold().fg(Color::Cyan))
+        .title_style(Style::new().bold().fg(theme::get().accent))
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
@@ -664,12 +700,12 @@ fn render_new_task_popup(
     let repos = repo_names(dirs);
     let where_line = if joins {
         Line::from(vec![
-            Span::styled("adds ", Style::new().fg(Color::Yellow)),
+            Span::styled("adds ", Style::new().fg(theme::get().warn)),
             Span::raw(repos),
-            Span::styled(" to this existing task", Style::new().fg(Color::Yellow)),
+            Span::styled(" to this existing task", Style::new().fg(theme::get().warn)),
         ])
     } else {
-        Line::from(vec![Span::raw("in "), Span::raw(repos)]).fg(Color::DarkGray)
+        Line::from(vec![Span::raw("in "), Span::raw(repos)]).fg(theme::get().muted)
     };
     frame.render_widget(where_line, where_row);
 }
@@ -686,9 +722,10 @@ fn render_message_popup(frame: &mut Frame, label: &str, how: &str, text: &TextIn
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().accent))
         .title(format!(" Message to {label} "))
-        .title_style(Style::new().bold().fg(Color::Cyan))
+        .title_style(Style::new().bold().fg(theme::get().accent))
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
@@ -698,9 +735,12 @@ fn render_message_popup(frame: &mut Frame, label: &str, how: &str, text: &TextIn
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
     let [prompt, input] =
         Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(text_row);
-    frame.render_widget(Span::styled("> ", Style::new().fg(Color::Cyan)), prompt);
+    frame.render_widget(
+        Span::styled("> ", Style::new().fg(theme::get().accent)),
+        prompt,
+    );
     text.render(frame, input, Style::new(), true);
-    frame.render_widget(Line::from(how).fg(Color::DarkGray), how_row);
+    frame.render_widget(Line::from(how).fg(theme::get().muted), how_row);
 }
 
 fn render_enter_path_popup(frame: &mut Frame, path: &TextInput) {
@@ -713,9 +753,10 @@ fn render_enter_path_popup(frame: &mut Frame, path: &TextInput) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().accent))
         .title(" Enter Path ")
-        .title_style(Style::new().bold().fg(Color::Cyan))
+        .title_style(Style::new().bold().fg(theme::get().accent))
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
@@ -723,7 +764,10 @@ fn render_enter_path_popup(frame: &mut Frame, path: &TextInput) {
 
     let [prompt, text] =
         Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
-    frame.render_widget(Span::styled("> ", Style::new().fg(Color::Cyan)), prompt);
+    frame.render_widget(
+        Span::styled("> ", Style::new().fg(theme::get().accent)),
+        prompt,
+    );
     path.render(frame, text, Style::new(), true);
 }
 
@@ -799,7 +843,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
             }
             lines.push(Line::styled(
                 title.to_string(),
-                Style::new().fg(Color::Cyan).bold(),
+                Style::new().fg(theme::get().accent).bold(),
             ));
             for (key, what) in entries {
                 lines.push(Line::from(vec![
@@ -842,9 +886,10 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().accent))
         .title(" Keys ")
-        .title_style(Style::new().bold().fg(Color::Cyan))
+        .title_style(Style::new().bold().fg(theme::get().accent))
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -867,7 +912,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
 /// Asks to drop a task, or (with `member`, the focused member of a task
 /// with several) that member alone.
 fn render_confirm_drop_popup(frame: &mut Frame, name: &str, member: Option<&MemberChoice>) {
-    let red = |key: &'static str| Span::styled(key, Style::new().bold().fg(Color::Red));
+    let red = |key: &'static str| Span::styled(key, Style::new().bold().fg(theme::get().bad));
     let mut lines = match member {
         None => vec![Line::from(vec![
             Span::raw("Drop task "),
@@ -915,9 +960,10 @@ fn render_confirm_drop_popup(frame: &mut Frame, name: &str, member: Option<&Memb
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Red))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().bad))
         .title(" Confirm Drop ")
-        .title_style(Style::new().bold().fg(Color::Red))
+        .title_style(Style::new().bold().fg(theme::get().bad))
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
@@ -942,7 +988,7 @@ fn render_force_drop_popup(frame: &mut Frame, name: &str, member: bool, report: 
         Line::raw(""),
         Line::from(vec![
             Span::raw("Drop anyway? "),
-            Span::styled("y", Style::new().bold().fg(Color::Red)),
+            Span::styled("y", Style::new().bold().fg(theme::get().bad)),
             Span::raw("/"),
             Span::styled("n", Style::new().bold()),
         ]),
@@ -960,9 +1006,10 @@ fn render_force_drop_popup(frame: &mut Frame, name: &str, member: bool, report: 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Red))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().bad))
         .title(" Drop Refused ")
-        .title_style(Style::new().bold().fg(Color::Red))
+        .title_style(Style::new().bold().fg(theme::get().bad))
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
@@ -993,23 +1040,23 @@ fn render_repair_or_drop_popup(
     let mut keys = Vec::new();
     if repairable {
         keys.extend([
-            Span::styled("r", Style::new().bold().fg(Color::Green)),
+            Span::styled("r", Style::new().bold().fg(theme::get().ok)),
             Span::raw(" recreate · "),
         ]);
     }
     keys.extend([
-        Span::styled("y", Style::new().bold().fg(Color::Red)),
+        Span::styled("y", Style::new().bold().fg(theme::get().bad)),
         Span::raw(" drop · "),
     ]);
     if in_place {
         keys.extend([
-            Span::styled("b", Style::new().bold().fg(Color::Red)),
+            Span::styled("b", Style::new().bold().fg(theme::get().bad)),
             Span::raw(" drop + delete branch · "),
         ]);
     }
     if let Some(m) = member {
         keys.extend([
-            Span::styled("m", Style::new().bold().fg(Color::Red)),
+            Span::styled("m", Style::new().bold().fg(theme::get().bad)),
             Span::raw(format!(" drop {} only · ", m.label)),
         ]);
     }
@@ -1034,9 +1081,10 @@ fn render_repair_or_drop_popup(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Yellow))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().warn))
         .title(" Worktree Gone ")
-        .title_style(Style::new().bold().fg(Color::Yellow))
+        .title_style(Style::new().bold().fg(theme::get().warn))
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
@@ -1064,9 +1112,10 @@ fn render_notice_popup(frame: &mut Frame, title: &str, lines: &[String]) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Yellow))
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().warn))
         .title(format!(" {title} "))
-        .title_style(Style::new().bold().fg(Color::Yellow))
+        .title_style(Style::new().bold().fg(theme::get().warn))
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(area);
@@ -1076,28 +1125,33 @@ fn render_notice_popup(frame: &mut Frame, title: &str, lines: &[String]) {
 }
 
 pub(super) fn status_display(status: &TaskStatus) -> (&'static str, Color) {
-    match status {
-        TaskStatus::Run => ("● run", Color::Blue),
-        TaskStatus::Input => ("▲ input", Color::Yellow),
-        TaskStatus::Block => ("▲ block", Color::Red),
-        TaskStatus::Question => ("? question", Color::Magenta),
-        TaskStatus::Error => ("✗ error", Color::Red),
-        TaskStatus::Idle => ("○ idle", Color::DarkGray),
-        TaskStatus::Stale => ("◌ stale", Color::DarkGray),
-        TaskStatus::Gone => ("✗ gone", Color::Red),
-    }
+    (status.indicator(), theme::get().status(status))
 }
 
-pub(super) fn context_display(pct: u8) -> Span<'static> {
+/// How full the agent's context is: the percentage, and a gauge of
+/// `CONTEXT_GAUGE` cells.
+pub(super) fn context_display(pct: u8) -> Line<'static> {
+    let t = theme::get();
     let color = if pct >= 90 {
-        Color::Red
+        t.bad
     } else if pct >= 70 {
-        Color::Yellow
+        t.warn
     } else {
-        Color::Green
+        t.ok
     };
-    Span::styled(format!("{pct}%"), Style::new().fg(color))
+    let filled = (usize::from(pct.min(100)) * CONTEXT_GAUGE).div_ceil(100);
+    Line::from(vec![
+        Span::styled(format!("{pct:>3}% "), Style::new().fg(color)),
+        Span::styled("━".repeat(filled), Style::new().fg(color)),
+        Span::styled(
+            "━".repeat(CONTEXT_GAUGE - filled),
+            Style::new().fg(t.subtle),
+        ),
+    ])
 }
+
+/// Cells of the context gauge.
+pub(super) const CONTEXT_GAUGE: usize = 4;
 
 pub fn shorten_home(path: &str) -> String {
     if let Ok(home) = std::env::var("HOME") {
@@ -1447,10 +1501,10 @@ mod tests {
             }),
         );
         let s = screen(&mut app, 100, 34);
-        assert!(s.contains("┌ feat ─"), "{s}");
+        assert!(s.contains("╭ feat ─"), "{s}");
         assert!(s.contains("triage │ terminal"), "{s}");
         assert!(
-            s.contains("│▲ blocked for 3m · permission for Bash  (claude)"),
+            s.contains("│ BLOCKED  for 3m · permission for Bash  (claude)"),
             "{s}"
         );
         assert!(
@@ -1477,7 +1531,7 @@ mod tests {
             terminal.draw(|f| render(f, app)).unwrap();
             let buf = terminal.backend().buffer().clone();
             let row = (0..34)
-                .find(|&y| (0..100).any(|x| buf[(x, y)].symbol() == "┌"))
+                .find(|&y| (0..100).any(|x| buf[(x, y)].symbol() == "╭"))
                 .unwrap();
             let text: String = (0..100).map(|x| buf[(x, row)].symbol()).collect();
             let at = |word: &str| {
@@ -1583,7 +1637,7 @@ mod tests {
         let s = screen(&mut app, 100, 34);
         show("triage, answerable", &s);
         assert!(
-            s.contains("│▲ blocked for 30s · permission for Bash  (claude)  a: answer"),
+            s.contains("│ BLOCKED  for 30s · permission for Bash  (claude)  a: answer"),
             "{s}"
         );
         assert!(s.contains("│  command: cargo test --workspace"), "{s}");
@@ -1812,7 +1866,7 @@ mod tests {
             vec![agent_in("m-1", AgentState::Question, 45, question)],
         );
         let s = screen(&mut app, 100, 30);
-        assert!(s.contains("? question for 45s  (claude)"), "{s}");
+        assert!(s.contains("QUESTION  for 45s  (claude)"), "{s}");
         assert!(
             s.contains("│  Which database should the cache use? (+1 more)"),
             "{s}"
@@ -1832,10 +1886,7 @@ mod tests {
             vec![agent_in("m-1", AgentState::Error, 7200, error)],
         );
         let s = screen(&mut app, 100, 30);
-        assert!(
-            s.contains("✗ error for 2h · turn failed: rate_limit"),
-            "{s}"
-        );
+        assert!(s.contains("ERROR  for 2h · turn failed: rate_limit"), "{s}");
         assert!(s.contains("│  API Error: Rate limit reached"), "{s}");
 
         let denied = AgentDetail {
@@ -1875,7 +1926,7 @@ mod tests {
             vec![agent_in("m-1", AgentState::Input, 750, detail)],
         );
         let s = screen(&mut app, 100, 34);
-        assert!(s.contains("▲ input for 12m · turn finished"), "{s}");
+        assert!(s.contains("◆ input for 12m · turn finished"), "{s}");
         assert!(s.contains("│  Done. Summary:"), "{s}");
         // Cut, with the branch still shown and the screen kept below.
         assert!(s.contains("…"), "{s}");
@@ -1884,7 +1935,7 @@ mod tests {
 
         // 80x24: the pane is short, the screen still has half of it.
         let s = screen(&mut app, 80, 24);
-        assert!(s.contains("▲ input for 12m · turn finished"), "{s}");
+        assert!(s.contains("◆ input for 12m · turn finished"), "{s}");
         assert!(s.contains("│──────"), "{s}");
     }
 
@@ -1925,7 +1976,7 @@ mod tests {
         });
         let mut app = triage_app(vec![gone], vec![]);
         let s = screen(&mut app, 100, 30);
-        assert!(s.contains("✗ gone · no agent"), "{s}");
+        assert!(s.contains("∅ gone · no agent"), "{s}");
         assert!(
             s.contains("worktree /w/app--feat is gone, branch 'feat' is still there"),
             "{s}"
@@ -1948,13 +1999,13 @@ mod tests {
         );
         let s = screen(&mut app, 100, 34);
         // Both members, the blocked one focused: named in the title.
-        assert!(s.contains("┌ feat/web ─"), "{s}");
+        assert!(s.contains("╭ feat/web ─"), "{s}");
         assert!(s.contains("│  ● app  working 30s"), "{s}");
         assert!(
             s.contains("│▸ ▲ web  blocked 3m  permission · Bash: cargo test"),
             "{s}"
         );
-        assert!(s.contains("│▲ blocked for 3m · permission for Bash"), "{s}");
+        assert!(s.contains("│ BLOCKED  for 3m · permission for Bash"), "{s}");
         assert!(s.contains("h/l:member"), "{s}");
 
         // → shows the other one (and enter would attach to it).
@@ -1963,7 +2014,7 @@ mod tests {
         assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
         app.peek.agent = Some("m-1".into());
         let s = screen(&mut app, 100, 34);
-        assert!(s.contains("┌ feat/app ─"), "{s}");
+        assert!(s.contains("╭ feat/app ─"), "{s}");
         assert!(s.contains("│▸ ● app  working 30s"), "{s}");
         assert!(s.contains("│● working for 30s  (claude)"), "{s}");
     }
@@ -2062,6 +2113,90 @@ mod tests {
     // -- The task list -----------------------------------------------------
 
     /// Print a screen when `TAM_SHOW_SCREEN` is set (to look at a layout).
+    /// A drawn buffer as text with ANSI colours, to `cat` in a terminal.
+    fn ansi(buf: &ratatui::buffer::Buffer) -> String {
+        fn color(c: Color, fg: bool) -> String {
+            let base = if fg { 30 } else { 40 };
+            let named = |n: u8| (base + n).to_string();
+            let bright = |n: u8| (base + 60 + n).to_string();
+            match c {
+                Color::Reset => (base + 9).to_string(),
+                Color::Black => named(0),
+                Color::Red => named(1),
+                Color::Green => named(2),
+                Color::Yellow => named(3),
+                Color::Blue => named(4),
+                Color::Magenta => named(5),
+                Color::Cyan => named(6),
+                Color::Gray => named(7),
+                Color::DarkGray => bright(0),
+                Color::LightRed => bright(1),
+                Color::LightGreen => bright(2),
+                Color::LightYellow => bright(3),
+                Color::LightBlue => bright(4),
+                Color::LightMagenta => bright(5),
+                Color::LightCyan => bright(6),
+                Color::White => bright(7),
+                Color::Indexed(i) => format!("{};5;{i}", base + 8),
+                Color::Rgb(r, g, b) => format!("{};2;{r};{g};{b}", base + 8),
+            }
+        }
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                let mut codes = vec!["0".to_string(), color(cell.fg, true), color(cell.bg, false)];
+                for (modifier, code) in [
+                    (Modifier::BOLD, "1"),
+                    (Modifier::DIM, "2"),
+                    (Modifier::ITALIC, "3"),
+                    (Modifier::UNDERLINED, "4"),
+                    (Modifier::REVERSED, "7"),
+                ] {
+                    if cell.modifier.contains(modifier) {
+                        codes.push(code.to_string());
+                    }
+                }
+                out.push_str(&format!("\x1b[{}m{}", codes.join(";"), cell.symbol()));
+            }
+            out.push_str("\x1b[0m\n");
+        }
+        out
+    }
+
+    /// Not a test: writes the fixture dashboard in colour, at several
+    /// sizes and in both themes, to `$TAM_UI_DUMP` (a directory).
+    /// `TAM_UI_DUMP=/tmp/ui cargo test -p tam-cli dump_the_dashboard -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_the_dashboard_in_colour() {
+        let dir = std::path::PathBuf::from(std::env::var("TAM_UI_DUMP").unwrap());
+        theme::set(Some(
+            &std::env::var("TAM_UI_THEME").unwrap_or("dark".into()),
+        ));
+        let draw = |app: &mut App, w: u16, h: u16, name: &str| {
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let text = ansi(terminal.backend().buffer());
+            std::fs::write(dir.join(format!("{name}-{w}x{h}.ansi")), text).unwrap();
+        };
+        for (w, h) in [(100, 30), (160, 40), (200, 50)] {
+            let mut app = dashboard();
+            app.spin = Some(2);
+            select(&mut app, "unit-pricing");
+            let mut app = with_pane(app);
+            draw(&mut app, w, h, "dashboard");
+            app.mode = Mode::Help;
+            draw(&mut app, w, h, "help");
+            app.mode = Mode::ConfirmDropTask {
+                name: "unit-pricing".into(),
+                member: None,
+            };
+            draw(&mut app, w, h, "drop");
+        }
+    }
+
     fn show(label: &str, s: &str) {
         if std::env::var_os("TAM_SHOW_SCREEN").is_some() {
             println!("--- {label}\n{s}");
@@ -2221,12 +2356,14 @@ mod tests {
         show("80x44", &s);
         // A header per repository, the task in two under both.
         for group in ["backend", "backend + frontend", "frontend", "rustpallet"] {
-            assert!(s.lines().any(|l| l.trim_end() == group), "{group}: {s}");
+            // The repositories, then a rule.
+            let named = |l: &str| l.trim_end_matches([' ', '─']) == format!(" {group}");
+            assert!(s.lines().any(named), "{group}: {s}");
         }
         assert!(!s.contains("DIR"), "{s}");
         // The task name is not cut at 15 columns; time in state and branch.
         assert!(
-            s.contains("▲ block      3m fix-allotment-rounding ↑2 *1  claude 67%"),
+            s.contains("BLOCK       3m fix-allotment-rounding ↑2 *1  claude  67% ━━━━"),
             "{s}"
         );
         assert!(s.contains("◌ stale     45d spike-cache"), "{s}");
@@ -2236,10 +2373,10 @@ mod tests {
         // a row per member has.
         assert!(s.lines().any(|l| l.trim() == "unit-pricing"), "{s}");
         assert!(
-            s.contains("● run        1m  ├ backend             ↑1 *3  claude 12%"),
+            s.contains("● run        1m  ├ backend             ↑1 *3  claude  12% ━━━━"),
             "{s}"
         );
-        assert!(s.contains("? question   5m  └ frontend"), "{s}");
+        assert!(s.contains("QUESTION    5m  └ frontend"), "{s}");
 
         let s = screen(&mut app, 120, 44);
         show("120x44", &s);
@@ -2263,9 +2400,9 @@ mod tests {
         show("attention 80x24", &s);
         assert!(s.contains("attention first"), "{s}");
         let rows: Vec<&str> = s.lines().skip(2).collect();
-        assert!(rows[0].starts_with("▲ block"), "{s}");
+        assert!(rows[0].trim_start().starts_with("BLOCK"), "{s}");
         assert!(rows[1].trim_start().starts_with("unit-pricing "), "{s}");
-        assert!(rows[3].starts_with("? question"), "{s}");
+        assert!(rows[3].trim_start().starts_with("QUESTION"), "{s}");
         assert!(s.contains("REPO"), "{s}");
         assert!(s.contains("backend + frontend"), "{s}");
     }
@@ -2279,16 +2416,19 @@ mod tests {
         show("200x40 pane", &s);
         // The list on the left, the pane on the right from the top.
         let first = s.lines().nth(1).unwrap();
-        assert!(first.starts_with("STATUS"), "{s}");
-        assert!(first.contains("┌ unit-pricing/frontend"), "{s}");
+        assert!(first.trim_start().starts_with("STATUS"), "{s}");
+        assert!(first.contains("╭ unit-pricing/frontend"), "{s}");
         // The member the keys act on is marked.
         assert!(s.contains("└▸frontend"), "{s}");
 
         // Narrower: the pane below a list as tall as its rows allow.
         let s = screen(&mut app, 120, 40);
         show("120x40 pane", &s);
-        assert!(s.lines().nth(1).unwrap().starts_with("STATUS"), "{s}");
-        assert!(!s.lines().nth(1).unwrap().contains('┌'), "{s}");
+        assert!(
+            s.lines().nth(1).unwrap().trim_start().starts_with("STATUS"),
+            "{s}"
+        );
+        assert!(!s.lines().nth(1).unwrap().contains('╭'), "{s}");
         let s = screen(&mut app, 80, 24);
         show("80x24 pane", &s);
         // The selected task's members stay in view.
@@ -2304,19 +2444,19 @@ mod tests {
         // The agent column goes first, then context.
         assert!(!s.contains("AGENT"), "{s}");
         assert!(s.contains("fix-allotment-rounding"), "{s}");
-        let s = screen(&mut app, 36, 20);
-        show("36x20", &s);
-        assert!(s.contains("fix-allotment-round…"), "{s}");
-        assert!(s.contains(" tam — 7 tasks · 3 need you "), "{s}");
+        let s = screen(&mut app, 30, 20);
+        show("30x20", &s);
+        assert!(s.contains("fix-allotment-rou…"), "{s}");
+        assert!(s.contains(" tam  7 tasks  3 need you "), "{s}");
 
         // Just wide enough for the pane beside the list, and just not.
         let mut app = with_pane(dashboard());
         let s = screen(&mut app, 136, 30);
         show("136x30 pane", &s);
-        assert!(s.lines().nth(1).unwrap().contains('┌'), "{s}");
+        assert!(s.lines().nth(1).unwrap().contains('╭'), "{s}");
         let s = screen(&mut app, 135, 30);
         show("135x30 pane", &s);
-        assert!(!s.lines().nth(1).unwrap().contains('┌'), "{s}");
+        assert!(!s.lines().nth(1).unwrap().contains('╭'), "{s}");
     }
 
     #[test]
@@ -2344,7 +2484,10 @@ mod tests {
         // 18 rows: header, footer, the pane, and for the list (half of
         // the rest) the column names and 7 rows.
         let s = screen(&mut app, 80, 18);
-        assert!(s.lines().nth(2).unwrap().starts_with("api"), "{s}");
+        assert!(
+            s.lines().nth(2).unwrap().trim_start().starts_with("api"),
+            "{s}"
+        );
         select(&mut app, "zz-both");
         let s = screen(&mut app, 80, 18);
         show("scrolled", &s);
@@ -2360,7 +2503,10 @@ mod tests {
         assert!(s.contains("└ web"), "kept in view: {s}");
         app.selected = 0;
         let s = screen(&mut app, 80, 18);
-        assert!(s.lines().nth(2).unwrap().starts_with("api"), "{s}");
+        assert!(
+            s.lines().nth(2).unwrap().trim_start().starts_with("api"),
+            "{s}"
+        );
     }
 
     // -- Help, filter, prompts -------------------------------------------
@@ -2446,9 +2592,9 @@ mod tests {
             .unwrap();
         let text: String = (0..80).map(|x| buf[(x, row)].symbol()).collect();
         let x = text[..text.find("2d nav ").unwrap()].chars().count() as u16 + 3;
-        assert_eq!(buf[(x, row)].fg, Color::Cyan);
+        assert_eq!(buf[(x, row)].fg, theme::get().accent);
         assert_eq!(buf[(x + 1, row)].fg, Color::Reset);
-        assert_eq!(buf[(x + 2, row)].fg, Color::Cyan);
+        assert_eq!(buf[(x + 2, row)].fg, theme::get().accent);
         // Typing elsewhere: no cursor in the list.
         app.filter_active = false;
         let (_, cursor) = screen_and_cursor(&mut app, 80, 24);

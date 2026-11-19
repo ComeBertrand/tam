@@ -9,7 +9,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 use tam_proto::ScreenInfo;
 
-/// The preview pane's state, while it is shown.
+/// The smallest pane an agent's terminal is resized to.
+const MIN_COLS: u16 = 40;
+const MIN_ROWS: u16 = 10;
+
+/// The preview pane's state.
 #[derive(Default)]
 pub struct Peek {
     /// The agent shown: the selected task's, when it has one running.
@@ -25,6 +29,12 @@ pub struct Peek {
     pub from: Option<u64>,
     /// Rows of the pane at the last draw.
     pub height: u16,
+    /// Columns and rows the pane has for the agent's screen when it shows
+    /// nothing else (at the last draw).
+    pub room: (u16, u16),
+    /// The size last asked for the agent's terminal: asked once, so that
+    /// two dashboards of different sizes do not fight over it.
+    pub asked: Option<(u16, u16)>,
 }
 
 /// How to move through an agent's screen and history.
@@ -59,6 +69,18 @@ impl Peek {
         }
         self.screen = Some(screen);
         self.error = None;
+    }
+
+    /// The size the agent's terminal should take to fill the pane, when it
+    /// has another and was not asked for this one yet.
+    pub fn wanted_size(&self) -> Option<(u16, u16)> {
+        let (cols, rows) = self.room;
+        let (has_rows, has_cols) = self.screen.as_ref()?.size();
+        // Too small to be a terminal: the agent keeps its size.
+        if cols < MIN_COLS || rows < MIN_ROWS {
+            return None;
+        }
+        ((has_cols, has_rows) != self.room && self.asked != Some(self.room)).then_some(self.room)
     }
 
     /// When scrolled back: how many lines of history the pane shows above
@@ -251,6 +273,35 @@ fn color(color: vt100::Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_is_asked_once_for_the_size_of_the_pane() {
+        let screen = |cols, rows| ScreenInfo {
+            cols,
+            rows,
+            contents: String::new(),
+            top: 0,
+            oldest: 0,
+            live: 0,
+        };
+        let mut peek = Peek::default();
+        assert_eq!(peek.wanted_size(), None, "no screen yet");
+        peek.set_screen(&screen(80, 24));
+        assert_eq!(peek.wanted_size(), None, "not drawn yet");
+        peek.room = (120, 40);
+        assert_eq!(peek.wanted_size(), Some((120, 40)));
+        // Asked: not again, even if another viewer resized it since.
+        peek.asked = Some((120, 40));
+        assert_eq!(peek.wanted_size(), None);
+        // The pane changed: asked again.
+        peek.room = (100, 40);
+        assert_eq!(peek.wanted_size(), Some((100, 40)));
+        peek.set_screen(&screen(100, 40));
+        assert_eq!(peek.wanted_size(), None, "it fits");
+        // A pane too small to be a terminal leaves the agent alone.
+        peek.room = (30, 8);
+        assert_eq!(peek.wanted_size(), None);
+    }
 
     /// A reply for a `cols`×`rows` screen showing `output`.
     fn info(cols: u16, rows: u16, output: &str, top: u64, oldest: u64, live: u64) -> ScreenInfo {

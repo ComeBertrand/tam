@@ -5,6 +5,7 @@ mod fuzzy;
 mod input;
 mod peek;
 mod table;
+mod theme;
 mod triage;
 mod ui;
 
@@ -122,6 +123,7 @@ pub async fn run() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     mouse_capture(true);
 
+    theme::set(config.theme.as_deref());
     let mut app = App::new();
     app.commands = config.commands.clone();
     app.set_tasks(tasks);
@@ -236,6 +238,10 @@ async fn run_loop(
     // Redraw at least every second: times in state move on.
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Faster while an agent works: its spinner.
+    let mut spin = tokio::time::interval(Duration::from_millis(120));
+    spin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    app.spin = Some(0);
     // What git said of a member's worktree (looked at off this thread).
     let (branch_tx, mut branch_rx) = tokio::sync::mpsc::unbounded_channel();
     // The projects found under $HOME (looked for off this thread).
@@ -253,6 +259,7 @@ async fn run_loop(
         if app.detail_stale() {
             refresh_detail(client, app).await;
         }
+        fit_agent(client, app).await;
         if let Some((id, dir)) = app.branch_due() {
             let tx = branch_tx.clone();
             // A thread of its own: quitting never waits for a slow git (the
@@ -293,6 +300,10 @@ async fn run_loop(
                 Vec::new()
             }
             _ = tick.tick() => Vec::new(),
+            _ = spin.tick(), if app.any_running() => {
+                app.spin = app.spin.map(|n| n.wrapping_add(1));
+                Vec::new()
+            }
         };
 
         for ev in events {
@@ -325,6 +336,8 @@ async fn run_loop(
                     mouse_capture(true);
                     input.resume();
                     attached?;
+                    // Attached, the agent took the terminal's size.
+                    app.peek.asked = None;
                     screen_moved = true;
                     // What came before attaching is not for the dashboard.
                     break;
@@ -1034,6 +1047,7 @@ async fn refresh_peek(client: &mut Client, app: &mut App) {
             agent: wanted.clone(),
             watching: peek.watching.take(),
             height: peek.height,
+            room: peek.room,
             ..Peek::default()
         };
     }
@@ -1052,6 +1066,20 @@ async fn refresh_peek(client: &mut Client, app: &mut App) {
             peek.error = Some(format!("{e:#}"));
         }
     }
+}
+
+/// Give the agent the pane shows a terminal of the pane's size, so that
+/// its screen fills it: asked once per agent and size (see `Peek::asked`).
+/// Its screen follows (`ScreenUpdated`).
+async fn fit_agent(client: &mut Client, app: &mut App) {
+    let (Some(id), Some((cols, rows))) = (app.peek.agent.clone(), app.peek.wanted_size()) else {
+        return;
+    };
+    app.peek.asked = Some((cols, rows));
+    // An error is an agent already gone: its exit event follows.
+    let _ = client
+        .send(tam_proto::Request::Resize { id, cols, rows })
+        .await;
 }
 
 /// Fetch the selected task's runs and messages for the detail pane (it

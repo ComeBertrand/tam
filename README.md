@@ -362,20 +362,20 @@ Running `tam` with no arguments opens the dashboard:
 
 ```
  tam  7 tasks  3 need you                                         by repository
- STATUS          TASK                   BRANCH AGENT  CTX
- backend ──────────────────────────────────────────────────────
-▌▲ block      3m fix-allotment-rounding ↑2 *1  claude  67% ━━━━
- ⠹ run       20s perf                   =      claude  31% ━━━━
- ◌ stale     45d spike-cache            ↑5 ↓12 -
- backend + frontend ───────────────────────────────────────────
+ STATUS          TASK                                    BRANCH AGENT  CTX
+ backend ───────────────────────────────────────────────────────────────────────
+▌▲ block      3m fix-allotment-rounding                  ↑2 *1  claude  67% ━━━━
+ ⠹ run       20s perf                                    =      claude  31% ━━━━
+ ◌ stale     45d spike-cache                             ↑5 ↓12 -
+ backend + frontend ────────────────────────────────────────────────────────────
                  unit-pricing
- ⠹ run        1m  ├ backend             ↑1 *3  claude  12% ━━━━
- ? question   5m  └▸frontend            ↑1     claude  40% ━━━━
- frontend ─────────────────────────────────────────────────────
- ○ idle       2d nav                    =      -
- ∅ gone       3d old-banner                    -
- rustpallet ───────────────────────────────────────────────────
- ◆ ready     12m offload-explain        ↑3 ↓1  claude  55% ━━━━
+ ⠹ run        1m  ├ backend                              ↑1 *3  claude  12% ━━━━
+ ? question   5m  └▸frontend                             ↑1     claude  40% ━━━━
+ frontend ──────────────────────────────────────────────────────────────────────
+ ○ idle       2d nav                                     =      -
+ ∅ gone       3d old-banner                                     -
+ rustpallet ────────────────────────────────────────────────────────────────────
+ ◆ ready     12m offload-explain                         ↑3 ↓1  claude  55% ━━━━
  enter:attach  s:stop  d:drop  n:new  /:filter  ?:help  q:quit
 ```
 

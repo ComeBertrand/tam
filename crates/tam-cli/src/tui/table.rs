@@ -237,8 +237,9 @@ fn name_line(name: &str, query: &str, style: Style) -> Line<'static> {
 }
 
 /// Column widths for `width` columns: drops the columns that do not fit
-/// (from `cols` and each row of `cells`), the task column as wide as its
-/// longest name while there is room.
+/// (from `cols` and each row of `cells`). The task column is as wide as
+/// its longest name while there is room, and takes the room left when no
+/// note column does.
 fn fit(cols: &mut Vec<Col>, cells: &mut [Vec<Line<'static>>], width: u16) -> Vec<u16> {
     let natural = |cols: &[Col], cells: &[Vec<Line>], i: usize| {
         cols[i].fixed_width().unwrap_or_else(|| {
@@ -277,12 +278,19 @@ fn fit(cols: &mut Vec<Col>, cells: &mut [Vec<Line<'static>>], width: u16) -> Vec
             }
         }
     }
-    let task_width = natural(
-        cols,
-        cells,
-        cols.iter().position(|&c| c == Col::Task).unwrap(),
-    )
-    .min(width.saturating_sub(others(cols, cells)));
+    let room = width.saturating_sub(others(cols, cells));
+    // The list fills its width: the note column takes what is left, else
+    // the task column does (the columns after it sit at the right edge).
+    let task_width = if cols.contains(&Col::Note) {
+        natural(
+            cols,
+            cells,
+            cols.iter().position(|&c| c == Col::Task).unwrap(),
+        )
+        .min(room)
+    } else {
+        room
+    };
     (0..cols.len())
         .map(|i| match cols[i] {
             Col::Task => task_width,

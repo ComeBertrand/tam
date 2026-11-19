@@ -375,12 +375,10 @@ fn status_cell(status: TaskStatus, spin: Option<usize>) -> Line<'static> {
     }
     let style = Style::new().fg(color);
     match status {
-        // An agent stuck on the user: a filled label.
-        TaskStatus::Block | TaskStatus::Question | TaskStatus::Error => Line::from(Span::styled(
-            format!(" {} ", status.to_string().to_uppercase()),
-            theme::get().chip(color),
-        )),
-        TaskStatus::Ready => Line::styled(text, style.add_modifier(Modifier::BOLD)),
+        // What needs the user stands out.
+        TaskStatus::Block | TaskStatus::Question | TaskStatus::Error | TaskStatus::Ready => {
+            Line::styled(text, style.add_modifier(Modifier::BOLD))
+        }
         _ => Line::styled(text, style),
     }
 }

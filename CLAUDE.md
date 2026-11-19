@@ -347,8 +347,8 @@ adopt). `tam-cli` depends on all three.
   (`peek.rs` keeps the agent's colours). Dialogs draw over a dimmed dashboard
   (`ui::render`, not the footer: it has their keys). A working agent's mark
   is a spinner (`App::spin`, `None` in tests; the loop ticks every 120 ms
-  only while one works). What needs an answer (block, question, error) is a
-  filled label in the list and the pane's headline. The agent the pane
+  only while one works). What needs the user (block, question, error, ready) is in
+  bold. The agent the pane
   shows is given a terminal of the pane's size (`fit_agent`,
   `Peek::wanted_size`: asked once per agent and size, again after an
   attach). `ui::tests::dump_the_dashboard_in_colour` (ignored)

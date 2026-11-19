@@ -16,7 +16,9 @@ pub enum AgentState {
     /// Needs user action to continue (e.g. permission prompt)
     Blocked,
     /// Finished current task, waiting for new prompt
-    Input,
+    /// `input` before: still read.
+    #[serde(alias = "input")]
+    Ready,
     /// Running but inactive (heuristic fallback)
     Idle,
     /// Asked the user a question and waits for the answer
@@ -30,7 +32,7 @@ impl std::fmt::Display for AgentState {
         match self {
             Self::Working => write!(f, "working"),
             Self::Blocked => write!(f, "blocked"),
-            Self::Input => write!(f, "input"),
+            Self::Ready => write!(f, "ready"),
             Self::Idle => write!(f, "idle"),
             Self::Question => write!(f, "question"),
             Self::Error => write!(f, "error"),
@@ -727,7 +729,9 @@ pub enum Request {
 pub enum MemberState {
     Working,
     Blocked,
-    Input,
+    /// `input` before: still read.
+    #[serde(alias = "input")]
+    Ready,
     Idle,
     Question,
     Error,
@@ -738,18 +742,18 @@ impl MemberState {
     /// Every state but `Working`: the agent waits on someone, or is gone.
     pub const SETTLED: [MemberState; 6] = [
         Self::Blocked,
-        Self::Input,
+        Self::Ready,
         Self::Idle,
         Self::Question,
         Self::Error,
         Self::Exit,
     ];
 
-    /// Whether a member in this state is one `until` waits for. `Input`
+    /// Whether a member in this state is one `until` waits for. `Ready`
     /// takes in `Idle`: agents tam knows only by their output (no hooks)
-    /// are never `input`, they go `idle` once quiet.
+    /// are never `ready`, they go `idle` once quiet.
     pub fn satisfies(self, until: &[MemberState]) -> bool {
-        until.contains(&self) || (self == Self::Idle && until.contains(&Self::Input))
+        until.contains(&self) || (self == Self::Idle && until.contains(&Self::Ready))
     }
 }
 
@@ -758,7 +762,7 @@ impl From<AgentState> for MemberState {
         match state {
             AgentState::Working => Self::Working,
             AgentState::Blocked => Self::Blocked,
-            AgentState::Input => Self::Input,
+            AgentState::Ready => Self::Ready,
             AgentState::Idle => Self::Idle,
             AgentState::Question => Self::Question,
             AgentState::Error => Self::Error,
@@ -771,7 +775,7 @@ impl std::fmt::Display for MemberState {
         match self {
             Self::Working => write!(f, "working"),
             Self::Blocked => write!(f, "blocked"),
-            Self::Input => write!(f, "input"),
+            Self::Ready => write!(f, "ready"),
             Self::Idle => write!(f, "idle"),
             Self::Question => write!(f, "question"),
             Self::Error => write!(f, "error"),
@@ -1075,7 +1079,7 @@ mod tests {
     fn agent_state_display() {
         assert_eq!(AgentState::Working.to_string(), "working");
         assert_eq!(AgentState::Blocked.to_string(), "blocked");
-        assert_eq!(AgentState::Input.to_string(), "input");
+        assert_eq!(AgentState::Ready.to_string(), "ready");
         assert_eq!(AgentState::Idle.to_string(), "idle");
         assert_eq!(AgentState::Question.to_string(), "question");
         assert_eq!(AgentState::Error.to_string(), "error");
@@ -1086,7 +1090,7 @@ mod tests {
         for state in [
             AgentState::Working,
             AgentState::Blocked,
-            AgentState::Input,
+            AgentState::Ready,
             AgentState::Idle,
             AgentState::Question,
             AgentState::Error,
@@ -1108,8 +1112,17 @@ mod tests {
             "\"blocked\""
         );
         assert_eq!(
-            serde_json::to_string(&AgentState::Input).unwrap(),
-            "\"input\""
+            serde_json::to_string(&AgentState::Ready).unwrap(),
+            "\"ready\""
+        );
+        // Its name before is still read.
+        assert_eq!(
+            serde_json::from_str::<AgentState>("\"input\"").unwrap(),
+            AgentState::Ready
+        );
+        assert_eq!(
+            serde_json::from_str::<MemberState>("\"input\"").unwrap(),
+            MemberState::Ready
         );
     }
 
@@ -1386,7 +1399,7 @@ mod tests {
         let event = Event::StateChange {
             id: "fix-auth".into(),
             old: AgentState::Working,
-            new: AgentState::Input,
+            new: AgentState::Ready,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"state_change\""));
@@ -1395,7 +1408,7 @@ mod tests {
             Event::StateChange { id, old, new } => {
                 assert_eq!(id, "fix-auth");
                 assert_eq!(old, AgentState::Working);
-                assert_eq!(new, AgentState::Input);
+                assert_eq!(new, AgentState::Ready);
             }
             _ => panic!("wrong variant"),
         }
@@ -2060,7 +2073,7 @@ mod tests {
             r#"{"type":"wait_agents","members":["feat"]}"#
         );
         let req: Request = serde_json::from_str(
-            r#"{"type":"wait_agents","members":["m-1"],"until":["input","exit"],"timeout_secs":30}"#,
+            r#"{"type":"wait_agents","members":["m-1"],"until":["ready","exit"],"timeout_secs":30}"#,
         )
         .unwrap();
         match req {
@@ -2070,7 +2083,7 @@ mod tests {
                 timeout_secs,
             } => {
                 assert_eq!(members, ["m-1"]);
-                assert_eq!(until, [MemberState::Input, MemberState::Exit]);
+                assert_eq!(until, [MemberState::Ready, MemberState::Exit]);
                 assert_eq!(timeout_secs, Some(30));
             }
             other => panic!("wrong variant: {other:?}"),
@@ -2089,7 +2102,7 @@ mod tests {
         for state in [
             AgentState::Working,
             AgentState::Blocked,
-            AgentState::Input,
+            AgentState::Ready,
             AgentState::Idle,
             AgentState::Question,
             AgentState::Error,
@@ -2111,9 +2124,9 @@ mod tests {
     #[test]
     fn idle_satisfies_a_wait_for_input() {
         use MemberState::*;
-        assert!(Idle.satisfies(&[Input]));
-        assert!(Input.satisfies(&[Input, Exit]));
-        assert!(!Input.satisfies(&[Idle]));
+        assert!(Idle.satisfies(&[Ready]));
+        assert!(Ready.satisfies(&[Ready, Exit]));
+        assert!(!Ready.satisfies(&[Idle]));
         assert!(!Working.satisfies(&MemberState::SETTLED));
         assert!(Exit.satisfies(&MemberState::SETTLED));
     }

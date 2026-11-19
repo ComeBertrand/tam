@@ -51,7 +51,7 @@ pub fn load_notify_config() -> Option<NotifyConfig> {
     let on_states = section
         .on_states
         .unwrap_or_else(|| {
-            ["input", "blocked", "question", "error"]
+            ["ready", "blocked", "question", "error"]
                 .map(String::from)
                 .to_vec()
         })
@@ -66,7 +66,8 @@ fn parse_state(s: &str) -> Option<AgentState> {
     match s {
         "working" => Some(AgentState::Working),
         "blocked" => Some(AgentState::Blocked),
-        "input" => Some(AgentState::Input),
+        // `input`: its name before, in configs written then.
+        "ready" | "input" => Some(AgentState::Ready),
         "idle" => Some(AgentState::Idle),
         "question" => Some(AgentState::Question),
         "error" => Some(AgentState::Error),
@@ -121,7 +122,7 @@ impl Notification<'_> {
         match self.new {
             AgentState::Question => "question".into(),
             AgentState::Blocked => "permission".into(),
-            AgentState::Input => "done".into(),
+            AgentState::Ready => "done".into(),
             AgentState::Error => "error".into(),
             other => other.to_string(),
         }
@@ -135,7 +136,7 @@ impl Notification<'_> {
             AgentState::Question | AgentState::Blocked => {
                 d.pending.as_ref().map(|p| p.summary.clone())
             }
-            AgentState::Input => d.last_message.clone(),
+            AgentState::Ready => d.last_message.clone(),
             AgentState::Error => d
                 .error
                 .as_ref()
@@ -292,7 +293,7 @@ mod tests {
     fn parse_states() {
         assert_eq!(parse_state("working"), Some(AgentState::Working));
         assert_eq!(parse_state("blocked"), Some(AgentState::Blocked));
-        assert_eq!(parse_state("input"), Some(AgentState::Input));
+        assert_eq!(parse_state("ready"), Some(AgentState::Ready));
         assert_eq!(parse_state("idle"), Some(AgentState::Idle));
         assert_eq!(parse_state("unknown"), None);
     }
@@ -312,7 +313,7 @@ mod tests {
         NotifyConfig {
             command: command.into(),
             on_states: vec![
-                AgentState::Input,
+                AgentState::Ready,
                 AgentState::Blocked,
                 AgentState::Question,
                 AgentState::Error,
@@ -336,10 +337,10 @@ mod tests {
     fn fires_only_on_configured_states() {
         let d = AgentDetail::default();
         let mut cfg = config("echo {task} {state} {old_state}");
-        cfg.on_states = vec![AgentState::Input];
+        cfg.on_states = vec![AgentState::Ready];
         assert_eq!(
-            command_for(&cfg, &n(AgentState::Input, &d)).as_deref(),
-            Some("echo feat input working")
+            command_for(&cfg, &n(AgentState::Ready, &d)).as_deref(),
+            Some("echo feat ready working")
         );
         assert!(command_for(&cfg, &n(AgentState::Working, &d)).is_none());
     }
@@ -347,7 +348,7 @@ mod tests {
     #[test]
     fn skipped_when_a_viewer_is_attached() {
         let d = AgentDetail::default();
-        let mut notif = n(AgentState::Input, &d);
+        let mut notif = n(AgentState::Ready, &d);
         notif.viewers = 1;
         assert!(command_for(&config("echo"), &notif).is_none());
     }
@@ -373,8 +374,8 @@ mod tests {
             "permission/Bash//touch x/agent-1/blocked\n"
         );
         assert_eq!(
-            run(AgentState::Input, &d),
-            "done///All done./agent-1/input\n"
+            run(AgentState::Ready, &d),
+            "done///All done./agent-1/ready\n"
         );
         assert_eq!(
             run(AgentState::Error, &d),
@@ -397,7 +398,7 @@ mod tests {
             last_message: Some(nasty.into()),
             ..Default::default()
         };
-        let notif = n(AgentState::Input, &d);
+        let notif = n(AgentState::Ready, &d);
         for template in [
             "printf '%s' {message}",
             "printf '%s' '{message}'",
@@ -421,8 +422,8 @@ mod tests {
         let d = AgentDetail::default();
         let cfg = config("printf '%s|%s' 'tam: {task}' '{status}'");
         assert_eq!(
-            sh(&command_for(&cfg, &n(AgentState::Input, &d)).unwrap()),
-            "tam: feat|input"
+            sh(&command_for(&cfg, &n(AgentState::Ready, &d)).unwrap()),
+            "tam: feat|ready"
         );
     }
 
@@ -430,7 +431,7 @@ mod tests {
     fn unknown_placeholders_and_escapes_are_kept() {
         let d = AgentDetail::default();
         let cfg = config(r#"echo {nope} \' {task} "\"{task}""#);
-        let cmd = command_for(&cfg, &n(AgentState::Input, &d)).unwrap();
+        let cmd = command_for(&cfg, &n(AgentState::Ready, &d)).unwrap();
         assert_eq!(cmd, r#"echo {nope} \' feat "\"feat""#);
     }
 
@@ -440,7 +441,7 @@ mod tests {
             last_message: Some("x".repeat(500)),
             ..Default::default()
         };
-        let m = n(AgentState::Input, &d).message();
+        let m = n(AgentState::Ready, &d).message();
         assert_eq!(m.chars().count(), MAX_MESSAGE_CHARS + 1);
     }
 }

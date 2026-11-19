@@ -2060,7 +2060,7 @@ impl DaemonState {
                 agent.member() == Some(id.as_str())
                     && !agent.inbox_hook()
                     && !self.inbox.has_waiter(id)
-                    && matches!(agent.current_state(), AgentState::Idle | AgentState::Input)
+                    && matches!(agent.current_state(), AgentState::Idle | AgentState::Ready)
             })
             .map(|(id, _)| id.clone())
             .collect();

@@ -505,7 +505,7 @@ fn silence_fallback(
     timeout: Option<Duration>,
 ) -> AgentState {
     match timeout {
-        Some(t) if stored == AgentState::Working && silent_for >= t => AgentState::Input,
+        Some(t) if stored == AgentState::Working && silent_for >= t => AgentState::Ready,
         _ => stored,
     }
 }
@@ -568,13 +568,13 @@ mod tests {
     fn silent_working_agent_falls_back_to_input() {
         let s = |stored, secs| silence_fallback(stored, Duration::from_secs(secs), T);
         assert_eq!(s(AgentState::Working, 3), AgentState::Working);
-        assert_eq!(s(AgentState::Working, 10), AgentState::Input);
+        assert_eq!(s(AgentState::Working, 10), AgentState::Ready);
         // Only `working` is subject to the fallback
         for state in [
             AgentState::Blocked,
             AgentState::Question,
             AgentState::Error,
-            AgentState::Input,
+            AgentState::Ready,
         ] {
             assert_eq!(s(state, 60), state);
         }

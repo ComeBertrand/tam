@@ -30,6 +30,9 @@ adopt). `tam-cli` depends on all three.
   (merge, split) is one ledger event. Names typed by users (task, `task/member`,
   member id, or the cwd) are resolved by the daemon: `Ledger::resolve` /
   `member_at`, request `ResolveMember`.
+- **`ready`** — the state of an agent waiting for a prompt (`AgentState::Ready`,
+  `TaskStatus::Ready`) was `input`: that name is still read on the wire, in
+  `[notify] on_states` and by `tam wait -u`, never written.
 - **Task status is always derived** — computed from agent state + the
   member health the daemon observed in git + activity timestamps, never
   stored. See `task.rs` `Task::status()`: each member has its own status, the
@@ -113,7 +116,7 @@ adopt). `tam-cli` depends on all three.
   are injected per spawn (`claude --settings`) and run `tam hook-notify`, which
   forwards the hook's JSON input to the daemon (`$TAM_SOCKET`, never starting
   one); `ClaudeProvider::handle_hook` maps it to a state and per-agent
-  `AgentDetail`. A working Claude agent silent for 10s falls back to input
+  `AgentDetail`. A working Claude agent silent for 10s falls back to ready
   (interrupted turns fire no hook).
 - **One session per member, resumed by default** — clients start a member's
   agent with `RunAgent { session: current | new | id }` (`handle_run_agent`):
@@ -255,7 +258,7 @@ adopt). `tam-cli` depends on all three.
   every key present (`null`), documented in the README (Scripting); a key removed
   or retyped bumps the version, `ps --json` keeps its pre-version keys. `tam wait`
   is `WaitAgents` (a `dispatch` arm like `WaitReply`: events plus a 1s recheck,
-  gives up on `exit`/`error` not waited for; `MemberState::satisfies`: `input`
+  gives up on `exit`/`error` not waited for; `MemberState::satisfies`: `ready`
   takes `idle`); `tam result` is `GetOutcomes`. A task name means all its members
   there. `MemberOutcome.response` is the Stop hook's `last_assistant_message` in
   full (`HookData::response`, up to 100k chars, cleared at `UserPromptSubmit`;

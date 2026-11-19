@@ -355,7 +355,7 @@ mod tests {
             last_message: Some(format!("Done.\n\n{}", "x".repeat(200))),
             ..Default::default()
         };
-        let said = description(&agent(AgentState::Input, said)).unwrap();
+        let said = description(&agent(AgentState::Ready, said)).unwrap();
         assert!(said.starts_with("last response: Done. xxx"), "{said}");
         assert_eq!(said.chars().count(), DESCRIPTION_LEN + 1);
         assert_eq!(
@@ -387,7 +387,7 @@ mod tests {
                 run_count: 1,
                 last_activity: None,
             },
-            &[agent(AgentState::Input, detail)],
+            &[agent(AgentState::Ready, detail)],
         );
         let rows: Vec<Row> = task
             .members
@@ -403,7 +403,7 @@ mod tests {
             [
                 "NAME      ID   STATUS  AGENT   REPO      BRANCH  WORKTREE",
                 "api       m-1  idle    -       api       feat    /w/api",
-                "frontend  m-2  input   claude  frontend  feat    /w/frontend",
+                "frontend  m-2  ready   claude  frontend  feat    /w/frontend",
                 "          last response: Agreed: POST /items",
             ]
         );

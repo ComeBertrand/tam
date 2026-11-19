@@ -447,7 +447,7 @@ fn claude_handle_hook(
             // blocked and error alone.
             Some("idle_prompt") if current == AgentState::Working => {
                 detail.pending = None;
-                Some(AgentState::Input)
+                Some(AgentState::Ready)
             }
             Some("elicitation_dialog") => {
                 detail.pending = Some(Pending {
@@ -467,7 +467,7 @@ fn claude_handle_hook(
                 text: truncate(m, MAX_RESPONSE_LEN),
                 at: crate::ledger::now(),
             });
-            Some(AgentState::Input)
+            Some(AgentState::Ready)
         }
         "StopFailure" => {
             detail.pending = None;
@@ -1136,7 +1136,7 @@ mod tests {
         hook(
             "SessionStart",
             serde_json::json!({"session_id": "s2", "transcript_path": "/t/s2.jsonl"}),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert_eq!(d.detail.session_id.as_deref(), Some("s2"));
@@ -1231,7 +1231,7 @@ mod tests {
             AgentState::Working,
             &mut d,
         );
-        assert_eq!(r, handled(AgentState::Input));
+        assert_eq!(r, handled(AgentState::Ready));
         assert_eq!(d.detail.last_message.as_deref(), Some("All done."));
         assert!(d.detail.pending.is_none());
     }
@@ -1288,7 +1288,7 @@ mod tests {
         let idle = serde_json::json!({"notification_type": "idle_prompt"});
         assert_eq!(
             hook("Notification", idle.clone(), AgentState::Working, &mut d),
-            handled(AgentState::Input)
+            handled(AgentState::Ready)
         );
         // idle_prompt leaves an error (or a question) alone
         assert_eq!(
@@ -1330,7 +1330,7 @@ mod tests {
         let mut d = HookData::default();
         assert_eq!(
             p.handle_hook("Stop", None, AgentState::Working, &mut d),
-            handled(AgentState::Input)
+            handled(AgentState::Ready)
         );
         assert!(d.detail.last_message.is_none());
     }
@@ -1602,21 +1602,21 @@ mod tests {
         hook(
             "SessionStart",
             start("s1", "startup"),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert_eq!(d.resumable_session, None);
         hook(
             "Notification",
             serde_json::json!({"session_id": "s1", "notification_type": "idle_prompt"}),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert_eq!(d.resumable_session, None);
         hook(
             "UserPromptSubmit",
             serde_json::json!({"session_id": "s1"}),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert_eq!(d.resumable_session.as_deref(), Some("s1"));
@@ -1625,13 +1625,13 @@ mod tests {
         hook(
             "SessionStart",
             start("s2", "clear"),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         hook(
             "SessionEnd",
             serde_json::json!({"session_id": "s2"}),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert_eq!(d.detail.session_id.as_deref(), Some("s2"));
@@ -1648,7 +1648,7 @@ mod tests {
         hook(
             "SessionStart",
             start("s0", "resume"),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert_eq!(d.resumable_session.as_deref(), Some("s0"));
@@ -1765,14 +1765,14 @@ mod tests {
         hook(
             "SessionStart",
             serde_json::json!({"session_id": "s1", "source": "resume"}),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert!(d.response.is_some());
         hook(
             "UserPromptSubmit",
             serde_json::json!({"prompt": "more"}),
-            AgentState::Input,
+            AgentState::Ready,
             &mut d,
         );
         assert!(d.response.is_none());

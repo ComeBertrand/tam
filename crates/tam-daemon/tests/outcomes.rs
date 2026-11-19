@@ -170,11 +170,11 @@ async fn wait_ends_once_the_agent_settles() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
     let ids = task(&sock, dir.path(), "feat", &["api"]).await;
-    // Prints, then stays quiet: idle after 5s, which is input enough for an
+    // Prints, then stays quiet: idle after 5s, which is ready enough for an
     // agent without hooks.
     spawn(&sock, &ids[0], "echo started; exec sleep 60").await;
 
-    let (got, timed_out, _) = wait(&sock, &["feat"], &[MemberState::Input], 20).await;
+    let (got, timed_out, _) = wait(&sock, &["feat"], &[MemberState::Ready], 20).await;
     assert!(!timed_out);
     assert_eq!(got[0].state, MemberState::Idle);
 }
@@ -207,7 +207,7 @@ async fn wait_gives_up_when_an_agent_exits_short_of_the_state() {
 
     // web exits: it will never be input, whatever api does.
     let members = [ids[0].as_str(), ids[1].as_str()];
-    let (got, timed_out, took) = wait(&sock, &members, &[MemberState::Input], 30).await;
+    let (got, timed_out, took) = wait(&sock, &members, &[MemberState::Ready], 30).await;
     assert!(!timed_out);
     assert!(took < Duration::from_secs(10), "{took:?}");
     assert_eq!(got[0].state, MemberState::Working);

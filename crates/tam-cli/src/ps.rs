@@ -159,7 +159,7 @@ mod tests {
         let agents = [
             agent("m-fix", "claude", AgentState::Working, Some(45)),
             agent("m-api", "claude", AgentState::Idle, Some(12)),
-            agent("m-web", "codex", AgentState::Input, None),
+            agent("m-web", "codex", AgentState::Ready, None),
         ];
         let tasks = [
             task(
@@ -187,13 +187,13 @@ mod tests {
 
         // The task: its most urgent member's status, its runs and activity,
         // nothing that is a member's.
-        assert!(multi.starts_with("◆ input"), "{shown}");
+        assert!(multi.starts_with("◆ ready"), "{shown}");
         assert!(multi.ends_with("5    5m"), "{shown}");
         // Each member: its own status, agent, worktree and context.
         assert!(api.starts_with("○ idle"), "{shown}");
         assert!(api.contains("├─ api"), "{shown}");
         assert!(api.ends_with("/w/api--api-and-web  12%"), "{shown}");
-        assert!(web.starts_with("◆ input"), "{shown}");
+        assert!(web.starts_with("◆ ready"), "{shown}");
         assert!(web.contains("└─ web"), "{shown}");
         assert!(web.contains("codex"), "{shown}");
         assert!(web.ends_with("/w/web--api-and-web    -"), "{shown}");

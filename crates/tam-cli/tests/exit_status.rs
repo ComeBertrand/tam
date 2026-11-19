@@ -247,7 +247,7 @@ async fn waiting_on_a_task_gives_up_on_the_member_that_exited() {
         "wait",
         "duo",
         "--until",
-        "input",
+        "ready",
         "--timeout",
         "20",
         "--json",
@@ -259,7 +259,7 @@ async fn waiting_on_a_task_gives_up_on_the_member_that_exited() {
     let message = doc["error"]["message"].as_str().unwrap();
     assert_eq!(
         message,
-        "'duo/web' will not get to input without someone acting: its agent exited (exit 3)"
+        "'duo/web' will not get to ready without someone acting: its agent exited (exit 3)"
     );
     assert_eq!(doc["members"][0]["label"], "duo/api");
     assert_eq!(doc["members"][0]["state"], "working");

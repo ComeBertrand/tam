@@ -1207,7 +1207,7 @@ mod tests {
             text(AgentState::Question, &d).unwrap(),
             "question: Tea or coffee?"
         );
-        assert!(text(AgentState::Input, &AgentDetail::default()).is_none());
+        assert!(text(AgentState::Ready, &AgentDetail::default()).is_none());
     }
 
     fn screen(app: &mut App, width: u16, height: u16) -> String {
@@ -1826,7 +1826,7 @@ mod tests {
             vec![member_info("m-1", "app")],
             vec![agent_in(
                 "m-1",
-                AgentState::Input,
+                AgentState::Ready,
                 30,
                 AgentDetail::default(),
             )],
@@ -1923,10 +1923,10 @@ mod tests {
         };
         let mut app = triage_app(
             vec![member_info("m-1", "app")],
-            vec![agent_in("m-1", AgentState::Input, 750, detail)],
+            vec![agent_in("m-1", AgentState::Ready, 750, detail)],
         );
         let s = screen(&mut app, 100, 34);
-        assert!(s.contains("◆ input for 12m · turn finished"), "{s}");
+        assert!(s.contains("◆ ready for 12m · turn finished"), "{s}");
         assert!(s.contains("│  Done. Summary:"), "{s}");
         // Cut, with the branch still shown and the screen kept below.
         assert!(s.contains("…"), "{s}");
@@ -1935,7 +1935,7 @@ mod tests {
 
         // 80x24: the pane is short, the screen still has half of it.
         let s = screen(&mut app, 80, 24);
-        assert!(s.contains("◆ input for 12m · turn finished"), "{s}");
+        assert!(s.contains("◆ ready for 12m · turn finished"), "{s}");
         assert!(s.contains("│──────"), "{s}");
     }
 
@@ -2306,7 +2306,7 @@ mod tests {
             agent_in("m-2", AgentState::Working, 20, AgentDetail::default()),
             agent_in("m-4", AgentState::Working, 75, AgentDetail::default()),
             agent_in("m-5", AgentState::Question, 300, question),
-            agent_in("m-6", AgentState::Input, 750, finished),
+            agent_in("m-6", AgentState::Ready, 750, finished),
         ];
         let mut agents = agents;
         agents[0].context_percent = Some(67);

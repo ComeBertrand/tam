@@ -193,9 +193,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Order::Attention => "attention first ",
     };
     if total > 0 && used + 1 + order.len() <= area.width as usize {
+        // In its own corner: a line styles the whole area it is given, and
+        // would take the chips' colours.
+        let width = order.len() as u16;
+        let corner = Rect::new(area.right() - width, area.y, width, 1);
         frame.render_widget(
-            Line::styled(order, Style::new().fg(theme::get().muted)).right_aligned(),
-            area,
+            Line::styled(order, Style::new().fg(theme::get().muted)),
+            corner,
         );
     }
 }
@@ -2195,6 +2199,24 @@ mod tests {
             };
             draw(&mut app, w, h, "drop");
         }
+    }
+
+    #[test]
+    fn the_header_chips_keep_their_colours_next_to_the_order() {
+        let mut app = dashboard();
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let t = theme::get();
+        // ` tam ` and ` 3 need you `: dark text on their colours.
+        assert_eq!((buf[(1, 0)].fg, buf[(1, 0)].bg), (t.on_accent, t.accent));
+        let need = (0..80).find(|&x| buf[(x, 0)].symbol() == "3").unwrap();
+        assert_eq!(
+            (buf[(need, 0)].fg, buf[(need, 0)].bg),
+            (t.on_accent, t.warn)
+        );
+        assert_eq!(buf[(78, 0)].fg, t.muted, "by repository");
     }
 
     fn show(label: &str, s: &str) {

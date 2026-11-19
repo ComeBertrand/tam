@@ -75,7 +75,6 @@ enum Action {
         dir: PathBuf,
         provider: String,
     },
-    TogglePeek,
     /// Start a member's agent in a new session.
     RunNewSession {
         member: String,
@@ -126,8 +125,6 @@ pub async fn run() -> Result<()> {
     let mut app = App::new();
     app.commands = config.commands.clone();
     app.set_tasks(tasks);
-    // The pane is shown from the start; `p` hides it.
-    app.peek = Some(Peek::default());
 
     let result = run_loop(&mut terminal, &mut app, &mut client, &config).await;
 
@@ -244,7 +241,7 @@ async fn run_loop(
     // The projects found under $HOME (looked for off this thread).
     let (projects_tx, mut projects_rx) = tokio::sync::mpsc::unbounded_channel();
     // The agent's screen changed, or the pane scrolled: fetch it again.
-    let mut screen_moved = app.peek.is_some();
+    let mut screen_moved = true;
 
     loop {
         app.sync_focus();
@@ -279,7 +276,7 @@ async fn run_loop(
             msg = client.read_message() => {
                 match msg? {
                     ServerMessage::Event(tam_proto::Event::ScreenUpdated { id }) => {
-                        let watched = app.peek.as_ref().and_then(|p| p.watching.as_ref());
+                        let watched = app.peek.watching.as_ref();
                         screen_moved |= watched == Some(&id);
                     }
                     ServerMessage::Event(event) => apply_event(app, event),
@@ -371,15 +368,6 @@ async fn run_loop(
                     Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
                     Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
                 },
-                Action::TogglePeek => {
-                    if app.peek.is_some() {
-                        unwatch_screen(client, app).await;
-                        app.peek = None;
-                    } else {
-                        app.peek = Some(Peek::default());
-                        screen_moved = true;
-                    }
-                }
                 Action::RunNewSession { member } => {
                     do_run(client, app, config, &member, SessionChoice::New).await?;
                 }
@@ -387,9 +375,7 @@ async fn run_loop(
                     repair_task(client, app, &name).await;
                 }
                 Action::ScrollPeek(scroll) => {
-                    if let Some(peek) = app.peek.as_mut() {
-                        peek.scroll(scroll);
-                    }
+                    app.peek.scroll(scroll);
                     screen_moved = true;
                 }
                 Action::Answer {
@@ -442,14 +428,8 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::Quit,
         // Vim's scroll keys, before the letters' own keys (ctrl-d is not drop).
-        (KeyCode::Char('u' | 'b'), KeyModifiers::CONTROL) => match app.peek {
-            Some(_) => Action::ScrollPeek(Scroll::PageUp),
-            None => Action::None,
-        },
-        (KeyCode::Char('d' | 'f'), KeyModifiers::CONTROL) => match app.peek {
-            Some(_) => Action::ScrollPeek(Scroll::PageDown),
-            None => Action::None,
-        },
+        (KeyCode::Char('u' | 'b'), KeyModifiers::CONTROL) => Action::ScrollPeek(Scroll::PageUp),
+        (KeyCode::Char('d' | 'f'), KeyModifiers::CONTROL) => Action::ScrollPeek(Scroll::PageDown),
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
         (KeyCode::Enter, _) => match selected_member(app) {
@@ -483,7 +463,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             },
             _ => Action::None,
         },
-        (KeyCode::Char('p'), _) => Action::TogglePeek,
         (KeyCode::Char('a'), _) => {
             open_answer(app);
             Action::None
@@ -512,20 +491,19 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             app.toggle_order();
             Action::None
         }
-        (KeyCode::Tab, _) if app.peek.is_some() => {
+        (KeyCode::Tab, _) => {
             app.tab = match app.tab {
                 PaneTab::Triage => PaneTab::Terminal,
                 PaneTab::Terminal => PaneTab::Triage,
             };
             Action::None
         }
-        // The pane (and the member keys) move to another member of the
-        // task: only while shown, never out of sight.
-        (KeyCode::Right | KeyCode::Char('l'), _) if app.peek.is_some() => {
+        // The pane (and the member keys) move to another member of the task.
+        (KeyCode::Right | KeyCode::Char('l'), _) => {
             app.cycle_member(1);
             Action::None
         }
-        (KeyCode::Left | KeyCode::Char('h'), _) if app.peek.is_some() => {
+        (KeyCode::Left | KeyCode::Char('h'), _) => {
             app.cycle_member(-1);
             Action::None
         }
@@ -571,10 +549,10 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
                 Action::None
             }
         }
-        (KeyCode::PageUp, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::PageUp),
-        (KeyCode::PageDown, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::PageDown),
-        (KeyCode::Home, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::Oldest),
-        (KeyCode::End, _) if app.peek.is_some() => Action::ScrollPeek(Scroll::Live),
+        (KeyCode::PageUp, _) => Action::ScrollPeek(Scroll::PageUp),
+        (KeyCode::PageDown, _) => Action::ScrollPeek(Scroll::PageDown),
+        (KeyCode::Home, _) => Action::ScrollPeek(Scroll::Oldest),
+        (KeyCode::End, _) => Action::ScrollPeek(Scroll::Live),
         _ => Action::None,
     }
 }
@@ -670,7 +648,7 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
 }
 
 /// A click or the wheel: in the task list, select (a member's row focuses
-/// that member while the pane is open) or move the selection; over the
+/// that member) or move the selection; over the
 /// pane, scroll the agent's screen; in the project picker, highlight or
 /// move. A click closes the help.
 fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
@@ -1049,9 +1027,7 @@ fn repository(dir: &std::path::Path) -> Result<PathBuf, String> {
 /// lines scrolled back to), and have the daemon tell when it changes.
 async fn refresh_peek(client: &mut Client, app: &mut App) {
     let wanted = app.peek_agent();
-    let Some(peek) = app.peek.as_mut() else {
-        return;
-    };
+    let peek = &mut app.peek;
     if peek.agent != wanted {
         // Another agent: from its live screen.
         *peek = Peek {
@@ -1110,10 +1086,8 @@ async fn refresh_detail(client: &mut Client, app: &mut App) {
 /// Stop the daemon's screen updates (the pane is closed, or the dashboard
 /// stops reading for a while).
 async fn unwatch_screen(client: &mut Client, app: &mut App) {
-    if let Some(peek) = app.peek.as_mut() {
-        if peek.watching.take().is_some() {
-            let _ = client.watch_screen(None).await;
-        }
+    if app.peek.watching.take().is_some() {
+        let _ = client.watch_screen(None).await;
     }
 }
 
@@ -1795,15 +1769,10 @@ mod tests {
     }
 
     #[test]
-    fn page_keys_scroll_the_preview_only_when_shown() {
+    fn page_keys_scroll_the_preview() {
         let config = Config::default();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = App::new();
-        assert!(matches!(
-            handle_normal_key(key(KeyCode::PageUp), &mut app, &config),
-            Action::None
-        ));
-        app.peek = Some(Peek::default());
         for (code, scroll) in [
             (KeyCode::PageUp, Scroll::PageUp),
             (KeyCode::PageDown, Scroll::PageDown),
@@ -1876,16 +1845,19 @@ mod tests {
         app.sync_focus();
         assert_eq!(attach_target(&mut app).as_deref(), Some("m-2"));
 
-        // Pane closed: the one the task's status is about, as it changes.
+        // The one the pane shows. It stays when the other one comes to
+        // need the user more: a key never acts on a member the pane did
+        // not show.
         app.update_state("m-2", Working);
         app.update_state("m-1", Blocked);
         app.sync_focus();
-        assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
-
-        // Pane open: the one it shows. It stays when the other one comes
-        // to need the user more: a key never acts on a member the pane did
-        // not show.
-        app.peek = Some(Peek::default());
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-2"));
+        assert_eq!(app.peek_agent().as_deref(), Some("m-2"));
+        // Back on the task after another one: the most urgent again.
+        let feat = app.selected;
+        app.selected = 1 - feat;
+        app.sync_focus();
+        app.selected = feat;
         app.sync_focus();
         assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
         app.update_state("m-1", Working);
@@ -1902,7 +1874,7 @@ mod tests {
         app.sync_focus();
         assert_eq!(attach_target(&mut app).as_deref(), Some("m-2"));
 
-        // ←/→ move it, only while the pane shows which member it is.
+        // ←/→ move it.
         let config = Config::default();
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_normal_key(right, &mut app, &config);
@@ -1952,22 +1924,6 @@ mod tests {
             Action::ScrollPeek(Scroll::PageUp)
         ));
         assert!(matches!(app.mode, Mode::Normal));
-        app.peek = None;
-        app.sync_focus();
-        handle_normal_key(left, &mut app, &config);
-        assert_eq!(
-            attach_target(&mut app).as_deref(),
-            Some("m-2"),
-            "no pane, no ←"
-        );
-        assert!(matches!(
-            handle_normal_key(ctrl('d'), &mut app, &config),
-            Action::None
-        ));
-        assert!(matches!(app.mode, Mode::Normal), "no pane: still no drop");
-        app.peek = Some(Peek::default());
-        app.sync_focus();
-        handle_normal_key(left, &mut app, &config);
         assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
 
         // `s` and `r` too: here `r` runs the idle one.
@@ -2015,7 +1971,7 @@ mod tests {
         let status = app.status_message().unwrap().to_string();
         assert!(status.contains("enter attaches"), "{status}");
 
-        // The pane closed: the member the task's status is about.
+        // The other member asks: the dialog is about that one.
         set_ask(&mut app, "m-2", Some(bash_ask("ask-1")));
         handle_key_event(press('a'), &mut app, &config);
         let Mode::Answer(dialog) = &app.mode else {
@@ -2131,9 +2087,6 @@ mod tests {
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         let mut app = App::new();
         handle_normal_key(tab, &mut app, &config);
-        assert_eq!(app.tab, PaneTab::Triage, "no pane, no tab");
-        app.peek = Some(Peek::default());
-        handle_normal_key(tab, &mut app, &config);
         assert_eq!(app.tab, PaneTab::Terminal);
         handle_normal_key(tab, &mut app, &config);
         assert_eq!(app.tab, PaneTab::Triage);
@@ -2166,8 +2119,6 @@ mod tests {
     fn the_pane_keeps_the_shown_task_runs_and_messages() {
         let mut app = two_member_app(&[]);
         app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
-        assert!(!app.detail_stale(), "pane closed: nothing to fetch");
-        app.peek = Some(Peek::default());
         assert!(app.detail_stale());
         app.detail = Some(TaskDetail {
             task: "feat".into(),
@@ -2431,18 +2382,17 @@ mod tests {
         seen.sort();
         assert_eq!(seen, ["m-1", "m-2", "m-3"]);
 
-        // Looked at 30s ago: not due in the background (every 60s)...
+        // Looked at 30s ago: the member the pane shows is due (every 10s),
+        // the others are not (every 60s).
         for id in ["m-1", "m-2", "m-3"] {
             looked(&mut app, id, 30);
         }
-        assert_eq!(app.branch_due(), None);
-        // ...but the member the pane shows is (every 10s).
         app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
-        app.peek = Some(Peek::default());
         app.sync_focus();
         let focused = app.focused_member().unwrap().1.id().to_string();
         assert_eq!(app.branch_due().map(|(id, _)| id), Some(focused.clone()));
         looked(&mut app, &focused, 0);
+        assert_eq!(app.branch_due(), None);
 
         // The oldest look goes first; a state change asks for a new one.
         looked(&mut app, "m-3", 90);
@@ -2562,7 +2512,7 @@ mod tests {
         // A member's row selects its task, and with the pane open, it.
         handle_mouse(mouse(click, 10, 5), &mut app);
         assert_eq!(app.selected_task().unwrap().name, "feat");
-        app.peek = Some(Peek::default());
+        app.peek = Peek::default();
         app.sync_focus();
         draw(&mut app, 80, 24);
         handle_mouse(mouse(click, 10, 5), &mut app);

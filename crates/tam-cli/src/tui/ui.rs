@@ -44,10 +44,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.hits.pane = pane;
     if let Some(pane) = pane {
         // Out of the app while drawn: the pane reads the rest of it.
-        if let Some(mut peek) = app.peek.take() {
-            render_pane(frame, pane, app, &mut peek);
-            app.peek = Some(peek);
-        }
+        let mut peek = std::mem::take(&mut app.peek);
+        render_pane(frame, pane, app, &mut peek);
+        app.peek = peek;
     }
     render_footer(frame, footer_area, app);
 
@@ -106,14 +105,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Where the task list and the detail pane go (`None`: the pane is
-/// closed). Side by side when the pane has room for an agent's screen next
+/// Where the task list and the detail pane go. Side by side when the pane has room for an agent's screen next
 /// to a list of useful width; else the list above the pane, as tall as its
-/// rows up to two fifths of the height.
+/// rows up to half of the height.
 fn split(area: Rect, app: &App, filter: bool) -> (Rect, Option<Rect>) {
-    if app.peek.is_none() {
-        return (area, None);
-    }
     let list = (area.width / 5 * 2).clamp(LIST_MIN, LIST_MAX);
     if area.width >= list + PANE_MIN {
         let [list, pane] =
@@ -122,7 +117,7 @@ fn split(area: Rect, app: &App, filter: bool) -> (Rect, Option<Rect>) {
     }
     // Header, rows, filter.
     let wanted = app.rows().len() as u16 + 1 + u16::from(filter);
-    let height = wanted.max(3).min((area.height / 5 * 2).max(5));
+    let height = wanted.max(3).min((area.height / 2).max(5));
     let [list, pane] =
         Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(area);
     (list, Some(pane))
@@ -341,7 +336,8 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
     if selected.is_some() {
         hints.push(("m", "message".into(), 2));
     }
-    if let Some(peek) = &app.peek {
+    {
+        let peek = &app.peek;
         if selected.is_some_and(|t| t.members.len() > 1) {
             hints.push(("h/l", "member".into(), 1));
         }
@@ -365,7 +361,6 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         hints.push(("d", drop.into(), 1));
     }
     hints.push(("n", "new".into(), 2));
-    hints.push(("p", "pane".into(), 1));
     hints.push(("/", "filter".into(), 3));
     let order = match app.order {
         Order::Repo => "attention first",
@@ -764,7 +759,6 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         (
             "Pane",
             vec![
-                entry("p", "show / hide"),
                 entry("tab", "triage / terminal"),
                 entry("h/l ←/→", "another member"),
                 entry("pgup/pgdn", "scroll (ctrl-u/d, wheel)"),
@@ -1260,12 +1254,12 @@ mod tests {
     #[test]
     fn preview_pane_shows_the_agent_screen() {
         let mut app = App::new();
-        app.peek = Some(Peek::default());
+        app.peek = Peek::default();
         let s = screen(&mut app, 80, 20);
         assert!(s.contains("(no agent running)"), "{s}");
         assert!(s.contains("pgup/pgdn:scroll"), "{s}");
         // Narrower: the footer keeps what matters most, help among them.
-        let s = screen(&mut app, 60, 20);
+        let s = screen(&mut app, 50, 20);
         assert!(!s.contains("pgup/pgdn:scroll"), "{s}");
         assert!(s.contains("?:help  q:quit"), "{s}");
 
@@ -1286,13 +1280,13 @@ mod tests {
             ..Default::default()
         };
         peek.set_screen(&info);
-        app.peek = Some(peek);
+        app.peek = peek;
         let s = screen(&mut app, 60, 20);
         assert!(s.contains("│line 12"), "{s}");
         assert!(!s.contains("history"), "{s}");
 
         // Scrolled back to line 4.
-        let peek = app.peek.as_mut().unwrap();
+        let peek = &mut app.peek;
         peek.from = Some(4);
         info.top = 4;
         peek.set_screen(&info);
@@ -1386,10 +1380,10 @@ mod tests {
         app.set_tasks(vec![Task::from_info(info, &agents)]);
         app.sync_focus();
         let focused = app.peek_agent();
-        app.peek = Some(match focused {
+        app.peek = match focused {
             Some(id) => agent_screen(&id, PERMISSION_DIALOG),
             None => Peek::default(),
-        });
+        };
         app
     }
 
@@ -1967,7 +1961,7 @@ mod tests {
         app.cycle_member(1);
         app.sync_focus();
         assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
-        app.peek.as_mut().unwrap().agent = Some("m-1".into());
+        app.peek.agent = Some("m-1".into());
         let s = screen(&mut app, 100, 34);
         assert!(s.contains("┌ feat/app ─"), "{s}");
         assert!(s.contains("│▸ ● app  working 30s"), "{s}");
@@ -2205,10 +2199,10 @@ mod tests {
     /// The dashboard with its pane open on the selected task.
     fn with_pane(mut app: App) -> App {
         app.sync_focus();
-        app.peek = Some(match app.peek_agent() {
+        app.peek = match app.peek_agent() {
             Some(id) => agent_screen(&id, PERMISSION_DIALOG),
             None => Peek::default(),
-        });
+        };
         app
     }
 
@@ -2223,8 +2217,8 @@ mod tests {
     #[test]
     fn the_list_groups_tasks_by_repository_with_member_rows() {
         let mut app = dashboard();
-        let s = screen(&mut app, 80, 24);
-        show("80x24", &s);
+        let s = screen(&mut app, 80, 44);
+        show("80x44", &s);
         // A header per repository, the task in two under both.
         for group in ["backend", "backend + frontend", "frontend", "rustpallet"] {
             assert!(s.lines().any(|l| l.trim_end() == group), "{group}: {s}");
@@ -2247,9 +2241,9 @@ mod tests {
         );
         assert!(s.contains("? question   5m  └ frontend"), "{s}");
 
-        let s = screen(&mut app, 140, 30);
-        show("140x30", &s);
-        // Wide: what each member waits on.
+        let s = screen(&mut app, 120, 44);
+        show("120x44", &s);
+        // A wide list (above the pane): what each member waits on.
         assert!(s.contains("permission · Bash: cargo test"), "{s}");
         assert!(s.contains("question: Keep the old endpoint"), "{s}");
         assert!(s.contains("Done: rounding now happens once"), "{s}");
@@ -2347,11 +2341,12 @@ mod tests {
         ));
         let mut app = App::new();
         app.set_tasks(tasks.into_iter().map(|t| Task::from_info(t, &[])).collect());
-        // 10 rows: header, footer, the column names and 7 rows.
-        let s = screen(&mut app, 80, 10);
+        // 18 rows: header, footer, the pane, and for the list (half of
+        // the rest) the column names and 7 rows.
+        let s = screen(&mut app, 80, 18);
         assert!(s.lines().nth(2).unwrap().starts_with("api"), "{s}");
         select(&mut app, "zz-both");
-        let s = screen(&mut app, 80, 10);
+        let s = screen(&mut app, 80, 18);
         show("scrolled", &s);
         // The task in both repositories, its header and both members.
         assert!(s.contains("api + web"), "{s}");
@@ -2360,11 +2355,11 @@ mod tests {
         assert!(s.contains("└ web"), "{s}");
         // Back up one: the list moves only as far as it must.
         app.select_prev();
-        let s = screen(&mut app, 80, 10);
+        let s = screen(&mut app, 80, 18);
         assert!(s.contains("task-11"), "{s}");
         assert!(s.contains("└ web"), "kept in view: {s}");
         app.selected = 0;
-        let s = screen(&mut app, 80, 10);
+        let s = screen(&mut app, 80, 18);
         assert!(s.lines().nth(2).unwrap().starts_with("api"), "{s}");
     }
 

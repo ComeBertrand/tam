@@ -278,7 +278,7 @@ pub struct App {
     pub status: Option<(String, Instant)>,
     pub mode: Mode,
     /// The preview pane, when shown.
-    pub peek: Option<Peek>,
+    pub peek: Peek,
     pub filter: TextInput,
     pub filter_active: bool,
     pub commands: Vec<CustomCommand>,
@@ -310,7 +310,7 @@ impl App {
             selected: 0,
             status: None,
             mode: Mode::Normal,
-            peek: None,
+            peek: Peek::default(),
             filter: TextInput::default(),
             filter_active: false,
             commands: Vec::new(),
@@ -445,7 +445,7 @@ impl App {
         }
         self.selected = index;
         self.sync_focus();
-        let Some(member) = member.filter(|_| self.peek.is_some()) else {
+        let Some(member) = member else {
             return;
         };
         if let Some(task) = self.selected_task().map(|t| t.name.clone()) {
@@ -615,9 +615,7 @@ impl App {
 
     /// The preview pane shows another agent than the one it should.
     pub fn peek_stale(&self) -> bool {
-        self.peek
-            .as_ref()
-            .is_some_and(|p| p.agent != self.peek_agent())
+        self.peek.agent != self.peek_agent()
     }
 
     /// Count tasks needing attention (input, blocked, question or error).
@@ -641,14 +639,13 @@ impl App {
         Some((task, focused.or_else(|| most_urgent(task))?))
     }
 
-    /// While the pane is shown, focus the selected task's most urgent
+    /// Focus the selected task's most urgent
     /// member when the selection is on another task than the focus (or the
     /// focused member left it). The focus then stays while the task is
     /// selected, whatever becomes more urgent: a key never acts on a member
-    /// the pane did not show. With the pane closed nothing is focused: keys
-    /// act on the member the task's status in the list is about.
+    /// the pane did not show.
     pub fn sync_focus(&mut self) {
-        let Some(task) = self.selected_task().filter(|_| self.peek.is_some()) else {
+        let Some(task) = self.selected_task() else {
             self.focus = None;
             return;
         };
@@ -684,9 +681,6 @@ impl App {
     /// The pane shows another task's runs and messages than the selected
     /// one's, or they changed.
     pub fn detail_stale(&self) -> bool {
-        if self.peek.is_none() {
-            return false;
-        }
         let selected = self.selected_task().map(|t| t.name.as_str());
         match &self.detail {
             Some(detail) => detail.stale || Some(detail.task.as_str()) != selected,
@@ -727,7 +721,6 @@ impl App {
         };
         let focused = self
             .focused_member()
-            .filter(|_| self.peek.is_some())
             .map(|(_, m)| m)
             .filter(|m| due(m, branch::REFRESH));
         let member = focused.or_else(|| {

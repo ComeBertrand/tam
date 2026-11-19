@@ -65,15 +65,6 @@ pub enum Mode {
     Help,
     /// The request a member's agent waits on, to answer (`a`).
     Answer(AnswerDialog),
-    /// A message to a member's agent (`m`), sent as `tam msg` sends it.
-    Message {
-        /// The member's id, and how to name it.
-        member: String,
-        label: String,
-        /// How the message reaches the agent, said under the text.
-        how: String,
-        text: TextInput,
-    },
 }
 
 /// How the task list is ordered.
@@ -109,17 +100,6 @@ pub struct MemberChoice {
     pub id: String,
     /// How to name it (`<task>/<member>`).
     pub label: String,
-}
-
-/// Which view of the focused member the detail pane shows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PaneTab {
-    /// Why it waits and since when, its branch and messages; its screen
-    /// below.
-    #[default]
-    Triage,
-    /// Its screen, on the whole pane.
-    Terminal,
 }
 
 /// The member of the selected task that the detail pane shows and member
@@ -289,7 +269,6 @@ pub struct App {
     pub focus: Option<Focus>,
     /// A first `g` was pressed: a second one goes to the first task.
     pub pending_g: bool,
-    pub tab: PaneTab,
     /// The selected task's runs and messages, while the pane is shown.
     pub detail: Option<TaskDetail>,
     /// Git's view of members' worktrees, by member id.
@@ -320,7 +299,6 @@ impl App {
             commands: Vec::new(),
             focus: None,
             pending_g: false,
-            tab: PaneTab::default(),
             detail: None,
             branches: HashMap::new(),
             order: Order::default(),

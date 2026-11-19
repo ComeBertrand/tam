@@ -31,7 +31,7 @@ use crate::task::{Member, Task};
 use tam_proto::SessionChoice;
 
 use self::answer::{AnswerDialog, Outcome};
-use self::app::{App, MemberChoice, Mode, PaneTab, PickerItem, PickerState, TaskDetail};
+use self::app::{App, MemberChoice, Mode, PickerItem, PickerState, TaskDetail};
 use self::input::TextInput;
 use self::peek::{Peek, Scroll};
 
@@ -95,11 +95,6 @@ enum Action {
         /// The member, and what the answer says: for the status line.
         label: String,
         what: String,
-    },
-    /// Send a message to a member's agent, from the user.
-    SendMessage {
-        member: String,
-        text: String,
     },
 }
 
@@ -407,9 +402,6 @@ async fn run_loop(
                     let request = tam_proto::Request::Answer { agent, ask, answer };
                     answer_request(client, app, request, &label, &what).await?;
                 }
-                Action::SendMessage { member, text } => {
-                    send_message(client, app, &member, &text).await?;
-                }
                 Action::None => {}
             }
         }
@@ -437,7 +429,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         }
         Mode::NewTaskPickProject(_) => handle_picker_key(key, app, config),
         Mode::Answer(_) => handle_answer_key(key, app),
-        Mode::Message { .. } => handle_message_key(key, app),
     }
 }
 
@@ -486,10 +477,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             open_answer(app);
             Action::None
         }
-        (KeyCode::Char('m'), _) => {
-            open_message(app);
-            Action::None
-        }
         (KeyCode::Char('?'), _) => {
             app.mode = Mode::Help;
             Action::None
@@ -509,13 +496,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('T'), _) => Action::NextTheme,
         (KeyCode::Char('t'), _) => {
             app.toggle_order();
-            Action::None
-        }
-        (KeyCode::Tab, _) => {
-            app.tab = match app.tab {
-                PaneTab::Triage => PaneTab::Terminal,
-                PaneTab::Terminal => PaneTab::Triage,
-            };
             Action::None
         }
         // The pane (and the member keys) move to another member of the task.
@@ -863,26 +843,6 @@ fn open_answer(app: &mut App) {
     app.set_status(why, Duration::from_secs(4));
 }
 
-/// `m`: a message to the member's agent (or its next one).
-fn open_message(app: &mut App) {
-    let Some((task, member)) = selected_member(app) else {
-        return;
-    };
-    let how = match &member.agent_info {
-        None => "No agent runs: its next one gets the message when it starts.",
-        Some(agent) if agent.provider == "claude" => {
-            "Claude reads it at its next step, at once when idle."
-        }
-        Some(_) => "Typed into its terminal once it is idle.",
-    };
-    app.mode = Mode::Message {
-        member: member.id().to_string(),
-        label: task.member_label(member),
-        how: how.into(),
-        text: TextInput::default(),
-    };
-}
-
 /// The answer dialog: the request's keys (see `answer::AnswerDialog::key`).
 fn handle_answer_key(key: KeyEvent, app: &mut App) -> Action {
     let stale = app.answer_stale();
@@ -908,28 +868,6 @@ fn handle_answer_key(key: KeyEvent, app: &mut App) -> Action {
             }
         }
     }
-}
-
-/// The message prompt: enter sends (not an empty message), esc cancels.
-fn handle_message_key(key: KeyEvent, app: &mut App) -> Action {
-    let Mode::Message { member, text, .. } = &mut app.mode else {
-        return Action::None;
-    };
-    match key.code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Enter if !text.value().trim().is_empty() => {
-            let action = Action::SendMessage {
-                member: std::mem::take(member),
-                text: text.value().to_string(),
-            };
-            app.mode = Mode::Normal;
-            return action;
-        }
-        _ => {
-            text.handle(key);
-        }
-    }
-    Action::None
 }
 
 fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
@@ -1367,29 +1305,6 @@ async fn answer_request(
         }
         _ => {}
     }
-    Ok(())
-}
-
-/// Send a message from the user to a member (its id), as `tam msg` does;
-/// the status line says whether it is delivered yet.
-async fn send_message(client: &mut Client, app: &mut App, member: &str, text: &str) -> Result<()> {
-    let request = tam_proto::Request::SendMessage {
-        to: member.into(),
-        text: text.into(),
-        from: None,
-    };
-    let status = match client.send(request).await? {
-        tam_proto::Response::Sent { message, pending } => match pending {
-            Some(why) => format!(
-                "Sent to '{}' ({}), not delivered yet: {why}",
-                message.to_label, message.id
-            ),
-            None => format!("Delivered to '{}' ({})", message.to_label, message.id),
-        },
-        tam_proto::Response::Error { message } => format!("Message not sent: {message}"),
-        _ => return Ok(()),
-    };
-    app.set_status(status, Duration::from_secs(5));
     Ok(())
 }
 
@@ -2076,59 +1991,6 @@ mod tests {
         app.update_state("m-2", Working);
         handle_key_event(press('a'), &mut app, &config);
         assert!(matches!(app.mode, Mode::Normal));
-    }
-
-    #[test]
-    fn m_sends_the_member_a_message() {
-        use tam_proto::AgentState::{Blocked, Working};
-        let mut app = two_member_app(&[("m-1", Working), ("m-2", Blocked)]);
-        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
-        app.sync_focus();
-        let config = Config::default();
-        handle_key_event(press('m'), &mut app, &config);
-        let Mode::Message { label, how, .. } = &app.mode else {
-            panic!("no message prompt");
-        };
-        assert_eq!(label, "feat/web");
-        assert!(how.starts_with("Claude reads it"), "{how}");
-        // Enter sends nothing empty.
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(matches!(
-            handle_key_event(enter, &mut app, &config),
-            Action::None
-        ));
-        for c in "run clippy too".chars() {
-            handle_key_event(press(c), &mut app, &config);
-        }
-        match handle_key_event(enter, &mut app, &config) {
-            Action::SendMessage { member, text } => {
-                assert_eq!((member.as_str(), text.as_str()), ("m-2", "run clippy too"));
-            }
-            _ => panic!("no message sent"),
-        }
-        assert!(matches!(app.mode, Mode::Normal));
-        // A member without an agent: its next one gets it.
-        app.remove_agent("m-2");
-        app.remove_agent("m-1");
-        handle_key_event(press('m'), &mut app, &config);
-        let Mode::Message { how, .. } = &app.mode else {
-            panic!("no message prompt");
-        };
-        assert!(how.starts_with("No agent runs"), "{how}");
-        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        handle_key_event(esc, &mut app, &config);
-        assert!(matches!(app.mode, Mode::Normal));
-    }
-
-    #[test]
-    fn tab_switches_the_pane_between_triage_and_terminal() {
-        let config = Config::default();
-        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        let mut app = App::new();
-        handle_normal_key(tab, &mut app, &config);
-        assert_eq!(app.tab, PaneTab::Terminal);
-        handle_normal_key(tab, &mut app, &config);
-        assert_eq!(app.tab, PaneTab::Triage);
     }
 
     #[test]

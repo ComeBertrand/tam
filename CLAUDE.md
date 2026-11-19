@@ -196,9 +196,8 @@ adopt). `tam-cli` depends on all three.
   render: `a` and `y` in one input batch) do nothing; `enter` never
   allows. Permission/plan: `y`, `n` then an optional reason (`TextInput`).
   Questions: one at a time, a row to type one's own answer, a review step
-  with several. A refused answer opens a notice. `m` (`Mode::Message`)
-  sends `SendMessage` from the user to the focused member's id: the same
-  path as `tam msg`, for every provider. `a` and `m` are reserved keys.
+  with several. A refused answer opens a notice. `a` is a reserved key.
+  The dashboard sends no message itself: attach and type, or `tam msg`.
 - **Peers and discovery** — an agent knows its task from its environment:
   `$TAM_AGENT_ID` (its member id, the only stable handle) and `$TAM_SOCKET`;
   never a task name or peer list, which change (a member joins; a merge,
@@ -224,29 +223,25 @@ adopt). `tam-cli` depends on all three.
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
   `CLAUDE*` variables, or nested Claude sessions write no transcript.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
-- **Triage pane** — the TUI's detail pane (always shown: `App::peek`;
-  `h`/`l` like `←`/`→`, `ctrl-u`/`ctrl-d` like `pgup`/`pgdn`; `tui/triage.rs`,
-  `ui::render_pane`) tells, for the focused member of the selected task,
-  what it needs from the user without attaching (and `a` answers it when
-  the daemon can: the whole request, `AgentDetail::ask`, shown whatever the
-  state, which a parallel tool call can move on): its state and since when
-  (`AgentInfo.state_since`, stamped by the daemon when it reports the change,
-  "now" while a hook's change is not reported yet; the TUI stamps a
-  `StateChange` itself), the permission it waits on (tool and one-line
-  input: `Pending.summary`) or its question, its last message, why its turn
-  failed, what auto mode refused; without an agent, how its last run ended
-  (`GetTask` runs) or what is wrong with its worktree; its branch against
-  the default branch and its diff stat (`tui/branch.rs`: read-only git with
-  `GIT_OPTIONAL_LOCKS=0`, off the UI thread, one worktree at a time:
-  `App::branch_due`, the focused member every 10s while shown, the others
-  every 60s for the task list, any after its state changes); its latest messages
-  (`ListMessages`, then `MessageSent`/`MessageDelivered`); its screen below.
-  `tab` shows the screen on the whole pane. Member actions (enter, `s`, `r`,
-  `R`, custom commands) apply to the focused member (`App::focused_member`):
-  the one the pane shows: the most urgent one when the
-  selection landed on the task, pinned while the task stays selected (a key
-  never acts on a member the pane did not show), and `←`/`→` move it. The
-  dashboard redraws every second (times in state).
+- **The pane** — always shown (`App::peek`, `ui::render_pane`): the screen
+  of the focused member's agent, on the whole pane, and nothing said twice
+  (to answer or type, attach; `a` answers a request without attaching).
+  Its bottom border keeps what the screen may no longer show: why the turn
+  failed, what auto mode refused (`ui::agent_detail_line`, not a request it
+  waits on), and how many messages wait for the agent. Without an agent
+  there is no screen: `tui/triage.rs` says how its last run ended (`GetTask`
+  runs) or what is wrong with its worktree, its branch against the default
+  branch with its diff stat, and its latest messages (`ListMessages`, then
+  `MessageSent`/`MessageDelivered`). `tui/branch.rs` asks git, read-only
+  with `GIT_OPTIONAL_LOCKS=0`, off the UI thread, one worktree at a time
+  (`App::branch_due`: the focused member every 10s, the others every 60s for
+  the task list, any after its state changes). `h`/`l` like `←`/`→`,
+  `ctrl-u`/`ctrl-d` like `pgup`/`pgdn`. Member actions (enter, `s`, `r`,
+  `R`, `a`, custom commands) apply to the focused member
+  (`App::focused_member`): the one the pane shows: the most urgent one when
+  the selection landed on the task, pinned while the task stays selected (a
+  key never acts on a member the pane did not show), and `←`/`→` move it.
+  The dashboard redraws every second (times in state).
 - **Non-interactive CLI** (`tam-cli/src/script.rs`, `schema.rs`) — `tam new`/`run`
   attach only when stdin and stdout are terminals (`script::attaching`), else start
   the agents and print what started (`--detach`; `--json`, a receipt). Failures carry

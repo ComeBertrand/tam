@@ -187,13 +187,13 @@ mod tests {
 
         // The task: its most urgent member's status, its runs and activity,
         // nothing that is a member's.
-        assert!(multi.starts_with("▲ input"), "{shown}");
+        assert!(multi.starts_with("◆ input"), "{shown}");
         assert!(multi.ends_with("5    5m"), "{shown}");
         // Each member: its own status, agent, worktree and context.
         assert!(api.starts_with("○ idle"), "{shown}");
         assert!(api.contains("├─ api"), "{shown}");
         assert!(api.ends_with("/w/api--api-and-web  12%"), "{shown}");
-        assert!(web.starts_with("▲ input"), "{shown}");
+        assert!(web.starts_with("◆ input"), "{shown}");
         assert!(web.contains("└─ web"), "{shown}");
         assert!(web.contains("codex"), "{shown}");
         assert!(web.ends_with("/w/web--api-and-web    -"), "{shown}");
@@ -225,7 +225,7 @@ mod tests {
         )];
         let lines = lines(&tasks);
         let shown = lines.join("\n");
-        assert!(lines[3].starts_with("✗ gone"), "{shown}");
+        assert!(lines[3].starts_with("∅ gone"), "{shown}");
         assert_eq!(lines[4], "", "{shown}");
         assert!(
             lines[5].starts_with("both/web: worktree /w/web--both is gone"),

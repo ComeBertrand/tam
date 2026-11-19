@@ -4,7 +4,7 @@
 //! failed, what auto mode refused), its branch and its latest messages. The
 //! agent's screen goes below (see `ui::render_pane`).
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use tam_proto::{AgentInfo, AgentState, Ask, AskKind, MemberHealth, MessageInfo, RunInfo};
 
@@ -12,6 +12,7 @@ use crate::task::{Member, Task, TaskStatus};
 
 use super::app::TaskDetail;
 use super::branch::{BranchState, Observation};
+use super::theme;
 use super::ui::{agent_detail_line, status_display};
 
 /// Latest messages shown.
@@ -136,7 +137,7 @@ fn member_row(task: &Task, member: &Member, focused: bool, now: u64) -> Line<'st
             if let Some(since) = agent.state_since {
                 spans.push(Span::styled(
                     format!(" {}", age(now.saturating_sub(since))),
-                    Style::new().fg(Color::DarkGray),
+                    Style::new().fg(theme::get().muted),
                 ));
             }
             if let Some((text, color)) = agent_detail_line(agent.state, &agent.detail) {
@@ -153,7 +154,7 @@ fn member_row(task: &Task, member: &Member, focused: bool, now: u64) -> Line<'st
             };
             spans.push(Span::styled(
                 format!("  {note}"),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(theme::get().muted),
             ));
         }
     }
@@ -170,17 +171,24 @@ fn agent_lines(
     let status = task.member_status(member);
     let (_, color) = status_display(&status);
     let detail = &agent.detail;
-    let mut spans = vec![Span::styled(
-        format!("{} {}", glyph(status), agent.state),
-        Style::new().fg(color).add_modifier(Modifier::BOLD),
-    )];
+    let mut spans = vec![match agent.state {
+        // Stuck on the user: a filled label, as in the list.
+        AgentState::Blocked | AgentState::Question | AgentState::Error => Span::styled(
+            format!(" {} ", agent.state.to_string().to_uppercase()),
+            theme::get().chip(color),
+        ),
+        _ => Span::styled(
+            format!("{} {}", glyph(status), agent.state),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    }];
     if let Some(since) = agent.state_since {
         spans.push(Span::raw(format!(
             " for {}",
             age(now.saturating_sub(since))
         )));
     }
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::get().muted);
     let strong = Style::new().add_modifier(Modifier::BOLD);
     let mut body = Vec::new();
     let waiting = matches!(agent.state, AgentState::Blocked | AgentState::Question);
@@ -216,7 +224,7 @@ fn agent_lines(
         }
         AgentState::Error => detail.error.as_ref().map(|e| {
             if let Some(message) = &e.message {
-                body.push((message.clone(), Style::new().fg(Color::Red)));
+                body.push((message.clone(), Style::new().fg(theme::get().bad)));
             }
             format!("turn failed: {}", e.kind)
         }),
@@ -255,7 +263,7 @@ fn agent_lines(
         if let Some(reason) = &denied.reason {
             text.push_str(&format!(" ({reason})"));
         }
-        body.push((text, Style::new().fg(Color::Yellow)));
+        body.push((text, Style::new().fg(theme::get().warn)));
     }
     (Line::from(spans), body)
 }
@@ -263,7 +271,7 @@ fn agent_lines(
 /// The request an agent waits on, in full, as body rows: the tool's input,
 /// the plan, or the questions with their options (`a` answers it).
 fn ask_lines(ask: &Ask, body: &mut Vec<(String, Style)>) {
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::get().muted);
     let strong = Style::new().add_modifier(Modifier::BOLD);
     let cut = |body: &mut Vec<(String, Style)>, cut: bool| {
         if cut {
@@ -315,10 +323,10 @@ fn idle_lines(
         format!("{} {status}", glyph(status)),
         Style::new().fg(color).add_modifier(Modifier::BOLD),
     )];
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::get().muted);
     let mut body = Vec::new();
     if let Some(problem) = crate::health::problem(&member.info) {
-        body.push((problem, Style::new().fg(Color::Red)));
+        body.push((problem, Style::new().fg(theme::get().bad)));
         let fix = if crate::health::repairable(&member.info) {
             "d: recreate the worktree, or drop the task"
         } else {
@@ -364,25 +372,25 @@ fn branch_line(member: &Member, observation: Option<&Observation>) -> Option<Lin
     if member.is_unhealthy() {
         return None;
     }
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::get().muted);
     let branch = &member.info.branch;
     let head = match &member.info.health {
         Some(MemberHealth::Ok { branch: Some(b) }) if b != branch => Span::styled(
             format!("on {b}, not {branch}"),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::get().warn),
         ),
         Some(MemberHealth::Ok { branch: None }) => Span::styled(
             format!("detached HEAD (branch {branch})"),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::get().warn),
         ),
-        _ => Span::raw(format!("branch {branch}")),
+        _ => Span::styled(branch.clone(), Style::new().add_modifier(Modifier::BOLD)),
     };
-    let mut spans = vec![head];
+    let mut spans = vec![Span::styled("branch ", dim), head];
     match observation.and_then(|o| o.state.as_ref()) {
         Some(Ok(state)) => {
             for part in branch_facts(state) {
                 spans.push(Span::styled(" · ", dim));
-                spans.push(part);
+                spans.extend(part);
             }
         }
         Some(Err(why)) => spans.push(Span::styled(format!(" · {}", clean(why)), dim)),
@@ -391,34 +399,38 @@ fn branch_line(member: &Member, observation: Option<&Observation>) -> Option<Lin
     Some(Line::from(spans))
 }
 
-fn branch_facts(state: &BranchState) -> Vec<Span<'static>> {
+/// What git said, a group of spans per fact.
+fn branch_facts(state: &BranchState) -> Vec<Vec<Span<'static>>> {
+    let t = theme::get();
     let mut parts = Vec::new();
     if let Some(base) = &state.base {
-        parts.push(Span::raw(match (state.ahead, state.behind) {
+        parts.push(vec![Span::raw(match (state.ahead, state.behind) {
             (0, 0) => format!("even with {base}"),
             (ahead, 0) => format!("{ahead} ahead of {base}"),
             (0, behind) => format!("{behind} behind {base}"),
             (ahead, behind) => format!("{ahead} ahead, {behind} behind {base}"),
-        }));
+        })]);
     }
     if state.files > 0 {
         let files = if state.files == 1 { "file" } else { "files" };
-        parts.push(Span::raw(format!(
-            "{} {files} +{} -{}",
-            state.files, state.insertions, state.deletions
-        )));
+        parts.push(vec![
+            Span::raw(format!("{} {files} ", state.files)),
+            Span::styled(format!("+{}", state.insertions), Style::new().fg(t.ok)),
+            Span::raw(" "),
+            Span::styled(format!("-{}", state.deletions), Style::new().fg(t.bad)),
+        ]);
     }
-    parts.push(match state.uncommitted {
+    parts.push(vec![match state.uncommitted {
         0 => Span::raw("clean"),
-        n => Span::styled(format!("{n} uncommitted"), Style::new().fg(Color::Yellow)),
-    });
+        n => Span::styled(format!("{n} uncommitted"), Style::new().fg(t.warn)),
+    }]);
     parts
 }
 
 /// The member's latest messages, oldest first: `← sender` for one it got,
 /// `→ recipient` for one it sent.
 fn message_lines(id: &str, messages: &[MessageInfo], now: u64) -> Vec<Line<'static>> {
-    let dim = Style::new().fg(Color::DarkGray);
+    let dim = Style::new().fg(theme::get().muted);
     let mut ours: Vec<&MessageInfo> = messages
         .iter()
         .filter(|m| m.to == id || m.from.as_deref() == Some(id))
@@ -435,10 +447,16 @@ fn message_lines(id: &str, messages: &[MessageInfo], now: u64) -> Vec<Line<'stat
             };
             let mut spans = vec![
                 Span::styled(format!("{:>4} ", age(now.saturating_sub(m.sent_at))), dim),
-                Span::styled(format!("{arrow} {who}: "), Style::new().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{arrow} {who}: "),
+                    Style::new().fg(theme::get().accent),
+                ),
             ];
             if m.delivered_at.is_none() {
-                spans.push(Span::styled("(queued) ", Style::new().fg(Color::Yellow)));
+                spans.push(Span::styled(
+                    "(queued) ",
+                    Style::new().fg(theme::get().warn),
+                ));
             }
             spans.push(Span::raw(one_line(&m.text)));
             Line::from(spans)

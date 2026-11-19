@@ -279,6 +279,9 @@ pub struct App {
     pub mode: Mode,
     /// The preview pane, when shown.
     pub peek: Peek,
+    /// The running agents' spinner: its frame, `None` for a still mark
+    /// (tests).
+    pub spin: Option<usize>,
     pub filter: TextInput,
     pub filter_active: bool,
     pub commands: Vec<CustomCommand>,
@@ -311,6 +314,7 @@ impl App {
             status: None,
             mode: Mode::Normal,
             peek: Peek::default(),
+            spin: None,
             filter: TextInput::default(),
             filter_active: false,
             commands: Vec::new(),
@@ -616,6 +620,15 @@ impl App {
     /// The preview pane shows another agent than the one it should.
     pub fn peek_stale(&self) -> bool {
         self.peek.agent != self.peek_agent()
+    }
+
+    /// An agent is working: its spinner turns.
+    pub fn any_running(&self) -> bool {
+        self.tasks.iter().any(|t| {
+            t.members
+                .iter()
+                .any(|m| matches!(t.member_status(m), crate::task::TaskStatus::Run))
+        })
     }
 
     /// Count tasks needing attention (input, blocked, question or error).

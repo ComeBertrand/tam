@@ -221,8 +221,8 @@ adopt). `tam-cli` depends on all three.
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
   `CLAUDE*` variables, or nested Claude sessions write no transcript.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
-- **Triage pane** — the TUI's detail pane (open from the start, `p` hides
-  it; `h`/`l` like `←`/`→`, `ctrl-u`/`ctrl-d` like `pgup`/`pgdn`; `tui/triage.rs`,
+- **Triage pane** — the TUI's detail pane (always shown: `App::peek`;
+  `h`/`l` like `←`/`→`, `ctrl-u`/`ctrl-d` like `pgup`/`pgdn`; `tui/triage.rs`,
   `ui::render_pane`) tells, for the focused member of the selected task,
   what it needs from the user without attaching (and `a` answers it when
   the daemon can: the whole request, `AgentDetail::ask`, shown whatever the
@@ -240,7 +240,7 @@ adopt). `tam-cli` depends on all three.
   (`ListMessages`, then `MessageSent`/`MessageDelivered`); its screen below.
   `tab` shows the screen on the whole pane. Member actions (enter, `s`, `r`,
   `R`, custom commands) apply to the focused member (`App::focused_member`):
-  the most urgent one; while the pane is open, the one it showed when the
+  the one the pane shows: the most urgent one when the
   selection landed on the task, pinned while the task stays selected (a key
   never acts on a member the pane did not show), and `←`/`→` move it. The
   dashboard redraws every second (times in state).
@@ -331,7 +331,8 @@ adopt). `tam-cli` depends on all three.
   what the member waits on; `table::fit` drops columns (`DROP_ORDER`)
   before cutting task names. `ui::split`: the pane beside the list from
   136 columns (pane >= 82: an agent's 80-column screen), else below it,
-  the list as tall as its rows up to 2/5. The footer keeps the hints that
+  the list as tall as its rows up to half the height (so the
+  what-it-waits-on column shows only stacked, from 100 columns). The footer keeps the hints that
   fit (`ui::fit_hints`, by priority). `tam ps` (`ps.rs`) prints the same
   rows as text: a row per task, most urgent first, and below a task with
   several members a row per member (status, agent, worktree, context).

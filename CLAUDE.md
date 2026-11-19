@@ -347,7 +347,9 @@ adopt). `tam-cli` depends on all three.
   hues; the logo, the selection's bar and the spinners move with
   `App::spin` (the loop then ticks all the time: `theme::animated`, off
   with `[tui] animate = false`), group rules and the pane's border
-  (`ui::rainbow_border`, over the drawn block) stand still. Backgrounds only on the header and footer
+  (`ui::rainbow_border`, over the drawn block) stand still. `T`
+  (`Action::NextTheme`, `theme::next`) switches theme while the dashboard
+  runs, never written to the config. Backgrounds only on the header and footer
   bars, the selected row, chips and dialogs: never behind the agent's screen
   (`peek.rs` keeps the agent's colours). Dialogs draw over a dimmed dashboard
   (`ui::render`, not the footer: it has their keys). A working agent's mark

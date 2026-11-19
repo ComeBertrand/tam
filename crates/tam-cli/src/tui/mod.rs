@@ -85,6 +85,8 @@ enum Action {
         name: String,
     },
     ScrollPeek(Scroll),
+    /// Switch to the next theme.
+    NextTheme,
     /// Answer the request `ask` of agent `agent` (see `answer`).
     Answer {
         agent: String,
@@ -391,6 +393,10 @@ async fn run_loop(
                     app.peek.scroll(scroll);
                     screen_moved = true;
                 }
+                Action::NextTheme => {
+                    let name = theme::next();
+                    app.set_status(format!("theme: {name}"), Duration::from_secs(2));
+                }
                 Action::Answer {
                     agent,
                     ask,
@@ -500,6 +506,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             app.select_last();
             Action::None
         }
+        (KeyCode::Char('T'), _) => Action::NextTheme,
         (KeyCode::Char('t'), _) => {
             app.toggle_order();
             Action::None
@@ -1930,6 +1937,10 @@ mod tests {
         let order = app.order;
         handle_normal_key(press('t'), &mut app, &config);
         assert_ne!(app.order, order, "t switches the order");
+        assert!(matches!(
+            handle_normal_key(press('T'), &mut app, &config),
+            Action::NextTheme
+        ));
         handle_normal_key(press('t'), &mut app, &config);
         app.sync_focus();
         handle_normal_key(right, &mut app, &config);

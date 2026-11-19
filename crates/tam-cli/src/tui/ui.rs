@@ -406,6 +406,7 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         Order::Attention => "by repository",
     };
     hints.push(("t", order.into(), 4));
+    hints.push(("T", "theme".into(), 5));
     for cmd in &app.commands {
         hints.push((cmd.key.as_str(), cmd.name.clone(), 5));
     }
@@ -837,6 +838,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
                 entry("/", "filter (fuzzy)"),
                 entry("gg/G", "first / last task"),
                 entry("t", "by repo / attention"),
+                entry("T", "next theme"),
                 entry("click", "select a row"),
                 entry("wheel", "move the selection"),
             ],

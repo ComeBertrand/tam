@@ -1,32 +1,29 @@
-//! The detail pane's triage view: for the focused member of the selected
-//! task, what it needs from the user and since when (the permission it asks
-//! with the tool's input, its question, its last message, why its turn
-//! failed, what auto mode refused), its branch and its latest messages. The
-//! agent's screen goes below (see `ui::render_pane`).
+//! What the pane shows for a member without an agent, so without a screen:
+//! how its last run ended or what is wrong with its worktree, its branch
+//! and its latest messages (see `ui::render_pane`).
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use tam_proto::{AgentInfo, AgentState, Ask, AskKind, MemberHealth, MessageInfo, RunInfo};
+use tam_proto::{MemberHealth, MessageInfo, RunInfo};
 
 use crate::task::{Member, Task, TaskStatus};
 
 use super::app::TaskDetail;
 use super::branch::{BranchState, Observation};
 use super::theme;
-use super::ui::{agent_detail_line, status_display};
+use super::ui::status_display;
 
 /// Latest messages shown.
 const MESSAGES: usize = 3;
 /// Body rows kept before the branch and messages when the pane is short.
 const BODY_MIN: usize = 2;
 
-/// The triage view's parts, before they are fitted to the pane.
+/// The view's parts, before they are fitted to the pane.
 pub struct Triage {
-    /// One row per member, when the task has several.
-    pub members: Vec<Line<'static>>,
-    /// The focused member's state, since when, and what about.
+    /// The member's status, and how its last run ended.
     pub headline: Line<'static>,
-    /// What it waits on, in full: wrapped to the pane's width when fitted.
+    /// What is wrong with its worktree: wrapped to the pane's width when
+    /// fitted.
     pub body: Vec<(String, Style)>,
     /// Its branch and changes.
     pub branch: Option<Line<'static>>,
@@ -34,9 +31,9 @@ pub struct Triage {
     pub messages: Vec<Line<'static>>,
 }
 
-/// The triage view of `member` of `task`. `detail` is the task's runs and
-/// messages, `branch` what git said of the member's worktree; `now` is a
-/// Unix timestamp (seconds).
+/// The view of `member` of `task`, which has no agent. `detail` is the
+/// task's runs and messages, `branch` what git said of the member's
+/// worktree; `now` is a Unix timestamp (seconds).
 pub fn triage(
     task: &Task,
     member: &Member,
@@ -44,24 +41,12 @@ pub fn triage(
     branch: Option<&Observation>,
     now: u64,
 ) -> Triage {
-    let members = if task.members.len() > 1 {
-        task.members
-            .iter()
-            .map(|m| member_row(task, m, m.id() == member.id(), now))
-            .collect()
-    } else {
-        Vec::new()
-    };
     let runs = detail.map_or(&[][..], |d| &d.runs[..]);
-    let (headline, body) = match &member.agent_info {
-        Some(agent) => agent_lines(task, member, agent, now),
-        None => idle_lines(task, member, runs, now),
-    };
+    let (headline, body) = idle_lines(task, member, runs, now);
     let messages = detail
         .map(|d| message_lines(member.id(), &d.messages, now))
         .unwrap_or_default();
     Triage {
-        members,
         headline,
         body,
         branch: branch_line(member, branch),
@@ -69,8 +54,8 @@ pub fn triage(
     }
 }
 
-/// The view in at most `rows` rows of `width` columns. The headline and
-/// members come first, then the first rows of the body, the branch, the
+/// The view in at most `rows` rows of `width` columns. The headline
+/// comes first, then the first rows of the body, the branch, the
 /// messages, and the rest of the body.
 pub fn fit(triage: Triage, width: u16, rows: u16) -> Vec<Line<'static>> {
     let rows = rows as usize;
@@ -86,8 +71,7 @@ pub fn fit(triage: Triage, width: u16, rows: u16) -> Vec<Line<'static>> {
         .collect();
 
     let headline = rows.min(1);
-    let members = triage.members.len().min(rows - headline);
-    let mut left = rows - headline - members;
+    let mut left = rows - headline;
     let body_min = body.len().min(BODY_MIN).min(left);
     left -= body_min;
     let branch = usize::from(triage.branch.is_some()).min(left);
@@ -96,7 +80,7 @@ pub fn fit(triage: Triage, width: u16, rows: u16) -> Vec<Line<'static>> {
     left -= messages;
     let body_rows = body_min + (body.len() - body_min).min(left);
 
-    let mut lines: Vec<Line> = triage.members.into_iter().take(members).collect();
+    let mut lines: Vec<Line> = Vec::new();
     if headline > 0 {
         lines.push(triage.headline);
     }
@@ -113,193 +97,6 @@ pub fn fit(triage: Triage, width: u16, rows: u16) -> Vec<Line<'static>> {
     let skip = triage.messages.len() - messages;
     lines.extend(triage.messages.into_iter().skip(skip));
     lines
-}
-
-/// A member of a task with several: its status, since when, and what it
-/// waits on, on one row; `focused` marks the one the pane is about.
-fn member_row(task: &Task, member: &Member, focused: bool, now: u64) -> Line<'static> {
-    let status = task.member_status(member);
-    let (_, color) = status_display(&status);
-    let base = if focused {
-        Style::new().add_modifier(Modifier::BOLD)
-    } else {
-        Style::new()
-    };
-    let mut spans = vec![
-        Span::styled(if focused { "▸ " } else { "  " }, base),
-        Span::styled(format!("{} ", glyph(status)), base.fg(color)),
-        Span::styled(member.info.name.clone(), base),
-        Span::raw("  "),
-    ];
-    match &member.agent_info {
-        Some(agent) => {
-            spans.push(Span::styled(agent.state.to_string(), base.fg(color)));
-            if let Some(since) = agent.state_since {
-                spans.push(Span::styled(
-                    format!(" {}", age(now.saturating_sub(since))),
-                    Style::new().fg(theme::get().muted),
-                ));
-            }
-            if let Some((text, color)) = agent_detail_line(agent.state, &agent.detail) {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(clean(&text), Style::new().fg(color)));
-            }
-        }
-        None => {
-            spans.push(Span::styled(status.to_string(), base.fg(color)));
-            let note = if member.is_unhealthy() {
-                "worktree gone"
-            } else {
-                "no agent"
-            };
-            spans.push(Span::styled(
-                format!("  {note}"),
-                Style::new().fg(theme::get().muted),
-            ));
-        }
-    }
-    Line::from(spans)
-}
-
-/// Headline and body of a member whose agent runs.
-fn agent_lines(
-    task: &Task,
-    member: &Member,
-    agent: &AgentInfo,
-    now: u64,
-) -> (Line<'static>, Vec<(String, Style)>) {
-    let status = task.member_status(member);
-    let (_, color) = status_display(&status);
-    let detail = &agent.detail;
-    let mut spans = vec![Span::styled(
-        format!("{} {}", glyph(status), agent.state),
-        Style::new().fg(color).add_modifier(Modifier::BOLD),
-    )];
-    if let Some(since) = agent.state_since {
-        spans.push(Span::raw(format!(
-            " for {}",
-            age(now.saturating_sub(since))
-        )));
-    }
-    let dim = Style::new().fg(theme::get().muted);
-    let strong = Style::new().add_modifier(Modifier::BOLD);
-    let mut body = Vec::new();
-    let waiting = matches!(agent.state, AgentState::Blocked | AgentState::Question);
-    // A request it still waits on while its state says otherwise (a
-    // parallel tool call ended meanwhile): what to answer comes first.
-    if let Some(ask) = detail.ask.as_ref().filter(|_| !waiting) {
-        ask_lines(ask, &mut body);
-    }
-    let about = match agent.state {
-        AgentState::Blocked => {
-            let pending = detail.pending.as_ref();
-            match (&detail.ask, pending.filter(|p| !p.summary.is_empty())) {
-                (Some(ask), _) => ask_lines(ask, &mut body),
-                (None, Some(p)) => body.push((p.summary.clone(), strong)),
-                (None, None) => body.push(("(the request is on its screen)".into(), dim)),
-            }
-            Some(match pending.and_then(|p| p.tool.as_deref()) {
-                Some("ExitPlanMode") => "plan to approve".into(),
-                Some(tool) => format!("permission for {tool}"),
-                None => "permission".into(),
-            })
-        }
-        AgentState::Question => {
-            match (
-                &detail.ask,
-                detail.pending.as_ref().filter(|p| !p.summary.is_empty()),
-            ) {
-                (Some(ask), _) => ask_lines(ask, &mut body),
-                (None, Some(p)) => body.push((p.summary.clone(), strong)),
-                (None, None) => body.push(("(the question is on its screen)".into(), dim)),
-            }
-            None
-        }
-        AgentState::Error => detail.error.as_ref().map(|e| {
-            if let Some(message) = &e.message {
-                body.push((message.clone(), Style::new().fg(theme::get().bad)));
-            }
-            format!("turn failed: {}", e.kind)
-        }),
-        AgentState::Ready => Some(match &detail.last_message {
-            Some(message) => {
-                body.push((message.clone(), Style::new()));
-                "turn finished".into()
-            }
-            None => "waiting for a prompt".into(),
-        }),
-        AgentState::Working | AgentState::Idle => detail
-            .ask
-            .as_ref()
-            .map(|ask| format!("waits on a permission for {}", ask.tool)),
-    };
-    if let Some(about) = about {
-        spans.push(Span::raw(" · "));
-        spans.push(Span::raw(about));
-    }
-    spans.push(Span::styled(format!("  ({})", agent.provider), dim));
-    // How to answer what it waits on: here, or in its terminal.
-    match &detail.ask {
-        Some(_) => spans.extend([
-            Span::raw("  "),
-            Span::styled("a", strong),
-            Span::styled(": answer", dim),
-        ]),
-        None if waiting => spans.push(Span::styled("  answer in its terminal (enter)", dim)),
-        None => {}
-    }
-    if let Some(denied) = &detail.denied {
-        let mut text = format!("auto mode refused {}", denied.tool);
-        if let Some(summary) = &denied.summary {
-            text.push_str(&format!(": {summary}"));
-        }
-        if let Some(reason) = &denied.reason {
-            text.push_str(&format!(" ({reason})"));
-        }
-        body.push((text, Style::new().fg(theme::get().warn)));
-    }
-    (Line::from(spans), body)
-}
-
-/// The request an agent waits on, in full, as body rows: the tool's input,
-/// the plan, or the questions with their options (`a` answers it).
-fn ask_lines(ask: &Ask, body: &mut Vec<(String, Style)>) {
-    let dim = Style::new().fg(theme::get().muted);
-    let strong = Style::new().add_modifier(Modifier::BOLD);
-    let cut = |body: &mut Vec<(String, Style)>, cut: bool| {
-        if cut {
-            body.push(("(cut: its terminal shows the rest)".into(), dim));
-        }
-    };
-    match &ask.kind {
-        AskKind::Permission { input, cut: c } => {
-            body.extend(input.lines().map(|l| (l.to_string(), strong)));
-            cut(body, *c);
-        }
-        AskKind::Plan { plan, cut: c } => {
-            body.extend(plan.lines().map(|l| (l.to_string(), Style::new())));
-            cut(body, *c);
-        }
-        AskKind::Questions { questions } => {
-            for q in questions {
-                let several = if q.multi_select {
-                    " (several answers)"
-                } else {
-                    ""
-                };
-                body.push((format!("{}{several}", q.question), strong));
-                for (i, option) in q.options.iter().enumerate() {
-                    let text = match &option.description {
-                        Some(d) if *d != option.label => {
-                            format!("{}. {} — {d}", i + 1, option.label)
-                        }
-                        _ => format!("{}. {}", i + 1, option.label),
-                    };
-                    body.push((text, Style::new()));
-                }
-            }
-        }
-    }
 }
 
 /// Headline and body of a member without an agent: its last run, or what

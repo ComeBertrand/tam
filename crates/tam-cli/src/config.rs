@@ -174,7 +174,7 @@ pub fn run_custom_command(
 }
 
 const RESERVED_KEYS: &[char] = &[
-    'q', 'j', 'k', 'h', 'l', 'n', 'r', 'R', 's', 'd', '/', 'g', 'G', 't', 'T', '?', 'a', 'm',
+    'q', 'j', 'k', 'h', 'l', 'n', 'r', 'R', 's', 'd', '/', 'g', 'G', 't', 'T', '?', 'a',
 ];
 
 fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
@@ -359,7 +359,7 @@ finder = "fzf"
 
     #[test]
     fn run_and_reply_keys_are_reserved() {
-        for key in ["r", "R", "a", "m"] {
+        for key in ["r", "R", "a"] {
             let toml =
                 format!("[[tui.commands]]\nname = \"x\"\nkey = \"{key}\"\ncommand = \"true\"\n");
             let err = parse_config(&toml).unwrap_err().to_string();

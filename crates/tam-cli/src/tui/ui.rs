@@ -343,7 +343,7 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
     }
     if let Some(peek) = &app.peek {
         if selected.is_some_and(|t| t.members.len() > 1) {
-            hints.push(("←/→", "member".into(), 1));
+            hints.push(("h/l", "member".into(), 1));
         }
         let other = match app.tab {
             PaneTab::Triage => "terminal",
@@ -365,13 +365,13 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         hints.push(("d", drop.into(), 1));
     }
     hints.push(("n", "new".into(), 2));
-    hints.push(("p", "peek".into(), 1));
+    hints.push(("p", "pane".into(), 1));
     hints.push(("/", "filter".into(), 3));
     let order = match app.order {
         Order::Repo => "attention first",
         Order::Attention => "by repository",
     };
-    hints.push(("g", order.into(), 4));
+    hints.push(("t", order.into(), 4));
     for cmd in &app.commands {
         hints.push((cmd.key.as_str(), cmd.name.clone(), 5));
     }
@@ -755,7 +755,8 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
             "List",
             vec![
                 entry("/", "filter (fuzzy)"),
-                entry("g", "by repo / attention"),
+                entry("gg/G", "first / last task"),
+                entry("t", "by repo / attention"),
                 entry("click", "select a row"),
                 entry("wheel", "move the selection"),
             ],
@@ -765,8 +766,8 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
             vec![
                 entry("p", "show / hide"),
                 entry("tab", "triage / terminal"),
-                entry("←/→", "another member"),
-                entry("pgup/pgdn", "scroll (wheel too)"),
+                entry("h/l ←/→", "another member"),
+                entry("pgup/pgdn", "scroll (ctrl-u/d, wheel)"),
                 entry("home/end", "oldest line / live"),
             ],
         ),
@@ -1960,7 +1961,7 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("│▲ blocked for 3m · permission for Bash"), "{s}");
-        assert!(s.contains("←/→:member"), "{s}");
+        assert!(s.contains("h/l:member"), "{s}");
 
         // → shows the other one (and enter would attach to it).
         app.cycle_member(1);
@@ -2237,9 +2238,9 @@ mod tests {
         assert!(s.contains("◌ stale     45d spike-cache"), "{s}");
         assert!(s.contains("↑5 ↓12"), "{s}");
         assert!(s.contains("○ idle       2d nav"), "{s}");
-        // A task in two repositories: its status is its most urgent
-        // member's, a row per member says the rest.
-        assert!(s.contains("? question   5m unit-pricing"), "{s}");
+        // A task in two repositories: its row has no status of its own,
+        // a row per member has.
+        assert!(s.lines().any(|l| l.trim() == "unit-pricing"), "{s}");
         assert!(
             s.contains("● run        1m  ├ backend             ↑1 *3  claude 12%"),
             "{s}"
@@ -2269,7 +2270,8 @@ mod tests {
         assert!(s.contains("attention first"), "{s}");
         let rows: Vec<&str> = s.lines().skip(2).collect();
         assert!(rows[0].starts_with("▲ block"), "{s}");
-        assert!(rows[1].starts_with("? question"), "{s}");
+        assert!(rows[1].trim_start().starts_with("unit-pricing "), "{s}");
+        assert!(rows[3].starts_with("? question"), "{s}");
         assert!(s.contains("REPO"), "{s}");
         assert!(s.contains("backend + frontend"), "{s}");
     }

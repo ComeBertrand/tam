@@ -126,6 +126,8 @@ pub async fn run() -> Result<()> {
     let mut app = App::new();
     app.commands = config.commands.clone();
     app.set_tasks(tasks);
+    // The pane is shown from the start; `p` hides it.
+    app.peek = Some(Peek::default());
 
     let result = run_loop(&mut terminal, &mut app, &mut client, &config).await;
 
@@ -242,7 +244,7 @@ async fn run_loop(
     // The projects found under $HOME (looked for off this thread).
     let (projects_tx, mut projects_rx) = tokio::sync::mpsc::unbounded_channel();
     // The agent's screen changed, or the pane scrolled: fetch it again.
-    let mut screen_moved = false;
+    let mut screen_moved = app.peek.is_some();
 
     loop {
         app.sync_focus();
@@ -435,8 +437,19 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
 }
 
 fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
+    // `gg`: only two `g` in a row.
+    let after_g = std::mem::take(&mut app.pending_g);
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::Quit,
+        // Vim's scroll keys, before the letters' own keys (ctrl-d is not drop).
+        (KeyCode::Char('u' | 'b'), KeyModifiers::CONTROL) => match app.peek {
+            Some(_) => Action::ScrollPeek(Scroll::PageUp),
+            None => Action::None,
+        },
+        (KeyCode::Char('d' | 'f'), KeyModifiers::CONTROL) => match app.peek {
+            Some(_) => Action::ScrollPeek(Scroll::PageDown),
+            None => Action::None,
+        },
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
         (KeyCode::Enter, _) => match selected_member(app) {
@@ -484,6 +497,18 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             Action::None
         }
         (KeyCode::Char('g'), _) => {
+            if after_g {
+                app.select_first();
+            } else {
+                app.pending_g = true;
+            }
+            Action::None
+        }
+        (KeyCode::Char('G'), _) => {
+            app.select_last();
+            Action::None
+        }
+        (KeyCode::Char('t'), _) => {
             app.toggle_order();
             Action::None
         }
@@ -496,11 +521,11 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         }
         // The pane (and the member keys) move to another member of the
         // task: only while shown, never out of sight.
-        (KeyCode::Right, _) if app.peek.is_some() => {
+        (KeyCode::Right | KeyCode::Char('l'), _) if app.peek.is_some() => {
             app.cycle_member(1);
             Action::None
         }
-        (KeyCode::Left, _) if app.peek.is_some() => {
+        (KeyCode::Left | KeyCode::Char('h'), _) if app.peek.is_some() => {
             app.cycle_member(-1);
             Action::None
         }
@@ -576,6 +601,13 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         KeyCode::Esc => app.mode = Mode::Normal,
         KeyCode::Down => picker_mut(app, PickerState::select_next),
         KeyCode::Up => picker_mut(app, PickerState::select_prev),
+        // j/k type into the filter here: ctrl-n/ctrl-p move, as in vim's menus.
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            picker_mut(app, PickerState::select_next)
+        }
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            picker_mut(app, PickerState::select_prev)
+        }
         KeyCode::Enter => return handle_picker_enter(app, config),
         KeyCode::Tab => picker_mut(app, PickerState::toggle_mark),
         _ => picker_mut(app, |p| {
@@ -1880,6 +1912,46 @@ mod tests {
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         handle_normal_key(left, &mut app, &config);
         assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
+        // gg and G: the first and the last task; one g alone does nothing.
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let before = app.selected;
+        let last = app.visible_tasks().len() - 1;
+        handle_normal_key(press('G'), &mut app, &config);
+        assert_eq!(app.selected, last);
+        handle_normal_key(press('g'), &mut app, &config);
+        assert_eq!(app.selected, last, "one g");
+        handle_normal_key(press('j'), &mut app, &config);
+        handle_normal_key(press('g'), &mut app, &config);
+        assert_eq!(app.selected, last, "g, another key, g: not gg");
+        handle_normal_key(press('g'), &mut app, &config);
+        assert_eq!(app.selected, 0);
+        app.selected = before;
+        app.sync_focus();
+        let order = app.order;
+        handle_normal_key(press('t'), &mut app, &config);
+        assert_ne!(app.order, order, "t switches the order");
+        handle_normal_key(press('t'), &mut app, &config);
+        app.sync_focus();
+        handle_normal_key(right, &mut app, &config);
+        handle_normal_key(left, &mut app, &config);
+        // h/l are the same keys.
+        let l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        handle_normal_key(l, &mut app, &config);
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-2"));
+        let h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        handle_normal_key(h, &mut app, &config);
+        assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
+        // ctrl-d and ctrl-u scroll the pane: never the drop dialog.
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(matches!(
+            handle_normal_key(ctrl('d'), &mut app, &config),
+            Action::ScrollPeek(Scroll::PageDown)
+        ));
+        assert!(matches!(
+            handle_normal_key(ctrl('u'), &mut app, &config),
+            Action::ScrollPeek(Scroll::PageUp)
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
         app.peek = None;
         app.sync_focus();
         handle_normal_key(left, &mut app, &config);
@@ -1888,6 +1960,11 @@ mod tests {
             Some("m-2"),
             "no pane, no ←"
         );
+        assert!(matches!(
+            handle_normal_key(ctrl('d'), &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal), "no pane: still no drop");
         app.peek = Some(Peek::default());
         app.sync_focus();
         handle_normal_key(left, &mut app, &config);

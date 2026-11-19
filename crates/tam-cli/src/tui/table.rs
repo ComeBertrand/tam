@@ -279,9 +279,9 @@ fn fit(cols: &mut Vec<Col>, cells: &mut [Vec<Line<'static>>], width: u16) -> Vec
         .collect()
 }
 
-/// A task's row: its only member's, or for a task with several, its status
-/// (the most urgent member's) and name, the members' rows below saying the
-/// rest.
+/// A task's row: its only member's, or for a task with several, its name
+/// alone: a status belongs to an agent, and the members' rows below have
+/// theirs.
 fn task_cell(col: Col, task: &Task, app: &App, now: u64) -> Line<'static> {
     if let [member] = &task.members[..] {
         return match col {
@@ -291,10 +291,6 @@ fn task_cell(col: Col, task: &Task, app: &App, now: u64) -> Line<'static> {
         };
     }
     match col {
-        Col::Status => status_cell(task.status()),
-        Col::Age => app::most_urgent(task)
-            .map(|m| age_cell(task, m, now))
-            .unwrap_or_default(),
         Col::Task => name_line(
             &task.name,
             app.filter.value(),

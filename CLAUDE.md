@@ -221,7 +221,8 @@ adopt). `tam-cli` depends on all three.
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
   `CLAUDE*` variables, or nested Claude sessions write no transcript.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
-- **Triage pane** — the TUI's detail pane (`p`; `tui/triage.rs`,
+- **Triage pane** — the TUI's detail pane (open from the start, `p` hides
+  it; `h`/`l` like `←`/`→`, `ctrl-u`/`ctrl-d` like `pgup`/`pgdn`; `tui/triage.rs`,
   `ui::render_pane`) tells, for the focused member of the selected task,
   what it needs from the user without attaching (and `a` answers it when
   the daemon can: the whole request, `AgentDetail::ask`, shown whatever the
@@ -318,10 +319,12 @@ adopt). `tam-cli` depends on all three.
 - **Task list** — `tui/table.rs` draws `App::rows`: a header row per
   repository (`app::repo_group`: the set of a task's repositories, `api +
   web`), a row per task, and below a task with several members a row per
-  member (`▸` marks `App::focused_member`). Only task rows are selected
+  member (`▸` marks `App::focused_member`); such a task's own row has
+  its name only, no status (an agent's, so a member's). Only task rows are selected
   (`App::selected` indexes visible tasks); `App::table_offset` keeps the
   scroll between draws so the selected task's member rows (and its group's
-  header) stay in view. `g` (`App::toggle_order`, `Order`) switches to
+  header) stay in view. `gg`/`G` select the first/last task
+  (`App::pending_g`). `t` (`App::toggle_order`, `Order`) switches to
   attention first: no groups, a REPO column. Columns: status and time in it
   (`state_since`, else the task's `last_activity`), task, branch
   (`↑`/`↓`/`*` from `App::branches`), agent, context, and from 100 columns

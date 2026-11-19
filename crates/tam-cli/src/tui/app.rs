@@ -284,6 +284,8 @@ pub struct App {
     pub commands: Vec<CustomCommand>,
     /// See [`App::focused_member`].
     pub focus: Option<Focus>,
+    /// A first `g` was pressed: a second one goes to the first task.
+    pub pending_g: bool,
     pub tab: PaneTab,
     /// The selected task's runs and messages, while the pane is shown.
     pub detail: Option<TaskDetail>,
@@ -313,6 +315,7 @@ impl App {
             filter_active: false,
             commands: Vec::new(),
             focus: None,
+            pending_g: false,
             tab: PaneTab::default(),
             detail: None,
             branches: HashMap::new(),
@@ -459,6 +462,14 @@ impl App {
 
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn select_last(&mut self) {
+        self.selected = self.visible_tasks().len().saturating_sub(1);
     }
 
     pub fn selected_task(&self) -> Option<&Task> {

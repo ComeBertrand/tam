@@ -342,7 +342,12 @@ adopt). `tam-cli` depends on all three.
 - **Dashboard colours** — `tui/theme.rs`: colours by role (`theme::get()`),
   never a `Color::` in the drawing code. `DARK` (24-bit) when `COLORTERM`
   says truecolor or `[tui] theme = "dark"`, else `ANSI` (the terminal's 16
-  colours; what tests draw with). Backgrounds only on the header and footer
+  colours; what tests draw with). `UNICORN` (`theme = "unicorn"`, Dracula's
+  colours) has `Theme::rainbow`: `theme::rainbow(cell, tick)` gives the
+  hues; the logo, the selection's bar and the spinners move with
+  `App::spin` (the loop then ticks all the time: `theme::animated`, off
+  with `[tui] animate = false`), group rules and the pane's border
+  (`ui::rainbow_border`, over the drawn block) stand still. Backgrounds only on the header and footer
   bars, the selected row, chips and dialogs: never behind the agent's screen
   (`peek.rs` keeps the agent's colours). Dialogs draw over a dimmed dashboard
   (`ui::render`, not the footer: it has their keys). A working agent's mark

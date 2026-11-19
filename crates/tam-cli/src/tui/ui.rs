@@ -169,7 +169,18 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let t = theme::get();
     frame.render_widget(Block::new().style(t.bar()), area);
-    let mut spans = vec![Span::styled(" tam ", t.chip(t.accent)), Span::raw(" ")];
+    let tick = app.spin.unwrap_or(0);
+    let mut spans = if t.rainbow {
+        // The logo, each cell on the next hue.
+        " tam "
+            .chars()
+            .enumerate()
+            .map(|(i, c)| Span::styled(c.to_string(), t.chip(theme::rainbow(i * 2, tick))))
+            .collect()
+    } else {
+        vec![Span::styled(" tam ", t.chip(t.accent))]
+    };
+    spans.push(Span::raw(" "));
 
     if total == 0 {
         spans.push(Span::raw("no tasks"));
@@ -518,6 +529,9 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if t.rainbow {
+        rainbow_border(frame, area);
+    }
     peek.room = (inner.width, inner.height);
 
     let Some((task, member)) = focused.filter(|_| app.tab == PaneTab::Triage) else {
@@ -556,6 +570,29 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     );
     let screen = Rect::new(inner.x, inner.y + used + 1, inner.width, below);
     render_screen(frame, screen, peek);
+}
+
+/// The border of `area` fading through the hues (still: it frames the
+/// agent's screen), its titles left as they are.
+fn rainbow_border(frame: &mut Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let edge = y == area.top()
+                || y + 1 == area.bottom()
+                || x == area.left()
+                || x + 1 == area.right();
+            if !edge {
+                continue;
+            }
+            let cell = &mut buf[(x, y)];
+            if matches!(cell.symbol(), "─" | "│" | "╭" | "╮" | "╰" | "╯") {
+                // Along the diagonal: rows count double (cells are tall).
+                let i = usize::from(x - area.left()) + 2 * usize::from(y - area.top());
+                cell.set_fg(theme::rainbow(i / 2, 0));
+            }
+        }
+    }
 }
 
 /// The agent's screen, as the daemon's terminal emulator has it: its live
@@ -2178,9 +2215,10 @@ mod tests {
     #[ignore]
     fn dump_the_dashboard_in_colour() {
         let dir = std::path::PathBuf::from(std::env::var("TAM_UI_DUMP").unwrap());
-        theme::set(Some(
-            &std::env::var("TAM_UI_THEME").unwrap_or("dark".into()),
-        ));
+        theme::set(
+            Some(&std::env::var("TAM_UI_THEME").unwrap_or("dark".into())),
+            true,
+        );
         let draw = |app: &mut App, w: u16, h: u16, name: &str| {
             let backend = ratatui::backend::TestBackend::new(w, h);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();

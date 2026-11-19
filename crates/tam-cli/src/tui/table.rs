@@ -131,11 +131,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                 // The repositories, and a rule to the list's edge.
                 let name = app::repo_group(task);
                 let rule = (width as usize).saturating_sub(Span::raw(name.as_str()).width() + 1);
-                TableRow::new([Cell::from(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(name, Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" {}", "─".repeat(rule)), Style::new().fg(t.subtle)),
-                ]))
-                .column_span(cols.len() as u16)])
+                    Span::raw(" "),
+                ];
+                if t.rainbow {
+                    spans.extend(theme::rainbow_spans(&"─".repeat(rule), 0, Style::new()));
+                } else {
+                    spans.push(Span::styled("─".repeat(rule), Style::new().fg(t.subtle)));
+                }
+                TableRow::new([Cell::from(Line::from(spans)).column_span(cols.len() as u16)])
             }
             _ => TableRow::new(cols.iter().zip(cells).map(|(&col, line)| {
                 Cell::from(match col {
@@ -203,7 +208,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .header(header)
         .column_spacing(SPACING)
         .row_highlight_style(t.selection)
-        .highlight_symbol(Line::styled("▌", Style::new().fg(t.accent)))
+        .highlight_symbol(Line::styled(
+            "▌",
+            Style::new().fg(if t.rainbow {
+                theme::rainbow(0, app.spin.unwrap_or(0) * 2)
+            } else {
+                t.accent
+            }),
+        ))
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = TableState::new()
         .with_offset(offset)
@@ -378,7 +390,11 @@ fn status_cell(status: TaskStatus, spin: Option<usize>) -> Line<'static> {
         let name = text.split_once(' ').map_or(text, |(_, name)| name);
         return Line::styled(
             format!("{} {name}", FRAMES[frame % FRAMES.len()]),
-            Style::new().fg(color),
+            Style::new().fg(if theme::get().rainbow {
+                theme::rainbow(0, frame * 3)
+            } else {
+                color
+            }),
         );
     }
     let style = Style::new().fg(color);

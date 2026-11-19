@@ -29,6 +29,8 @@ pub struct TuiConfig {
     pub commands: Vec<CustomCommand>,
     /// `dark` (24-bit palette) or `ansi` (the terminal's 16 colours).
     pub theme: Option<String>,
+    /// Whether the `unicorn` theme's rainbows move (default: yes).
+    pub animate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +53,7 @@ pub struct Config {
     pub finder: Option<String>,
     pub commands: Vec<CustomCommand>,
     pub theme: Option<String>,
+    pub animate: bool,
 }
 
 impl Default for Config {
@@ -60,6 +63,7 @@ impl Default for Config {
             finder: None,
             commands: Vec::new(),
             theme: None,
+            animate: true,
         }
     }
 }
@@ -86,8 +90,8 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     let theme = file.tui.as_ref().and_then(|t| t.theme.clone());
     if let Some(theme) = &theme {
         anyhow::ensure!(
-            matches!(theme.as_str(), "dark" | "ansi"),
-            "tui.theme is 'dark' or 'ansi', not '{theme}'"
+            matches!(theme.as_str(), "dark" | "unicorn" | "ansi"),
+            "tui.theme is 'dark', 'unicorn' or 'ansi', not '{theme}'"
         );
     }
 
@@ -96,6 +100,7 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         finder,
         commands,
         theme,
+        animate: file.tui.as_ref().and_then(|t| t.animate).unwrap_or(true),
     })
 }
 
@@ -303,6 +308,15 @@ fn strip_legacy_hooks(settings: &mut serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_theme_is_one_of_three_and_rainbows_can_stand_still() {
+        let config = parse_config("[tui]\ntheme = \"unicorn\"\nanimate = false\n").unwrap();
+        assert_eq!(config.theme.as_deref(), Some("unicorn"));
+        assert!(!config.animate);
+        assert!(parse_config("").unwrap().animate);
+        assert!(parse_config("[tui]\ntheme = \"pink\"\n").is_err());
+    }
 
     #[test]
     fn defaults() {

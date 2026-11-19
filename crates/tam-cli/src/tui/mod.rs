@@ -123,7 +123,7 @@ pub async fn run() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     mouse_capture(true);
 
-    theme::set(config.theme.as_deref());
+    theme::set(config.theme.as_deref(), config.animate);
     let mut app = App::new();
     app.commands = config.commands.clone();
     app.set_tasks(tasks);
@@ -300,7 +300,7 @@ async fn run_loop(
                 Vec::new()
             }
             _ = tick.tick() => Vec::new(),
-            _ = spin.tick(), if app.any_running() => {
+            _ = spin.tick(), if app.any_running() || theme::animated() => {
                 app.spin = app.spin.map(|n| n.wrapping_add(1));
                 Vec::new()
             }

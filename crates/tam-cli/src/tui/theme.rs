@@ -4,8 +4,7 @@
 //! (what tests draw with). The agent's screen (`peek.rs`) keeps the
 //! agent's colours: nothing here paints a background behind it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -98,11 +97,29 @@ pub static ANSI: Theme = Theme {
     rainbow: false,
 };
 
-static THEME: OnceLock<&'static Theme> = OnceLock::new();
+/// The themes by name, in the order `next` goes through them.
+static THEMES: [(&str, &Theme); 3] = [("ansi", &ANSI), ("dark", &DARK), ("unicorn", &UNICORN)];
 
-/// The theme in use: `ANSI` until `set`.
+/// The theme in use, in `THEMES`: `ANSI` until `set`.
+static THEME: AtomicUsize = AtomicUsize::new(0);
+
+/// The theme in use.
 pub fn get() -> &'static Theme {
-    THEME.get().copied().unwrap_or(&ANSI)
+    THEMES[THEME.load(Ordering::Relaxed)].1
+}
+
+/// Switch to the next theme (until the dashboard quits: the configured
+/// one comes back); returns its name.
+pub fn next() -> &'static str {
+    let next = after(THEME.load(Ordering::Relaxed));
+    THEME.store(next, Ordering::Relaxed);
+    THEMES[next].0
+}
+
+/// The theme after theme `i`: the 24-bit ones in turn. `ansi` (the first)
+/// is left for them and only comes from the config.
+fn after(i: usize) -> usize {
+    1 + i % (THEMES.len() - 1)
 }
 
 /// Whether the rainbows move.
@@ -163,14 +180,13 @@ pub fn set(configured: Option<&str>, animate: bool) {
     ANIMATE.store(animate, Ordering::Relaxed);
     let truecolor = std::env::var("COLORTERM")
         .is_ok_and(|v| v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit"));
-    let theme = match configured {
-        Some("dark") => &DARK,
-        Some("unicorn") => &UNICORN,
-        Some("ansi") => &ANSI,
-        _ if truecolor => &DARK,
-        _ => &ANSI,
+    let name = match configured {
+        Some(name) => name,
+        None if truecolor => "dark",
+        None => "ansi",
     };
-    let _ = THEME.set(theme);
+    let theme = THEMES.iter().position(|(n, _)| *n == name).unwrap_or(0);
+    THEME.store(theme, Ordering::Relaxed);
 }
 
 impl Theme {
@@ -218,6 +234,8 @@ mod tests {
         assert_eq!(rainbow(0, 0), rainbow(0, 360 / HUE_SPEED));
         // It moves to the right: a cell takes its left neighbour's colour.
         assert_eq!(rainbow(HUE_SPEED, HUE_STEP), rainbow(0, 0));
+        // The key goes from one 24-bit theme to the other, never to ansi.
+        assert_eq!((after(0), after(1), after(2)), (1, 2, 1));
         let spans = rainbow_spans("────", 0, Style::new());
         assert_eq!(spans.len(), 4);
         assert_ne!(spans[0].style.fg, spans[3].style.fg);

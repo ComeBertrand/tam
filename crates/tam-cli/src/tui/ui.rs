@@ -2388,7 +2388,9 @@ mod tests {
         assert!(!s.contains("DIR"), "{s}");
         // The task name is not cut at 15 columns; time in state and branch.
         assert!(
-            s.contains("▲ block      3m fix-allotment-rounding ↑2 *1  claude  67% ━━━━"),
+            s.contains(
+                "▲ block      3m fix-allotment-rounding                  ↑2 *1  claude  67% ━━━━"
+            ),
             "{s}"
         );
         assert!(s.contains("◌ stale     45d spike-cache"), "{s}");
@@ -2398,7 +2400,9 @@ mod tests {
         // a row per member has.
         assert!(s.lines().any(|l| l.trim() == "unit-pricing"), "{s}");
         assert!(
-            s.contains("● run        1m  ├ backend             ↑1 *3  claude  12% ━━━━"),
+            s.contains(
+                "● run        1m  ├ backend                              ↑1 *3  claude  12% ━━━━"
+            ),
             "{s}"
         );
         assert!(s.contains("? question   5m  └ frontend"), "{s}");

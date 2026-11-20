@@ -787,7 +787,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
             vec![
                 entry("j/k ↑/↓", "select"),
                 entry("enter", "type (ctrl-] back)"),
-                entry("f", "full-screen terminal"),
+                entry("f", "full screen (⇧enter)"),
                 entry("r", "run, resuming"),
                 entry("R", "run, new session"),
                 entry("s", "stop the agent"),

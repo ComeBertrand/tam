@@ -389,9 +389,10 @@ impl Client {
 
     /// Receive `ScreenUpdated` events for this agent's screen (only), or
     /// with `None` for no screen.
-    pub async fn watch_screen(&mut self, id: Option<&str>) -> Result<()> {
+    pub async fn watch_screen(&mut self, id: Option<&str>, viewing: bool) -> Result<()> {
         let request = Request::WatchScreen {
             id: id.map(str::to_string),
+            viewing,
         };
         match self.send(request).await? {
             Response::Ok => Ok(()),

@@ -235,10 +235,19 @@ adopt). `tam-cli` depends on all three.
   The daemon writes it to the PTY and, for 2s after, reports the screen
   that connection watches every 15 ms instead of 100 (`ScreenWatch::
   typing_until`): the daemon stays the only terminal emulator, and typing
-  echoes at once. The dashboard's terminal reports pastes as such only
-  meanwhile (`bracketed_paste`), the agent's cursor is shown, the border is
-  thick. The mode ends when the pane shows another agent or none, on a
-  click in the list, or when a write fails. `f` is the full-screen attach
+  echoes at once. The agent's cursor is shown, the border is
+  thick. Typing counts as viewing (`WatchScreen.viewing`, a `Viewer` in the
+  daemon's `ScreenWatch`): no notification about that agent meanwhile.
+  The mode ends on ctrl-] or a click in the list; and, unasked, when the
+  pane shows another agent or none or a write fails (`App::stop_typing`):
+  the keys still coming are then dropped until typing pauses
+  (`App::drops_key`), never run as the dashboard's. For the same reason a
+  re-sort keeps the selection on its task (`update_state`, `update_agent`,
+  `remove_agent` reselect), the wheel over the list does nothing while
+  typing, the keys of the batch that brought the focusing `enter` are
+  dropped, and the dashboard's terminal always reports pastes as such
+  (`bracketed_paste`): outside the pane a paste goes into the prompt being
+  typed in, else nowhere (`paste_into_prompt`). `f` is the full-screen attach
   (`Action::Attach`, a reserved key like `enter`'s others).
   Its bottom border keeps what the screen may no longer show: why the turn
   failed, what auto mode refused (`ui::agent_detail_line`, not a request it

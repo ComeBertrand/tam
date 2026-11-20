@@ -20,6 +20,9 @@ pub struct Peek {
     pub agent: Option<String>,
     /// The agent whose screen updates the daemon sends us.
     pub watching: Option<String>,
+    /// The daemon counts that watch as a viewer (the pane has the
+    /// keyboard): no notification about the agent meanwhile.
+    pub viewing: bool,
     /// The agent's latest screen.
     pub screen: Option<AgentScreen>,
     /// Why there is no screen.

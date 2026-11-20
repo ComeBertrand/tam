@@ -584,6 +584,11 @@ pub enum Request {
     WatchScreen {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// The user is at this agent's screen (typing into it): the watch
+        /// counts as a viewer, as an attach does (no notification), until
+        /// the connection watches something else or closes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        viewing: bool,
     },
     /// Type into an agent's terminal: `data` is written to its PTY as it
     /// is (keys as a terminal sends them). Replies `Ok`. For a while after,
@@ -1886,11 +1891,15 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         assert_eq!(
-            serde_json::to_string(&Request::WatchScreen { id: None }).unwrap(),
+            serde_json::to_string(&Request::WatchScreen {
+                id: None,
+                viewing: false,
+            })
+            .unwrap(),
             r#"{"type":"watch_screen"}"#
         );
         match serde_json::from_str::<Request>(r#"{"type":"watch_screen","id":"m-1"}"#).unwrap() {
-            Request::WatchScreen { id } => assert_eq!(id.as_deref(), Some("m-1")),
+            Request::WatchScreen { id, .. } => assert_eq!(id.as_deref(), Some("m-1")),
             _ => panic!("wrong variant"),
         }
     }

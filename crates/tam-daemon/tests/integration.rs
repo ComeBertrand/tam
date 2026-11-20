@@ -1284,7 +1284,7 @@ fn drop_request(name: &str, force: bool, delete_branch: bool) -> Request {
 
 /// Run git in `dir`, asserting success; returns stdout.
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
+    let out = tam_worktree::git::command()
         .args(args)
         .current_dir(dir)
         .output()
@@ -1315,7 +1315,7 @@ fn git_worktree(root: &std::path::Path, branch: &str) -> (PathBuf, PathBuf) {
 }
 
 fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
-    std::process::Command::new("git")
+    tam_worktree::git::command()
         .args([
             "show-ref",
             "--verify",

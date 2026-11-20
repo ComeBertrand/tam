@@ -7,7 +7,6 @@
 //! large repository.
 
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// How often the focused member's worktree is looked at again while shown.
@@ -134,7 +133,7 @@ fn parse_shortstat(stat: &str) -> (u32, u32, u32) {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = tam_worktree::git::command()
         .args(args)
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -153,7 +152,7 @@ mod tests {
     use super::*;
 
     fn run(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = tam_worktree::git::command()
             .args(args)
             .current_dir(dir)
             .output()

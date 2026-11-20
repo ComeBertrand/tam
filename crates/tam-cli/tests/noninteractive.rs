@@ -65,6 +65,7 @@ fn tam(root: &Path, dir: &Path, args: &[&str]) -> Command {
         .env_remove("TAM_AGENT_ID")
         .env_remove("TAM_SOCKET")
         .stdin(Stdio::null());
+    tam_worktree::git::without_local_env(&mut cmd);
     cmd
 }
 
@@ -127,7 +128,7 @@ async fn agent_args(args_file: &Path) -> Vec<String> {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = tam_worktree::git::command()
         .args(["-c", "user.email=t@t", "-c", "user.name=t"])
         .args(args)
         .current_dir(dir)

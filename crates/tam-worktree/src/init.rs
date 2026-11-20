@@ -184,11 +184,10 @@ pub fn run(target: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
     fn git_cmd(dir: &Path, args: &[&str]) -> String {
-        let output = StdCommand::new("git")
+        let output = crate::git::command()
             .args(args)
             .current_dir(dir)
             .output()

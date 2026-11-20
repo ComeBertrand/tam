@@ -64,8 +64,8 @@ pub fn discover(config: &tam_worktree::config::Config) -> Result<Vec<PathBuf>> {
 /// The environment the daemon runs git with when it creates our worktrees
 /// (`CreateMembers`): ours, so that hooks and filters (git-lfs) see our
 /// `PATH` and credentials, without the variables that tie git to one
-/// repository (`git rev-parse --local-env-vars`). Variables that are not
-/// UTF-8 are left out.
+/// repository ([`tam_worktree::git::LOCAL_ENV_VARS`]). Variables that are
+/// not UTF-8 are left out.
 pub fn git_env() -> BTreeMap<String, String> {
     without_local_git_vars(
         std::env::vars_os()
@@ -133,24 +133,8 @@ fn for_agent(vars: BTreeMap<String, String>) -> BTreeMap<String, String> {
 fn without_local_git_vars(
     vars: impl Iterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
-    const LOCAL: &[&str] = &[
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_GRAFT_FILE",
-        "GIT_INDEX_FILE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_PREFIX",
-        "GIT_SHALLOW_FILE",
-        "GIT_COMMON_DIR",
-    ];
-    vars.filter(|(k, _)| !LOCAL.contains(&k.as_str())).collect()
+    vars.filter(|(k, _)| !tam_worktree::git::LOCAL_ENV_VARS.contains(&k.as_str()))
+        .collect()
 }
 
 /// The members to create for task `name` (`CreateMembers`): a worktree on
@@ -220,11 +204,10 @@ impl<F: FnOnce() -> Result<Vec<PathBuf>>> Projects<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::TempDir;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = tam_worktree::git::command()
             .args(args)
             .current_dir(dir)
             .output()

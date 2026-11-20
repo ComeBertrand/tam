@@ -4,15 +4,47 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The variables that tie git to one repository whatever directory it runs
+/// in (`git rev-parse --local-env-vars`). Git exports some of them to the
+/// commands it runs: `git rebase --exec` and hooks run from a linked worktree
+/// get `GIT_DIR` (and hooks an absolute `GIT_INDEX_FILE`). tam always gives
+/// git the directory to work in, so an inherited one is never meant.
+pub const LOCAL_ENV_VARS: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// Remove [`LOCAL_ENV_VARS`] from `cmd`'s environment: for a process that
+/// runs git where it is told to, e.g. `tam` started by a test.
+pub fn without_local_env(cmd: &mut Command) -> &mut Command {
+    for var in LOCAL_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 thread_local! {
     /// The environment git runs with on this thread, set by [`with_env`].
     static ENV: RefCell<Option<BTreeMap<String, String>>> = const { RefCell::new(None) };
 }
 
-/// Run `f` with every git command it runs on this thread given exactly
-/// `env` as its environment, instead of this process's: e.g. a daemon running
-/// git for a client, so that hooks and filters (git-lfs) see the client's
-/// `PATH` and credentials. `None`: this process's environment.
+/// Run `f` with every git command it runs on this thread given `env` as its
+/// environment (less [`LOCAL_ENV_VARS`]), instead of this process's: e.g. a
+/// daemon running git for a client, so that hooks and filters (git-lfs) see
+/// the client's `PATH` and credentials. `None`: this process's environment.
 pub fn with_env<T>(env: Option<BTreeMap<String, String>>, f: impl FnOnce() -> T) -> T {
     /// Puts the previous environment back, also when `f` panics.
     struct Restore(Option<BTreeMap<String, String>>);
@@ -26,14 +58,17 @@ pub fn with_env<T>(env: Option<BTreeMap<String, String>>, f: impl FnOnce() -> T)
     f()
 }
 
-/// A `git` command, in the environment [`with_env`] set, if any.
-fn command() -> Command {
+/// A `git` command, in the environment [`with_env`] set, if any, never with
+/// [`LOCAL_ENV_VARS`]: it acts on the directory it is given. Every git tam
+/// runs is one of these, the tests' too.
+pub fn command() -> Command {
     let mut cmd = Command::new("git");
     ENV.with(|e| {
         if let Some(env) = &*e.borrow() {
             cmd.env_clear().envs(env);
         }
     });
+    without_local_env(&mut cmd);
     cmd
 }
 
@@ -399,6 +434,36 @@ mod tests {
         // Only within: then this process's environment again.
         let ident = git(tmp.path(), &["var", "GIT_AUTHOR_IDENT"]).unwrap();
         assert!(ident.starts_with("Test <"), "{ident}");
+    }
+
+    #[test]
+    fn test_git_acts_on_its_directory_whatever_git_dir_says() {
+        let tmp = TempDir::new().unwrap();
+        let (here, other) = (tmp.path().join("here"), tmp.path().join("other"));
+        init_repo(&here);
+        init_repo(&other);
+
+        // In an environment given with `with_env`.
+        let mut env: BTreeMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let other_git = other.join(".git").to_string_lossy().into_owned();
+        env.insert("GIT_DIR".into(), other_git.clone());
+        env.insert("GIT_INDEX_FILE".into(), format!("{other_git}/index"));
+        with_env(Some(env), || git(&here, &["branch", "x"]).unwrap());
+        assert!(local_branch_exists(&here, "x").unwrap());
+        assert!(!local_branch_exists(&other, "x").unwrap());
+
+        // In this process's (set for a whole process in tam-cli's
+        // tests/git_dir.rs): every variable is removed.
+        let removed: Vec<_> = command()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in LOCAL_ENV_VARS {
+            assert!(removed.iter().any(|r| r == var), "{var} is passed to git");
+        }
     }
 
     #[test]

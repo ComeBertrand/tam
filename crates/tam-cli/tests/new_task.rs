@@ -49,6 +49,7 @@ fn tam(root: &Path, cwd: &Path, args: &[&str]) -> Command {
         .env_remove("TAM_AGENT_ID")
         .env_remove("TAM_SOCKET")
         .stdin(Stdio::null());
+    tam_worktree::git::without_local_env(&mut cmd);
     cmd
 }
 
@@ -64,7 +65,7 @@ fn text(bytes: &[u8]) -> String {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = tam_worktree::git::command()
         .args(args)
         .current_dir(dir)
         .output()

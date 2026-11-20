@@ -2427,7 +2427,7 @@ mod tests {
     fn tab_picks_several_projects_in_order() {
         let tmp = tempfile::TempDir::new().unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = tam_worktree::git::command()
                 .args(args)
                 .current_dir(dir)
                 .output()

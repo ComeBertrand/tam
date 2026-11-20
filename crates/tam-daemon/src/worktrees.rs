@@ -410,11 +410,10 @@ pub(crate) fn undo_all(created: Vec<Created>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::TempDir;
 
     fn git_in(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = tam_worktree::git::command()
             .args(args)
             .current_dir(dir)
             .output()

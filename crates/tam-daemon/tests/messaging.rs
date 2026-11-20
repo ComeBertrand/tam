@@ -608,40 +608,17 @@ async fn the_loop_guard_stops_endless_exchanges_until_the_user_prompts() {
 }
 
 #[tokio::test]
-async fn an_agent_without_inbox_hook_gets_messages_typed_in_once_idle() {
+async fn a_message_waits_while_the_agent_has_no_inbox_hook() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;
     let mut conn = Conn::connect(&sock).await;
-    let mut events = Conn::subscribed(&sock).await;
     let member = conn.member("feat", dir.path()).await;
+    // A plain program in Claude's place: no hook to hand a message to.
     conn.spawn(&member, "cat", &[]).await;
 
-    let (message, pending) = conn.sent("feat", "hello\nworld", None).await;
-    assert!(pending.unwrap().contains("once it is idle"));
-    // The generic provider is idle after 5s of silence.
-    assert!(events
-        .wait_event(
-            15,
-            |e| matches!(e, Event::MessageDelivered { message: m } if m.id == message.id)
-        )
-        .await
-        .is_some());
-    // One line, submitted: the terminal echoes it, cat prints it back.
-    let expected = format!("[tam] Message {} from the user: hello world", message.id);
-    let mut scrollback = String::new();
-    for _ in 0..50 {
-        if let Response::Scrollback { data } = conn
-            .request(&Request::Scrollback { id: member.clone() })
-            .await
-        {
-            scrollback = data;
-            if scrollback.matches(&expected).count() >= 2 {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("message not typed in: {scrollback:?}");
+    let (message, pending) = conn.sent("feat", "hello", None).await;
+    assert!(pending.unwrap().contains("takes no messages"));
+    assert_eq!(message.delivered_at, None);
 }
 
 #[tokio::test]

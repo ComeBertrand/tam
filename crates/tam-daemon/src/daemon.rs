@@ -264,11 +264,6 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             let _ = state.event_tx.send(Event::StateChange { id, old, new });
         }
 
-        // Type queued messages into the idle agents without an inbox hook.
-        for delivery in state.pty_deliveries() {
-            tokio::spawn(type_into_pty(state_arc.clone(), delivery));
-        }
-
         // Auto-shutdown: if no agents and no clients, start countdown
         let has_agents = !state.agents.is_empty();
         let has_clients = state.connected_clients.load(Ordering::Relaxed) > 0;
@@ -297,7 +292,6 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
                 .iter()
                 .map(|(id, agent)| agent.context_refresh_job(id))
                 .collect();
-            let session_jobs = state.session_jobs();
 
             let event_tx = state.event_tx.clone();
             // Release lock before disk IO
@@ -316,21 +310,6 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
                 })
                 .collect();
 
-            let sessions: Vec<_> = session_jobs
-                .into_iter()
-                .filter_map(|job| {
-                    let id = provider::resolve(&job.provider).session_id(job.pid)?;
-                    Some((job, id))
-                })
-                .collect();
-
-            // Phase 3: write back under lock
-            if !sessions.is_empty() {
-                let mut state = state_arc.lock().await;
-                for (job, session_id) in &sessions {
-                    state.record_session(job, session_id);
-                }
-            }
             if !results.is_empty() {
                 let mut state = state_arc.lock().await;
                 for (id, pct) in &results {
@@ -346,13 +325,6 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             }
         }
     }
-}
-
-/// An agent whose run has no session id recorded yet.
-struct SessionJob {
-    member: String,
-    pid: u32,
-    provider: String,
 }
 
 impl DaemonState {
@@ -431,25 +403,6 @@ impl DaemonState {
             .collect()
     }
 
-    /// Agents bound to a member whose current run has no session id yet.
-    /// Not those whose hooks report their sessions: they report one once it
-    /// has a turn, and a session found earlier could not be resumed.
-    fn session_jobs(&self) -> Vec<SessionJob> {
-        self.agents
-            .values()
-            .filter(|agent| !agent.reports_sessions())
-            .filter_map(|agent| {
-                let member = agent.member()?;
-                let run = self.ledger.member_runs(member).pop()?;
-                (run.ended_at.is_none() && run.session_id.is_none()).then(|| SessionJob {
-                    member: member.to_string(),
-                    pid: agent.pid(),
-                    provider: agent.provider_name().to_string(),
-                })
-            })
-            .collect()
-    }
-
     /// Record the session an agent's hooks showed a turn in as its member's
     /// current run's session (it changes on e.g. `/clear`).
     fn record_hook_session(&mut self, member: &str, session_id: &str) {
@@ -459,23 +412,6 @@ impl DaemonState {
             }
             Ok(false) => {}
             Err(e) => error!(member = %member, "failed to record session: {e:#}"),
-        }
-    }
-
-    /// Record a discovered session id, if the agent is still the one running
-    /// for the member.
-    fn record_session(&mut self, job: &SessionJob, session_id: &str) {
-        let still_running = self
-            .agents
-            .values()
-            .any(|a| a.member() == Some(job.member.as_str()) && a.pid() == job.pid);
-        if !still_running {
-            return;
-        }
-        match self.ledger.session_identified(&job.member, session_id) {
-            Ok(true) => info!(member = %job.member, session = %session_id, "session identified"),
-            Ok(false) => {}
-            Err(e) => error!(member = %job.member, "failed to record session: {e:#}"),
         }
     }
 }
@@ -911,7 +847,6 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::RunAgent {
             member,
             provider,
-            default_provider,
             session,
             args,
             prompt,
@@ -923,7 +858,6 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
                 RunSpec {
                     member,
                     provider,
-                    default_provider,
                     session,
                     args,
                     prompt,
@@ -1131,7 +1065,6 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
 struct RunSpec {
     member: String,
     provider: Option<String>,
-    default_provider: String,
     session: SessionChoice,
     args: Vec<String>,
     prompt: Option<String>,
@@ -1139,13 +1072,12 @@ struct RunSpec {
     launch: crate::agent::Launch,
 }
 
-/// Start a member's agent: the requested agent, else the member's last one,
-/// in the member's current session for that agent unless told otherwise.
+/// Start a member's agent, in the member's current session unless told
+/// otherwise.
 async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Response {
     let RunSpec {
         member,
         provider,
-        default_provider,
         session,
         args,
         prompt,
@@ -1166,9 +1098,8 @@ async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Res
                 message: format!("'{}' already has a running agent", label),
             };
         }
-        let provider = provider
-            .or_else(|| state.ledger.last_provider(&member))
-            .unwrap_or(default_provider);
+        // Claude, whatever the member's earlier runs were.
+        let provider = provider.unwrap_or_else(|| "claude".into());
         let current = state.ledger.current_session(&member, &provider);
         (label, provider, current)
     };
@@ -2084,14 +2015,6 @@ impl DaemonState {
 // Messages (see `inbox.rs`)
 // ---------------------------------------------------------------------------
 
-/// Queued messages to type into an agent's PTY, outside the state lock.
-struct PtyDelivery {
-    member: String,
-    ids: Vec<String>,
-    master: Arc<OwnedFd>,
-    input: Vec<u8>,
-}
-
 impl DaemonState {
     /// The member a caller's agent id stands for: the member its agent runs
     /// for, or the member with that id. `None`: the user.
@@ -2129,39 +2052,6 @@ impl DaemonState {
         }
     }
 
-    /// Messages to type into the idle agents that have no inbox hook: the
-    /// oldest queued one each.
-    fn pty_deliveries(&mut self) -> Vec<PtyDelivery> {
-        let ready: Vec<String> = self
-            .agents
-            .iter()
-            .filter(|(id, agent)| {
-                agent.member() == Some(id.as_str())
-                    && !agent.inbox_hook()
-                    && !self.inbox.has_waiter(id)
-                    && matches!(agent.current_state(), AgentState::Idle | AgentState::Ready)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut deliveries = Vec::new();
-        for member in ready {
-            let Some(message) = self.queued_messages(&member).into_iter().next() else {
-                continue;
-            };
-            let agent = &self.agents[&member];
-            let input = agent.pty_input(&inbox::pty_text(std::slice::from_ref(&message)));
-            let ids = vec![message.id];
-            self.inbox.take_off(&member, &ids);
-            deliveries.push(PtyDelivery {
-                master: agent.pty_master(),
-                member,
-                ids,
-                input,
-            });
-        }
-        deliveries
-    }
-
     /// A message reached its recipient's agent: record it and tell clients.
     /// `in_turn`: the agent reports the end of the turn that got it (whose
     /// last response is the reply).
@@ -2194,7 +2084,7 @@ impl DaemonState {
             Some(agent) if agent.inbox_hook() => format!(
                 "waiting for the inbox hook of '{to}' (armed when its session starts and after each turn)"
             ),
-            Some(_) => format!("typed into the agent of '{to}' once it is idle"),
+            Some(_) => format!("the agent of '{to}' takes no messages: its next one gets it"),
         })
     }
 }
@@ -2469,34 +2359,6 @@ async fn handle_wait_inbox(
         }
     }
     Ok(())
-}
-
-/// Type messages into an agent's PTY, then press Enter, and record them as
-/// delivered.
-async fn type_into_pty(state: Arc<Mutex<DaemonState>>, delivery: PtyDelivery) {
-    let PtyDelivery {
-        member,
-        ids,
-        master,
-        input,
-    } = delivery;
-    let fd = master.clone();
-    let typed = tokio::task::spawn_blocking(move || write_pty(&fd, &input))
-        .await
-        .unwrap_or(false);
-    if typed {
-        tokio::time::sleep(inbox::SUBMIT_DELAY).await;
-        let _ = tokio::task::spawn_blocking(move || write_pty(&master, b"\r")).await;
-    }
-    let mut state = state.lock().await;
-    state.inbox.land(&member, &ids);
-    if typed {
-        for id in &ids {
-            state.record_delivery(id, false);
-        }
-    } else {
-        warn!(member = %member, "could not type a message into the agent's terminal");
-    }
 }
 
 /// Write all of `data` to a PTY master.

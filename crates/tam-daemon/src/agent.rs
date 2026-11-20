@@ -515,11 +515,6 @@ impl Agent {
         self.provider.inbox_hook()
     }
 
-    /// Bytes that type `text` into the agent's input (Enter not included).
-    pub fn pty_input(&self, text: &str) -> Vec<u8> {
-        self.provider.pty_input(text)
-    }
-
     /// The response that ended the agent's last turn, in full, as its hooks
     /// reported it; `None` while a turn runs or before the first one ends.
     pub fn response(&self) -> Option<&AgentResponse> {

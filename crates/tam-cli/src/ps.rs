@@ -1,5 +1,5 @@
 //! `tam ps`'s text: a row per task, and below a task with several members a
-//! row per member (its status, agent, worktree and context), as in the
+//! row per member (its status, worktree and context), as in the
 //! dashboard's list; then what is wrong with worktrees. `tam ps --json` is
 //! `script::ps`.
 
@@ -7,9 +7,9 @@ use crate::health;
 use crate::task::{Member, Task};
 use crate::{format_age, shorten_home};
 
-const HEADER: [&str; 7] = ["STATUS", "TASK", "AGENT", "RUNS", "LAST", "DIR", "CTX"];
+const HEADER: [&str; 6] = ["STATUS", "TASK", "RUNS", "LAST", "DIR", "CTX"];
 /// The columns aligned to the right: RUNS, LAST, CTX.
-const RIGHT: [bool; 7] = [false, false, false, true, true, false, true];
+const RIGHT: [bool; 6] = [false, false, true, true, false, true];
 const SPACING: &str = "  ";
 
 /// What `tam ps` prints, line by line, the tasks in the order given.
@@ -22,8 +22,8 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
         let runs = task.run_count.to_string();
         let last = format_age(task.last_activity);
         if let [member] = &task.members[..] {
-            let [status, agent, dir, ctx] = member_cells(task, member);
-            rows.push([status, task.name.clone(), agent, runs, last, dir, ctx]);
+            let [status, dir, ctx] = member_cells(task, member);
+            rows.push([status, task.name.clone(), runs, last, dir, ctx]);
             continue;
         }
         // The task's status is its most urgent member's; the rest is each
@@ -32,7 +32,6 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
         rows.push([
             status,
             task.name.clone(),
-            String::new(),
             runs,
             last,
             String::new(),
@@ -45,8 +44,8 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
                 "├─"
             };
             let name = format!("{tree} {}", member.info.name);
-            let [status, agent, dir, ctx] = member_cells(task, member);
-            rows.push([status, name, agent, String::new(), String::new(), dir, ctx]);
+            let [status, dir, ctx] = member_cells(task, member);
+            rows.push([status, name, String::new(), String::new(), dir, ctx]);
         }
     }
 
@@ -87,12 +86,11 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
     out
 }
 
-/// A member's status, agent, worktree and context.
-fn member_cells(task: &Task, member: &Member) -> [String; 4] {
+/// A member's status, worktree and context.
+fn member_cells(task: &Task, member: &Member) -> [String; 3] {
     let agent = member.agent_info.as_ref();
     [
         task.member_status(member).indicator().into(),
-        agent.map_or("-", |a| a.provider.as_str()).into(),
         shorten_home(&member.info.dir.display().to_string()),
         agent
             .and_then(|a| a.context_percent)
@@ -119,10 +117,10 @@ mod tests {
         }
     }
 
-    fn agent(id: &str, provider: &str, state: AgentState, ctx: Option<u8>) -> AgentInfo {
+    fn agent(id: &str, state: AgentState, ctx: Option<u8>) -> AgentInfo {
         AgentInfo {
             id: id.into(),
-            provider: provider.into(),
+            provider: "claude".into(),
             dir: "/w".into(),
             state,
             pid: Some(1),
@@ -157,9 +155,9 @@ mod tests {
     #[test]
     fn a_row_per_task_and_per_member_of_a_task_with_several() {
         let agents = [
-            agent("m-fix", "claude", AgentState::Working, Some(45)),
-            agent("m-api", "claude", AgentState::Idle, Some(12)),
-            agent("m-web", "codex", AgentState::Ready, None),
+            agent("m-fix", AgentState::Working, Some(45)),
+            agent("m-api", AgentState::Idle, Some(12)),
+            agent("m-web", AgentState::Ready, None),
         ];
         let tasks = [
             task(
@@ -189,13 +187,12 @@ mod tests {
         // nothing that is a member's.
         assert!(multi.starts_with("◆ ready"), "{shown}");
         assert!(multi.ends_with("5    5m"), "{shown}");
-        // Each member: its own status, agent, worktree and context.
+        // Each member: its own status, worktree and context.
         assert!(api.starts_with("○ idle"), "{shown}");
         assert!(api.contains("├─ api"), "{shown}");
         assert!(api.ends_with("/w/api--api-and-web  12%"), "{shown}");
         assert!(web.starts_with("◆ ready"), "{shown}");
         assert!(web.contains("└─ web"), "{shown}");
-        assert!(web.contains("codex"), "{shown}");
         assert!(web.ends_with("/w/web--api-and-web    -"), "{shown}");
         // A single member is the task's row.
         assert!(single.starts_with("● run"), "{shown}");
@@ -205,8 +202,6 @@ mod tests {
         assert_eq!(column(header, "TASK"), column(multi, "api-and-web"));
         assert_eq!(column(header, "TASK"), column(single, "fix-nav"));
         assert_eq!(column(header, "TASK"), column(api, "├─"));
-        assert_eq!(column(header, "AGENT"), column(api, "claude"));
-        assert_eq!(column(header, "AGENT"), column(web, "codex"));
         assert_eq!(column(header, "DIR"), column(api, "/w/"));
         assert_eq!(column(header, "DIR"), column(single, "/w/"));
     }

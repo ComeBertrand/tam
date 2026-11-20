@@ -1,8 +1,8 @@
 //! Messages between task members (and from the user): what the daemon keeps
 //! in memory to deliver them. Messages themselves live in the ledger.
 //!
-//! Delivery depends on the recipient's agent:
-//! - An agent with an inbox hook (Claude) runs `tam inbox-wait` in the
+//! Delivery:
+//! - The agent's inbox hook runs `tam inbox-wait` in the
 //!   background (an `asyncRewake` hook armed at session start and after
 //!   each turn). It holds a `WaitInbox` connection; the daemon hands it the
 //!   queued messages, it prints them and exits 2, and Claude shows them to
@@ -11,7 +11,6 @@
 //!   is open). A message handed over counts as delivered when it shows up in
 //!   the prompt of the agent's next `UserPromptSubmit` hook; until then it is
 //!   in flight, and goes back to the queue if the agent exits.
-//! - Other agents get it typed into their PTY, once idle.
 //! - A member with no running agent keeps it queued for its next agent.
 
 use std::collections::{HashMap, VecDeque};
@@ -29,19 +28,13 @@ pub const MAX_HOPS: u32 = 6;
 pub const RATE_LIMIT: usize = 20;
 pub const RATE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// An agent's hop chain is forgotten when nothing reached it for this long
-/// (agents without hooks never report the user's prompts).
+/// (a user's prompt, which its hooks report, forgets it sooner).
 const CHAIN_TTL: Duration = Duration::from_secs(30 * 60);
 /// A message only answers one sent to its sender within this window.
 pub const REPLY_WINDOW_SECS: u64 = 60 * 60;
 /// Most text handed to an inbox hook at once; further messages wait for the
 /// next hand-over.
 const MAX_BATCH: usize = 9000;
-/// Longest line typed into a provider without bracketed paste (a terminal
-/// line in canonical mode holds 4095 bytes).
-pub const MAX_PTY_LINE: usize = 4000;
-/// Delay between typing a message and pressing Enter: a TUI reading a paste
-/// takes an Enter sent with it as part of the paste.
-pub const SUBMIT_DELAY: Duration = Duration::from_millis(500);
 /// Replies kept for a `WaitReply` that comes after the reply.
 const KEPT_REPLIES: usize = 64;
 
@@ -83,44 +76,6 @@ pub fn batch(pending: &[MessageInfo]) -> (String, Vec<String>) {
         ids.push(m.id.clone());
     }
     (text, ids)
-}
-
-/// The text typed into an agent's PTY for these messages.
-pub fn pty_text(pending: &[MessageInfo]) -> String {
-    let blocks: Vec<String> = pending.iter().map(format_message).collect();
-    format!("{REWAKE_PREFIX} {}", blocks.join("\n\n"))
-}
-
-/// `text` on one line, capped to [`MAX_PTY_LINE`] bytes: for programs that
-/// would take each line as a separate input.
-pub fn one_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if line.len() <= MAX_PTY_LINE {
-        return line;
-    }
-    let note = format!(" […{} bytes cut; see tam history]", line.len());
-    let mut cut = MAX_PTY_LINE - note.len();
-    while !line.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{note}", &line[..cut])
-}
-
-/// `text` as a bracketed paste (for TUIs that turn it on).
-pub fn bracketed_paste(text: &str) -> Vec<u8> {
-    let clean: String = text
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect();
-    let mut out = b"\x1b[200~".to_vec();
-    out.extend_from_slice(clean.as_bytes());
-    out.extend_from_slice(b"\x1b[201~");
-    out
 }
 
 /// Message ids (`msg-` and 8 hex digits) found in `text`.
@@ -220,14 +175,6 @@ impl Inbox {
             .or_default()
             .extend(handed);
         true
-    }
-
-    /// Mark messages as in flight (being typed into a PTY).
-    pub fn take_off(&mut self, member: &str, ids: &[String]) {
-        self.in_flight
-            .entry(member.to_string())
-            .or_default()
-            .extend(ids.iter().cloned());
     }
 
     pub fn in_flight(&self, member: &str) -> &[String] {
@@ -421,27 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn pty_text_flattens_and_caps() {
-        let text = pty_text(&[msg("msg-1", Some("m-1"), "line one\n\nline two")]);
-        assert!(text.starts_with("[tam] Message msg-1 from feat/api:\nline one"));
-        assert_eq!(
-            one_line(&text),
-            "[tam] Message msg-1 from feat/api: line one line two To reply, run: tam msg feat/api \"<reply>\""
-        );
-        let long = one_line(&"é".repeat(5000));
-        assert!(long.len() <= MAX_PTY_LINE, "{}", long.len());
-        assert!(long.ends_with("bytes cut; see tam history]"));
-    }
-
-    #[test]
-    fn bracketed_paste_wraps_and_drops_control_chars() {
-        assert_eq!(
-            bracketed_paste("a\nb\x1b[201~c"),
-            b"\x1b[200~a\nb[201~c\x1b[201~".to_vec()
-        );
-    }
-
-    #[test]
     fn delivered_ids_are_found_in_the_prompt() {
         let ids = vec!["msg-0000000a".to_string(), "msg-0000000b".to_string()];
         let prompt = "<task-notification>…</task-notification>\n<system-reminder>\n[tam] Message msg-0000000b from the user:\nhi\n</system-reminder>";
@@ -488,7 +414,9 @@ mod tests {
     fn agent_exit_requeues_what_was_in_flight() {
         let mut inbox = Inbox::default();
         let (_, mut rx) = inbox.register_waiter("m-1");
-        inbox.take_off("m-1", &["msg-1".into()]);
+        assert!(inbox.hand_over("m-1", "m-1", "t".into(), vec!["msg-1".into()]));
+        assert!(matches!(rx.try_recv(), Ok(Handover::Messages { .. })));
+        let (_, mut rx) = inbox.register_waiter("m-1");
         inbox.delivered_this_turn("m-1", "msg-0");
         inbox.agent_gone("m-1", Some("m-1"));
         assert!(matches!(rx.try_recv(), Ok(Handover::Released)));

@@ -6,7 +6,7 @@
 
 ### The problem
 
-Modern AI coding agents (Claude Code, Codex, etc.) run as interactive terminal processes. A developer working on multiple tasks needs multiple agents, each in its own working directory, each with its own conversation history. The tools for managing this are ad-hoc: tmux panes, background jobs, manual worktree creation, remembering which session to resume. The cognitive overhead scales with the number of tasks.
+Modern AI coding agents run as interactive terminal processes; tam runs one, Claude Code. A developer working on multiple tasks needs multiple agents, each in its own working directory, each with its own conversation history. The tools for managing this are ad-hoc: tmux panes, background jobs, manual worktree creation, remembering which session to resume. The cognitive overhead scales with the number of tasks.
 
 Two concerns are tangled together:
 
@@ -30,7 +30,7 @@ TASK
 
 **Borrowed context**: the directory already existed (the main repo, a manually created worktree, etc.). TAM manages agents in it but does not touch the filesystem. Cleanup removes the task from TAM's records, nothing more.
 
-A task is not a process. An agent can start, stop, and restart within a single task. A task is not a session — multiple sessions can be used within the same task (fresh starts, different providers). A task is the persistent spine that ties directory, agent runs, and sessions together over time.
+A task is not a process. An agent can start, stop, and restart within a single task. A task is not a session — multiple sessions can be used within the same task (fresh starts). A task is the persistent spine that ties directory, agent runs, and sessions together over time.
 
 ### No lifecycle assertions
 
@@ -132,11 +132,7 @@ The daemon writes a PID file next to the socket for health checks. The client au
 
 ### State detection
 
-State detection uses two strategies, selected per provider:
-
-**Hook-based** (Claude Code): the agent process receives `TAM_AGENT_ID` and `TAM_SOCKET` environment variables at spawn, and its hooks are injected with `claude --settings` (nothing is written to `~/.claude/settings.json`). Each hook runs `tam hook-notify`, which forwards the hook's JSON input to the daemon that spawned the agent (best effort, never starting a daemon). The daemon maps the event to a state (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PermissionRequest`, `Stop`, `StopFailure`…) and keeps per agent what it needs: session id, transcript path, pending permission or question, last response, error cause, last auto-mode denial. A turn the user interrupts fires no hook: a working agent whose PTY stays silent for 10s is taken as back at the prompt. Nothing fires when a permission is granted either; the agent shows blocked until the tool finishes.
-
-**PTY heuristic** (generic/codex): for agents without hooks, the daemon tracks time since last PTY output. Activity within 5 seconds means "working," silence beyond that means "idle." This cannot distinguish "waiting for input" from "thinking quietly," so it's a fallback.
+State detection uses Claude Code's hooks: the agent process receives `TAM_AGENT_ID` and `TAM_SOCKET` environment variables at spawn, and its hooks are injected with `claude --settings` (nothing is written to `~/.claude/settings.json`). Each hook runs `tam hook-notify`, which forwards the hook's JSON input to the daemon that spawned the agent (best effort, never starting a daemon). The daemon maps the event to a state (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PermissionRequest`, `Stop`, `StopFailure`…) and keeps per agent what it needs: session id, transcript path, pending permission or question, last response, error cause, last auto-mode denial. A turn the user interrupts fires no hook: a working agent whose PTY stays silent for 10s is taken as back at the prompt. Nothing fires when a permission is granted either; the agent shows blocked until the tool finishes.
 
 **Context usage**: for Claude Code, the daemon periodically reads the session transcript its hooks reported (`transcript_path`) to extract token usage (input + cache tokens) and computes a percentage against the model's context limit. This is done in a two-phase pattern: collect metadata under the daemon lock, release the lock, do file IO, re-acquire and write back. This avoids holding the lock during disk access.
 
@@ -146,7 +142,6 @@ TAM reads configuration from `~/.config/tam/config.toml`. The worktree-related s
 
 ```toml
 [spawn]
-default_agent = "claude"                    # default provider
 
 [worktree]
 root = "~/worktrees"                        # where owned worktrees are created
@@ -234,7 +229,7 @@ tam pick                            # fuzzy project picker, prints selected path
 ### Setup and administration
 
 ```
-tam init --agent claude             # remove the global hooks older versions installed
+tam init                            # remove the global hooks older versions installed
 tam shutdown                        # stop all agents, kill daemon
 tam status                          # check if daemon is running
 ```
@@ -265,15 +260,13 @@ tam hook-notify                     # hook callback from agent process
 
 ### Session resume flow
 
-A task member almost always has one conversation, so there is no session picker. Each member has a **current session** per agent, derived from the ledger: the session of the member's latest run of that agent that has one. A run's session is the one it resumed, or the last one its agent had a turn in. For Claude, the hooks report it: a session counts once a prompt or a turn shows in it (or it is resumed), because a session nobody typed in has no transcript and cannot be resumed. So a `/clear` followed by a prompt moves the current session; a new session left before any prompt does not.
+A task member almost always has one conversation, so there is no session picker. Each member has a **current session**, derived from the ledger: the session of the member's latest run that has one. A run's session is the one it resumed, or the last one its agent had a turn in. The hooks report it: a session counts once a prompt or a turn shows in it (or it is resumed), because a session nobody typed in has no transcript and cannot be resumed. So a `/clear` followed by a prompt moves the current session; a new session left before any prompt does not.
 
 `tam run NAME` (and `r` in the TUI) asks the daemon to start the member's agent (`RunAgent`); the daemon picks the session:
 
-1. `--session ID`: resume that session, whatever the current one (refused by agents that cannot resume).
+1. `--session ID`: resume that session, whatever the current one.
 2. `--new-session` (`R` in the TUI): start a new session. It becomes current once used.
 3. Otherwise: resume the current session of the agent, when there is one; else start a new session. If Claude deleted the session's transcript, the run is refused with a hint to start a new session, rather than starting an agent that exits at once.
-
-Without `-a`, the agent is the member's last one, else the configured default. Agents without hooks report no sessions, so tam never knows which one they ended in: Codex starts a new session unless given one with `--session` (`codex resume ID`); generic agents have no sessions at all.
 
 ---
 
@@ -307,11 +300,10 @@ The header shows the task count and how many need the user (ready, blocked, ques
 | TASK | Task name (a member's name on its rows), cut only when the terminal is too narrow |
 | REPO | Repositories, when not grouped by them (`g`) |
 | BRANCH | Against the default branch: `↑` ahead, `↓` behind, `*` uncommitted paths, `=` none (git asked once a minute per worktree, every 10s for the one the pane shows) |
-| AGENT | Provider name if agent is running, `-` otherwise |
 | CTX | Context window usage percentage (agent running only) |
 | (last) | From 100 columns: what the member waits on (permission, question, error, last message, worktree problem) |
 
-Narrow terminals drop AGENT, then CTX, then BRANCH before cutting task names.
+Narrow terminals drop CTX, then BRANCH before cutting task names.
 
 ### Status indicators
 

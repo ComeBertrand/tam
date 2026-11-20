@@ -474,12 +474,6 @@ impl Ledger {
             .find_map(|r| r.session_id.clone())
     }
 
-    /// The agent of the member's latest run.
-    pub fn last_provider(&self, member: &str) -> Option<String> {
-        let runs = &self.state.members.get(member)?.runs;
-        runs.last().map(|r| r.provider.clone())
-    }
-
     /// Find one member from what a user typed: a task name (its only
     /// member), `<task>/<member>` (short name) or a member id.
     ///
@@ -611,26 +605,6 @@ impl Ledger {
             timestamp: now(),
         })?;
         Ok(self.task(&task).expect("member's task exists"))
-    }
-
-    /// Record the session id of the member's open run, if it has none yet.
-    /// Returns whether anything was recorded.
-    pub fn session_identified(&mut self, member: &str, session_id: &str) -> Result<bool> {
-        let needed = self
-            .state
-            .members
-            .get(member)
-            .and_then(|m| m.runs.last())
-            .is_some_and(|r| r.ended_at.is_none() && r.session_id.is_none());
-        if !needed {
-            return Ok(false);
-        }
-        self.append(LedgerEvent::AgentSessionIdentified {
-            member: member.into(),
-            session_id: session_id.into(),
-            timestamp: now(),
-        })?;
-        Ok(true)
     }
 
     /// Record a session the agent of the member's open run had a turn in:
@@ -1979,14 +1953,14 @@ mod tests {
         assert_eq!(info.run_count, 1);
         assert!(ledger.has_open_run(&m));
 
-        assert!(ledger.session_identified(&m, "s1").unwrap());
+        assert!(ledger.session_reported(&m, "s1").unwrap());
         // Already known: not recorded twice.
-        assert!(!ledger.session_identified(&m, "s2").unwrap());
+        assert!(!ledger.session_reported(&m, "s1").unwrap());
 
         assert!(ledger.run_ended(&m, 0).unwrap().is_some());
         // No open run left: nothing to record.
         assert!(ledger.run_ended(&m, 0).unwrap().is_none());
-        assert!(!ledger.session_identified(&m, "s3").unwrap());
+        assert!(!ledger.session_reported(&m, "s3").unwrap());
 
         let runs = ledger.runs("feat");
         assert_eq!(runs.len(), 1);
@@ -2620,7 +2594,6 @@ mod tests {
         // Another agent has its own.
         ledger.run_started(&m, "codex", Some("x1".into())).unwrap();
         ledger.run_ended(&m, 0).unwrap();
-        assert_eq!(ledger.last_provider(&m).as_deref(), Some("codex"));
         assert_eq!(ledger.current_session(&m, "codex").as_deref(), Some("x1"));
         assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s1"));
 
@@ -2628,7 +2601,6 @@ mod tests {
         ledger.run_started(&m, "claude", Some("s0".into())).unwrap();
         assert_eq!(ledger.current_session(&m, "claude").as_deref(), Some("s0"));
         assert_eq!(ledger.current_session("m-nope", "claude"), None);
-        assert_eq!(ledger.last_provider("m-nope"), None);
     }
 
     #[test]
@@ -2876,9 +2848,7 @@ mod tests {
                     .map(|m| MemberFold {
                         runs: ledger.member_runs(&m.id),
                         open: ledger.has_open_run(&m.id),
-                        session: ledger
-                            .last_provider(&m.id)
-                            .and_then(|p| ledger.current_session(&m.id, &p)),
+                        session: ledger.current_session(&m.id, "claude"),
                         pending: ledger.pending_messages(&m.id),
                         response: ledger.last_response(&m.id),
                     })

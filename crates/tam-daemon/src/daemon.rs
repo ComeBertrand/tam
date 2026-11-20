@@ -70,6 +70,13 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// agent redraws far more often than a viewer needs.
 const SCREEN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The same on a connection someone types on (`Request::Keys`): what they
+/// type shows at once.
+const TYPING_UPDATE_INTERVAL: Duration = Duration::from_millis(15);
+
+/// How long after its last keys a connection counts as typed on.
+const TYPING_FOR: Duration = Duration::from_secs(2);
+
 impl Daemon {
     /// A daemon serving `socket_path` and owning the ledger at `ledger_path`
     /// (see [`crate::ledger::default_path`]).
@@ -500,6 +507,8 @@ struct ScreenWatch {
     changes: watch::Receiver<()>,
     /// No update before this instant (throttling).
     quiet_until: Option<tokio::time::Instant>,
+    /// Keys came on this connection: updates come sooner until then.
+    typing_until: Option<tokio::time::Instant>,
 }
 
 /// Next update of the screen watched on a connection: at most one per
@@ -515,7 +524,12 @@ async fn next_screen_update(watch: &mut Option<ScreenWatch>) -> Option<String> {
         watch.quiet_until = None;
     }
     watch.changes.changed().await.ok()?;
-    watch.quiet_until = Some(tokio::time::Instant::now() + SCREEN_UPDATE_INTERVAL);
+    let now = tokio::time::Instant::now();
+    let interval = match watch.typing_until {
+        Some(until) if now < until => TYPING_UPDATE_INTERVAL,
+        _ => SCREEN_UPDATE_INTERVAL,
+    };
+    watch.quiet_until = Some(now + interval);
     Some(watch.id.clone())
 }
 
@@ -604,12 +618,43 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                     changes: agent.screen_changes(),
                                     id,
                                     quiet_until: None,
+                                    typing_until: None,
                                 });
                                 Response::Ok
                             }
                             None => Response::Error {
                                 message: format!("agent '{}' not found", id),
                             },
+                        },
+                    };
+                    write_response(&mut writer, &response).await?;
+                } else if let Request::Keys { id, data } = request {
+                    let master = state.lock().await.agents.get(&id).map(|a| a.pty_master());
+                    let response = match master {
+                        Some(master) => {
+                            // Off the runtime: a PTY whose agent reads nothing blocks.
+                            let written = tokio::task::spawn_blocking(move || {
+                                write_pty(&master, data.as_bytes())
+                            })
+                            .await
+                            .unwrap_or(false);
+                            // What was typed shows at once, and the next
+                            // changes soon after.
+                            if let Some(watch) = screen_watch.as_mut().filter(|w| w.id == id) {
+                                let now = tokio::time::Instant::now();
+                                watch.typing_until = Some(now + TYPING_FOR);
+                                watch.quiet_until = None;
+                            }
+                            if written {
+                                Response::Ok
+                            } else {
+                                Response::Error {
+                                    message: format!("could not type into agent '{id}'"),
+                                }
+                            }
+                        }
+                        None => Response::Error {
+                            message: format!("agent '{}' not found", id),
                         },
                     };
                     write_response(&mut writer, &response).await?;
@@ -884,6 +929,9 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         },
         Request::WatchScreen { .. } => Response::Error {
             message: "watch_screen should be handled by connection handler".into(),
+        },
+        Request::Keys { .. } => Response::Error {
+            message: "keys should be handled by connection handler".into(),
         },
         Request::SendMessage { to, text, from } => {
             handle_send_message(state, &to, &text, from.as_deref()).await

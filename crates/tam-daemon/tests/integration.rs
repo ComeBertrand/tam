@@ -2306,6 +2306,65 @@ async fn watched_screen_updates_are_throttled() {
 }
 
 #[tokio::test]
+async fn keys_are_typed_into_the_agent_and_show_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = start_daemon(dir.path()).await;
+    let mut conn = Conn::connect(&sock).await;
+    // `cat` echoes what is typed (the terminal's echo, then its own line).
+    spawn_sh(&mut conn, "typed", "cat").await;
+    let resp = conn
+        .request(&Request::WatchScreen {
+            id: Some("typed".into()),
+        })
+        .await;
+    assert!(matches!(resp, Response::Ok), "{resp:?}");
+    // Let the first updates (the agent starting) pass.
+    count_screen_updates(&mut conn, "typed", 300).await;
+
+    // Twenty keys, one every 20ms: each shows before the next is typed.
+    let mut shown = 0;
+    let mut slowest = std::time::Duration::ZERO;
+    for i in 0..20 {
+        let typed = std::time::Instant::now();
+        let resp = conn
+            .request(&Request::Keys {
+                id: "typed".into(),
+                data: "x".into(),
+            })
+            .await;
+        assert!(matches!(resp, Response::Ok), "{resp:?}");
+        let update = conn
+            .wait_event(2, |e| matches!(e, tam_proto::Event::ScreenUpdated { .. }))
+            .await;
+        assert!(update.is_some(), "no update after key {i}");
+        slowest = slowest.max(typed.elapsed());
+        let row = screen_rows(&screen(&mut conn, "typed", None).await)[0].clone();
+        shown = row.chars().filter(|c| *c == 'x').count();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(shown, 20);
+    // Far under the 100ms of an agent nobody types into (generous: CI).
+    assert!(slowest < std::time::Duration::from_millis(80), "{slowest:?}");
+
+    // More keys in one write, Enter among them.
+    conn.request(&Request::Keys {
+        id: "typed".into(),
+        data: " done\r".into(),
+    })
+    .await;
+    let line = format!("{} done", "x".repeat(20));
+    wait_screen_row(&mut conn, "typed", &line).await;
+
+    let resp = conn
+        .request(&Request::Keys {
+            id: "nope".into(),
+            data: "x".into(),
+        })
+        .await;
+    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+}
+
+#[tokio::test]
 async fn watched_screen_update_follows_a_single_change() {
     let dir = tempfile::tempdir().unwrap();
     let sock = start_daemon(dir.path()).await;

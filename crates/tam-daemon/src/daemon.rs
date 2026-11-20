@@ -509,6 +509,24 @@ struct ScreenWatch {
     quiet_until: Option<tokio::time::Instant>,
     /// Keys came on this connection: updates come sooner until then.
     typing_until: Option<tokio::time::Instant>,
+    /// The watch counts as a viewer of the agent (`WatchScreen.viewing`).
+    _viewer: Option<Viewer>,
+}
+
+/// One viewer of an agent, for as long as this lives.
+struct Viewer(Arc<AtomicUsize>);
+
+impl Viewer {
+    fn of(viewers: Arc<AtomicUsize>) -> Self {
+        viewers.fetch_add(1, Ordering::Relaxed);
+        Self(viewers)
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Next update of the screen watched on a connection: at most one per
@@ -606,7 +624,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                     // Subscribe before replying: no event after the Ok is missed.
                     event_rx = Some(state.lock().await.event_tx.subscribe());
                     write_response(&mut writer, &Response::Ok).await?;
-                } else if let Request::WatchScreen { id } = request {
+                } else if let Request::WatchScreen { id, viewing } = request {
                     let response = match id {
                         None => {
                             screen_watch = None;
@@ -619,6 +637,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                     id,
                                     quiet_until: None,
                                     typing_until: None,
+                                    _viewer: viewing.then(|| Viewer::of(agent.viewers())),
                                 });
                                 Response::Ok
                             }

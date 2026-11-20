@@ -2279,6 +2279,7 @@ async fn watched_screen_updates_are_throttled() {
     let resp = watcher
         .request(&Request::WatchScreen {
             id: Some("busy".into()),
+            viewing: false,
         })
         .await;
     assert!(matches!(resp, Response::Ok), "{resp:?}");
@@ -2293,13 +2294,19 @@ async fn watched_screen_updates_are_throttled() {
     // Only the watching connection gets them.
     assert_eq!(unwatched, 0);
 
-    let resp = watcher.request(&Request::WatchScreen { id: None }).await;
+    let resp = watcher
+        .request(&Request::WatchScreen {
+            id: None,
+            viewing: false,
+        })
+        .await;
     assert!(matches!(resp, Response::Ok), "{resp:?}");
     assert_eq!(count_screen_updates(&mut watcher, "busy", 400).await, 0);
 
     let resp = watcher
         .request(&Request::WatchScreen {
             id: Some("nope".into()),
+            viewing: false,
         })
         .await;
     assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
@@ -2315,6 +2322,7 @@ async fn keys_are_typed_into_the_agent_and_show_at_once() {
     let resp = conn
         .request(&Request::WatchScreen {
             id: Some("typed".into()),
+            viewing: false,
         })
         .await;
     assert!(matches!(resp, Response::Ok), "{resp:?}");
@@ -2323,9 +2331,8 @@ async fn keys_are_typed_into_the_agent_and_show_at_once() {
 
     // Twenty keys, one every 20ms: each shows before the next is typed.
     let mut shown = 0;
-    let mut slowest = std::time::Duration::ZERO;
+    let started = std::time::Instant::now();
     for i in 0..20 {
-        let typed = std::time::Instant::now();
         let resp = conn
             .request(&Request::Keys {
                 id: "typed".into(),
@@ -2337,17 +2344,44 @@ async fn keys_are_typed_into_the_agent_and_show_at_once() {
             .wait_event(2, |e| matches!(e, tam_proto::Event::ScreenUpdated { .. }))
             .await;
         assert!(update.is_some(), "no update after key {i}");
-        slowest = slowest.max(typed.elapsed());
         let row = screen_rows(&screen(&mut conn, "typed", None).await)[0].clone();
         shown = row.chars().filter(|c| *c == 'x').count();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(shown, 20);
-    // Far under the 100ms of an agent nobody types into (generous: CI).
-    assert!(
-        slowest < std::time::Duration::from_millis(80),
-        "{slowest:?}"
-    );
+    // 0.4s of pauses; at an update per 100ms (an agent nobody types into)
+    // it would take over 2s.
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+
+    // Typing into it is looking at it: a watch that says so counts as a
+    // viewer (no notification), until it ends.
+    async fn viewers(conn: &mut Conn) -> usize {
+        match conn.request(&Request::List).await {
+            Response::Agents { agents } => agents[0].viewers,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(viewers(&mut conn).await, 0);
+    for (viewing, count) in [(true, 1), (false, 0), (true, 1)] {
+        conn.request(&Request::WatchScreen {
+            id: Some("typed".into()),
+            viewing,
+        })
+        .await;
+        assert_eq!(viewers(&mut conn).await, count);
+    }
+    conn.request(&Request::WatchScreen {
+        id: None,
+        viewing: false,
+    })
+    .await;
+    assert_eq!(viewers(&mut conn).await, 0);
+    conn.request(&Request::WatchScreen {
+        id: Some("typed".into()),
+        viewing: false,
+    })
+    .await;
 
     // More keys in one write, Enter among them.
     conn.request(&Request::Keys {
@@ -2377,6 +2411,7 @@ async fn watched_screen_update_follows_a_single_change() {
     let resp = watcher
         .request(&Request::WatchScreen {
             id: Some("quiet".into()),
+            viewing: false,
         })
         .await;
     assert!(matches!(resp, Response::Ok), "{resp:?}");

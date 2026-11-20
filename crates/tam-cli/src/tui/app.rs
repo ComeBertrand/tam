@@ -257,6 +257,10 @@ pub struct Hits {
     pub picker: Option<(Rect, usize)>,
 }
 
+/// How long without a key before the dashboard takes keys again after the
+/// pane lost the keyboard (see `App::stop_typing`).
+const TYPING_PAUSE: std::time::Duration = std::time::Duration::from_millis(700);
+
 pub struct App {
     pub tasks: Vec<Task>,
     pub selected: usize,
@@ -267,6 +271,10 @@ pub struct App {
     /// The running agents' spinner: its frame, `None` for a still mark
     /// (tests).
     pub spin: Option<usize>,
+    /// The pane lost the keyboard while one was typing (its agent exited,
+    /// say): keys are dropped until typing pauses, so that what was meant
+    /// for the agent does not run as the dashboard's own keys.
+    pub dropping_keys_until: Option<std::time::Instant>,
     pub filter: TextInput,
     pub filter_active: bool,
     pub commands: Vec<CustomCommand>,
@@ -299,6 +307,7 @@ impl App {
             mode: Mode::Normal,
             peek: Peek::default(),
             spin: None,
+            dropping_keys_until: None,
             filter: TextInput::default(),
             filter_active: false,
             commands: Vec::new(),
@@ -539,13 +548,17 @@ impl App {
 
     /// Update the agent info of the member it runs for.
     pub fn update_agent(&mut self, info: AgentInfo) {
+        let selected = self.selected_task().map(|t| t.name.clone());
         if let Some(member) = self.member_mut(&info.id) {
             member.agent_info = Some(info);
             self.sort_tasks();
+            // The selection stays on its task, wherever the order puts it.
+            self.reselect(selected);
         }
     }
 
     pub fn update_state(&mut self, id: &str, new_state: tam_proto::AgentState) {
+        let selected = self.selected_task().map(|t| t.name.clone());
         if let Some(member) = self.member_mut(id) {
             if let Some(ref mut info) = member.agent_info {
                 // Already taken from the daemon's info (with its time)
@@ -556,6 +569,7 @@ impl App {
                 }
             }
             self.sort_tasks();
+            self.reselect(selected);
         }
         // A turn ended or began: its changes are worth a new look.
         self.branch_changed(id);
@@ -571,9 +585,11 @@ impl App {
 
     /// Remove agent info from a member (agent exited, member becomes idle).
     pub fn remove_agent(&mut self, id: &str) {
+        let selected = self.selected_task().map(|t| t.name.clone());
         if let Some(member) = self.member_mut(id) {
             member.agent_info = None;
             self.sort_tasks();
+            self.reselect(selected);
         }
         self.clamp_selection();
         self.branch_changed(id);
@@ -603,6 +619,36 @@ impl App {
     /// The preview pane shows another agent than the one it should.
     pub fn peek_stale(&self) -> bool {
         self.peek.agent != self.peek_agent()
+    }
+
+    /// The pane gives the keyboard back without having been asked to
+    /// (`why`): said in the status line, and the keys still coming are
+    /// dropped (see `dropping_keys_until`).
+    pub fn stop_typing(&mut self, why: &str) {
+        if matches!(self.mode, Mode::Terminal { .. }) {
+            self.mode = Mode::Normal;
+            self.dropping_keys_until = Some(std::time::Instant::now() + TYPING_PAUSE);
+            self.set_status(
+                format!("Back to the list: {why}"),
+                std::time::Duration::from_secs(4),
+            );
+        }
+    }
+
+    /// Whether a key typed now is to be dropped (see `stop_typing`); each
+    /// one pushes the pause back.
+    pub fn drops_key(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        match self.dropping_keys_until {
+            Some(until) if now < until => {
+                self.dropping_keys_until = Some(now + TYPING_PAUSE);
+                true
+            }
+            _ => {
+                self.dropping_keys_until = None;
+                false
+            }
+        }
     }
 
     /// An agent is working: its spinner turns.

@@ -122,6 +122,7 @@ pub async fn run() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     mouse_capture(true);
+    bracketed_paste(true);
 
     theme::set(config.theme.as_deref(), config.animate);
     let mut app = App::new();
@@ -139,8 +140,9 @@ pub async fn run() -> Result<()> {
 }
 
 /// Have the terminal send pastes between markers (crossterm then reports
-/// them as one event), or stop: only while the pane has the keyboard, so
-/// that a pasted text with several lines is not typed line by line.
+/// them as one event), or stop. On while the dashboard has the terminal: a
+/// paste is typed into the agent as one paste, goes into a prompt as text,
+/// and is never read as the dashboard's keys.
 fn bracketed_paste(on: bool) {
     use std::io::Write;
     let seq = if on { "\x1b[?2004h" } else { "\x1b[?2004l" };
@@ -261,21 +263,20 @@ async fn run_loop(
     // The agent's screen changed, or the pane scrolled: fetch it again.
     let mut screen_moved = true;
 
-    // The terminal reports pastes as such while the pane has the keyboard.
-    let mut pastes = false;
-
     loop {
         app.sync_focus();
         // The pane keeps the keyboard only for the agent it took it for.
         if let Mode::Terminal { agent } = &app.mode {
-            if app.peek_agent().as_deref() != Some(agent) {
-                app.mode = Mode::Normal;
+            match app.peek_agent() {
+                Some(shown) if shown == *agent => {}
+                Some(_) => app.stop_typing("the pane shows another agent"),
+                None => app.stop_typing("the agent exited"),
             }
         }
-        let typing = matches!(app.mode, Mode::Terminal { .. });
-        if typing != pastes {
-            pastes = typing;
-            bracketed_paste(typing);
+        // Typing into it is looking at it: the daemon is told with the
+        // watch (see `refresh_peek`).
+        if app.peek.viewing != matches!(app.mode, Mode::Terminal { .. }) {
+            screen_moved = true;
         }
         // Whatever moved the selection (a key, a re-sort, an agent starting
         // or exiting), the preview follows.
@@ -354,9 +355,16 @@ async fn run_loop(
                         .is_some_and(|s| s.bracketed_paste());
                     Action::Keys(keys::paste(&text, bracketed))
                 }
+                Event::Paste(text) => {
+                    paste_into_prompt(&text, app, config);
+                    Action::None
+                }
                 Event::Mouse(mouse) => handle_mouse(mouse, app),
                 _ => Action::None,
             };
+            // The pane just took the keyboard: what follows in this batch
+            // was typed before any frame said so, and is dropped.
+            let focused = typing.is_none() && matches!(app.mode, Mode::Terminal { .. });
             match action {
                 Action::Quit => return Ok(()),
                 Action::SelectNext => app.select_next(),
@@ -364,6 +372,7 @@ async fn run_loop(
                 Action::Attach { id, label } => {
                     // Before the reader stops: no report may reach the agent.
                     mouse_capture(false);
+                    bracketed_paste(false);
                     // The dashboard reads nothing while attached.
                     unwatch_screen(client, app).await;
                     input.pause().await;
@@ -374,6 +383,7 @@ async fn run_loop(
                         .unwrap_or_default();
                     let attached = attach_agent(terminal, app, &id, &label, &provider).await;
                     mouse_capture(true);
+                    bracketed_paste(true);
                     input.resume();
                     attached?;
                     // Attached, the agent took the terminal's size.
@@ -456,6 +466,9 @@ async fn run_loop(
                 }
                 Action::None => {}
             }
+            if focused {
+                break;
+            }
         }
         if let Some((agent, bytes)) = typed {
             type_keys(client, app, agent, &bytes).await;
@@ -473,10 +486,7 @@ async fn type_keys(client: &mut Client, app: &mut App, id: String, bytes: &[u8])
         Err(e) => Some(format!("{e:#}")),
     };
     if let Some(why) = failed {
-        if matches!(app.mode, Mode::Terminal { .. }) {
-            app.mode = Mode::Normal;
-        }
-        app.set_status(format!("Not typed: {why}"), Duration::from_secs(4));
+        app.stop_typing(&format!("not typed ({why})"));
     }
 }
 
@@ -485,6 +495,10 @@ async fn type_keys(client: &mut Client, app: &mut App, id: String, bytes: &[u8])
 // ---------------------------------------------------------------------------
 
 fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
+    // Typed for an agent the pane no longer has the keyboard for.
+    if !matches!(app.mode, Mode::Terminal { .. }) && app.drops_key() {
+        return Action::None;
+    }
     if app.filter_active {
         return handle_filter_key(key, app);
     }
@@ -502,6 +516,25 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::NewTaskPickProject(_) => handle_picker_key(key, app, config),
         Mode::Answer(_) => handle_answer_key(key, app),
         Mode::Terminal { .. } => handle_terminal_key(key, app),
+    }
+}
+
+/// A paste outside the pane: text for the prompt being typed in (the
+/// filter, the project picker, a task name, a path), its line ends and
+/// other control characters left out. Anywhere else it is dropped: read as
+/// keys, it would run the dashboard's commands.
+fn paste_into_prompt(text: &str, app: &mut App, config: &Config) {
+    let prompt = app.filter_active
+        || matches!(
+            app.mode,
+            Mode::NewTaskPickProject(_) | Mode::NewTaskEnterName { .. } | Mode::SpawnEnterPath(_)
+        );
+    if !prompt {
+        return;
+    }
+    for c in text.chars().filter(|c| !c.is_control()) {
+        let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        handle_key_event(key, app, config);
     }
 }
 
@@ -758,8 +791,13 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
         // A click in the list gives it the keyboard back; the wheel scrolls
         // as in the list.
         Mode::Terminal { .. } => {
-            if click && app.hits.list.contains(at) {
+            let in_list = app.hits.list.contains(at);
+            if click && in_list {
                 app.mode = Mode::Normal;
+            } else if in_list {
+                // The wheel there would move the selection, and the
+                // keyboard with it.
+                return Action::None;
             }
         }
         Mode::Help if click => {
@@ -1091,21 +1129,24 @@ fn repository(dir: &std::path::Path) -> Result<PathBuf, String> {
 /// lines scrolled back to), and have the daemon tell when it changes.
 async fn refresh_peek(client: &mut Client, app: &mut App) {
     let wanted = app.peek_agent();
+    let viewing = matches!(app.mode, Mode::Terminal { .. });
     let peek = &mut app.peek;
     if peek.agent != wanted {
         // Another agent: from its live screen.
         *peek = Peek {
             agent: wanted.clone(),
             watching: peek.watching.take(),
+            viewing: peek.viewing,
             height: peek.height,
             room: peek.room,
             ..Peek::default()
         };
     }
-    if peek.watching != wanted {
+    if peek.watching != wanted || peek.viewing != viewing {
         // An error is an agent already gone: its exit event follows.
-        let _ = client.watch_screen(wanted.as_deref()).await;
+        let _ = client.watch_screen(wanted.as_deref(), viewing).await;
         peek.watching = wanted.clone();
+        peek.viewing = viewing;
     }
     let Some(id) = wanted else {
         return;
@@ -1166,7 +1207,8 @@ async fn refresh_detail(client: &mut Client, app: &mut App) {
 /// stops reading for a while).
 async fn unwatch_screen(client: &mut Client, app: &mut App) {
     if app.peek.watching.take().is_some() {
-        let _ = client.watch_screen(None).await;
+        let _ = client.watch_screen(None, false).await;
+        app.peek.viewing = false;
     }
 }
 
@@ -1892,6 +1934,93 @@ mod tests {
             Action::Attach { id, .. } => Some(id),
             _ => None,
         }
+    }
+
+    #[test]
+    fn keys_for_the_agent_never_run_as_the_dashboard_s() {
+        use tam_proto::AgentState::{Blocked, Ready, Working};
+        let config = Config::default();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let mut app = two_member_app(&[("m-1", Working), ("m-3", Working)]);
+        // Most urgent first: both tasks in one list, ordered by status.
+        app.toggle_order();
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        handle_key_event(enter, &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "m-1"));
+
+        // The other task comes to need the user, then this one ends its
+        // turn: the list is ordered again each time, the selection stays on
+        // its task and the pane on its agent.
+        app.update_state("m-3", Blocked);
+        app.update_state("m-1", Ready);
+        app.sync_focus();
+        assert_eq!(app.selected_task().unwrap().name, "feat");
+        assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
+
+        // The wheel over the list would move the selection: not while typing.
+        app.hits.list = ratatui::layout::Rect::new(0, 1, 40, 10);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(handle_mouse(wheel, &mut app), Action::None));
+        assert!(matches!(app.mode, Mode::Terminal { .. }));
+
+        // Its agent exits mid-word: the keys still coming are dropped, not
+        // run (`d` then `y` would drop the task).
+        app.remove_agent("m-1");
+        app.stop_typing("the agent exited");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status_message().unwrap().contains("the agent exited"));
+        for c in ['d', 'y', 'q'] {
+            assert!(matches!(
+                handle_key_event(key(c), &mut app, &config),
+                Action::None
+            ));
+            assert!(matches!(app.mode, Mode::Normal), "{c}");
+        }
+        // Once typing paused, keys are the dashboard's again.
+        app.dropping_keys_until = Some(std::time::Instant::now());
+        assert!(matches!(
+            handle_key_event(key('q'), &mut app, &config),
+            Action::Quit
+        ));
+
+        // The user's own ctrl-] drops nothing.
+        app.update_agent(
+            serde_json::from_value(serde_json::json!({
+                "id": "m-1", "provider": "claude", "dir": "/w", "state": "working",
+                "pid": 1, "uptime_secs": 1,
+            }))
+            .unwrap(),
+        );
+        app.sync_focus();
+        handle_key_event(enter, &mut app, &config);
+        assert!(matches!(app.mode, Mode::Terminal { .. }));
+        let leave = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL);
+        handle_key_event(leave, &mut app, &config);
+        assert!(matches!(
+            handle_key_event(key('q'), &mut app, &config),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn a_paste_goes_into_a_prompt_or_nowhere() {
+        let config = Config::default();
+        let mut app = two_member_app(&[]);
+        // On the list: dropped (as keys, `d` would open the drop dialog).
+        paste_into_prompt("d\ny", &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+        // In the filter: its text, on one line.
+        app.filter_active = true;
+        paste_into_prompt("fe\nat", &mut app, &config);
+        assert_eq!(app.filter.value(), "feat");
+        assert!(app.filter_active);
     }
 
     #[test]

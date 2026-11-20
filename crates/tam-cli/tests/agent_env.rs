@@ -137,6 +137,20 @@ async fn report(file: &Path) -> std::collections::BTreeMap<String, String> {
     panic!("the agent did not start");
 }
 
+/// Write tam's config where it reads it: `$XDG_CONFIG_HOME`, or on macOS
+/// `~/Library/Application Support`.
+fn write_config(root: &Path, text: &str) {
+    let macos = root
+        .join("home")
+        .join("Library")
+        .join("Application Support");
+    for dir in [root.join("config"), macos] {
+        let dir = dir.join("tam");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), text).unwrap();
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(["-c", "user.email=t@t", "-c", "user.name=t"])
@@ -168,14 +182,11 @@ async fn agents_run_in_the_environment_of_the_command_that_starts_them() {
     let report_file = root.join("agent-env");
     fake_claude(&bin, &report_file);
 
-    let config = root.join("config").join("tam");
-    std::fs::create_dir_all(&config).unwrap();
     let worktrees = root.join("wt");
-    std::fs::write(
-        config.join("config.toml"),
-        format!("[worktree]\nroot = \"{}\"\n", worktrees.display()),
-    )
-    .unwrap();
+    write_config(
+        root,
+        &format!("[worktree]\nroot = \"{}\"\n", worktrees.display()),
+    );
     let repo = root.join("app");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
@@ -226,14 +237,13 @@ async fn agents_run_in_the_environment_of_the_command_that_starts_them() {
     )
     .unwrap();
     std::fs::set_permissions(&wrap, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    std::fs::write(
-        config.join("config.toml"),
-        format!(
+    write_config(
+        root,
+        &format!(
             "[spawn]\nwrapper = [\"wrap\"]\n\n[worktree]\nroot = \"{}\"\n",
             worktrees.display()
         ),
-    )
-    .unwrap();
+    );
     ok(&output(tam(root, &repo, &["stop", "feat"])).await);
     let mut run = tam(root, &repo, &["run", "feat", "--detach"]);
     run.env("CALLER", "wrapped run");

@@ -13,7 +13,7 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.installShellFiles ];
-          nativeCheckInputs = [ pkgs.git ];
+          nativeCheckInputs = [ pkgs.git pkgs.procps ];
           postInstall = ''
             installShellCompletion --bash target/*/build/tam-cli-*/out/completions/tam.bash
             installShellCompletion --zsh --name _tam target/*/build/tam-cli-*/out/completions/_tam

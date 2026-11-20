@@ -53,6 +53,15 @@ adopt). `tam-cli` depends on all three.
   Clients use task requests (CreateTask, ListTasks, GetTask, ResolveMember,
   DropTask) and get TaskCreated/TaskUpdated/TaskDropped events after
   `Subscribe`; `tam-cli` never touches the ledger file.
+- **Git acts where tam points it** — every git tam runs is
+  `tam_worktree::git::command()` (the daemon's through `tam-worktree`,
+  `tui/branch.rs` too), and every git the tests run. It removes
+  `git::LOCAL_ENV_VARS` (`git rev-parse --local-env-vars`: `GIT_DIR`,
+  `GIT_INDEX_FILE`, `GIT_WORK_TREE`, …): git exports some of them to `git
+  rebase --exec` and to hooks run from a linked worktree (every tam
+  worktree), and tam always gives git the directory to act on. `repos::git_env`
+  (the caller's environment, for `git::with_env`, and agents' through
+  `repos::agent_env`) leaves them out too.
 - **Drop is the daemon's** — `DropTask { force, delete_branch }` (`handle_drop_task`;
   git side in `tam-daemon/src/worktrees.rs`, per worktree, over
   `tam_worktree::worktree::{check, remove, delete_branch}`). Without `force` it
@@ -340,8 +349,8 @@ adopt). `tam-cli` depends on all three.
   branch only if this request created it and no other ref holds its commits.
   The error names what is left behind. The daemon's environment is the shell
   that started it, maybe long ago: git runs in the client's instead
-  (`CreateMembers.env` from `repos::git_env`, without repo-local `GIT_*`
-  variables; `git::with_env` scopes it to the thread running that git, so
+  (`CreateMembers.env` from `repos::git_env`, without `git::LOCAL_ENV_VARS`;
+  `git::with_env` scopes it to the thread running that git, so
   hooks and filters such as git-lfs see the caller's `PATH`; `RepairMember`
   too). Never recorded or logged. The daemon never fetches: the client does first. `tam new NAME [-r REPO]...
   [--join]` resolves each REPO in `tam-cli/src/repos.rs`: an existing path
@@ -537,7 +546,15 @@ cargo test
   before and after a restart, and runs one through a wrapper; the CLI's has
   `tam new` and `tam run` from shells other than the daemon's (a fake
   `claude` only on theirs), then a wrapper configured meanwhile.
-- Tests that shell out to git need a real git repo (use tempdir fixtures)
+- Tests that shell out to git need a real git repo (use tempdir fixtures).
+  They build git with `tam_worktree::git::command()`, never
+  `Command::new("git")`, and their `tam()` helpers start `tam` without the
+  same variables (`git::without_local_env`): run from `git rebase --exec` or a hook in a
+  linked worktree, they would otherwise act on this repository (#57).
+  `crates/tam-cli/tests/git_dir.rs` sets `GIT_DIR`/`GIT_INDEX_FILE` to a
+  sentinel repository for its process, runs the tests' git, the real `tam`
+  and the daemon (`new`, `ps`, `drop -b`), and checks the sentinel's files are
+  unchanged.
 
 ## Commits
 

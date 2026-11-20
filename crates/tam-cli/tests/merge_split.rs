@@ -25,6 +25,7 @@ fn tam(root: &Path) -> Command {
         .env_remove("TAM_AGENT_ID")
         .env_remove("TAM_SOCKET")
         .stdin(Stdio::null());
+    tam_worktree::git::without_local_env(&mut cmd);
     cmd
 }
 

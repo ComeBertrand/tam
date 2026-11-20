@@ -755,7 +755,7 @@ mod tests {
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            tam_worktree::git::command()
                 .args(args)
                 .current_dir(path)
                 .output()

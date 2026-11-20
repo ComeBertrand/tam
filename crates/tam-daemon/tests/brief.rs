@@ -7,7 +7,6 @@
 //! not race other tests in this binary.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -51,7 +50,7 @@ fn set(task: &str, brief: Option<&str>) -> Request {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = tam_worktree::git::command()
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .current_dir(dir)

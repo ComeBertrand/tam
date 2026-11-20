@@ -29,6 +29,7 @@ fn tam(root: &Path, cwd: &Path, args: &[&str]) -> Command {
         .env_remove("TAM_AGENT_ID")
         .env_remove("TAM_SOCKET")
         .stdin(Stdio::null());
+    tam_worktree::git::without_local_env(&mut cmd);
     cmd
 }
 
@@ -50,7 +51,7 @@ async fn ok(root: &Path, cwd: &Path, args: &[&str]) -> String {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = tam_worktree::git::command()
         .args(["-c", "user.email=t@t", "-c", "user.name=t"])
         .args(args)
         .current_dir(dir)

@@ -25,6 +25,7 @@ fn tam(root: &Path) -> Command {
         .env_remove("TAM_AGENT_ID")
         .env_remove("TAM_SOCKET")
         .stdin(Stdio::null());
+    tam_worktree::git::without_local_env(&mut cmd);
     cmd
 }
 
@@ -114,7 +115,7 @@ async fn printing_to_a_closed_pipe_exits_quietly() {
     // Something for `tam ls` to find.
     let repo = root.join("projects").join("app");
     std::fs::create_dir_all(&repo).unwrap();
-    let git = Command::new("git")
+    let git = tam_worktree::git::command()
         .args(["init", "-q"])
         .current_dir(&repo)
         .status()

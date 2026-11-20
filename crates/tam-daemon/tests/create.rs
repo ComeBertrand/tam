@@ -122,7 +122,7 @@ fn error_message(resp: Response) -> String {
 
 /// Run git in `dir`, asserting success.
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = tam_worktree::git::command()
         .args(args)
         .current_dir(dir)
         .output()
@@ -157,7 +157,7 @@ fn hook(repo: &Path, script: &str) {
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
-    std::process::Command::new("git")
+    tam_worktree::git::command()
         .args([
             "show-ref",
             "--verify",

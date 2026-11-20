@@ -76,6 +76,7 @@ fn tam(root: &Path, dir: &Path, args: &[&str]) -> Command {
         .env("CLAUDE_CONFIG_DIR", root.join("claude"))
         .env("TMUX", "/tmp/tmux-1000/default,1,0")
         .stdin(Stdio::null());
+    tam_worktree::git::without_local_env(&mut cmd);
     cmd
 }
 
@@ -152,7 +153,7 @@ fn write_config(root: &Path, text: &str) {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = tam_worktree::git::command()
         .args(["-c", "user.email=t@t", "-c", "user.name=t"])
         .args(args)
         .current_dir(dir)

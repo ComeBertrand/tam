@@ -406,11 +406,10 @@ fn admin_dir(repo: &Path, path: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::TempDir;
 
     fn git_cmd(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = crate::git::command()
             .args(args)
             .current_dir(dir)
             .output()

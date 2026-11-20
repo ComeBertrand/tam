@@ -14,8 +14,6 @@ pub struct ConfigFile {
 
 #[derive(Debug, Deserialize)]
 pub struct SpawnConfig {
-    #[serde(alias = "agent")]
-    pub default_agent: Option<String>,
     pub wrapper: Option<Vec<String>>,
 }
 
@@ -50,7 +48,6 @@ impl CustomCommand {
 /// Resolved config with defaults applied.
 #[derive(Debug)]
 pub struct Config {
-    pub default_agent: String,
     pub finder: Option<String>,
     pub commands: Vec<CustomCommand>,
     pub theme: Option<String>,
@@ -64,7 +61,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            default_agent: "claude".into(),
             finder: None,
             commands: Vec::new(),
             theme: None,
@@ -76,13 +72,6 @@ impl Default for Config {
 
 pub fn parse_config(toml_str: &str) -> Result<Config> {
     let file: ConfigFile = toml::from_str(toml_str)?;
-    let defaults = Config::default();
-
-    let default_agent = file
-        .spawn
-        .as_ref()
-        .and_then(|s| s.default_agent.clone())
-        .unwrap_or(defaults.default_agent);
 
     let finder = file.session.as_ref().and_then(|s| s.finder.clone());
 
@@ -114,7 +103,6 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     }
 
     Ok(Config {
-        default_agent,
         finder,
         commands,
         theme,
@@ -219,20 +207,6 @@ fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex"];
-
-pub fn validate_provider(name: &str) -> anyhow::Result<()> {
-    if KNOWN_PROVIDERS.contains(&name) {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "unknown agent '{}'. Known agents: {}",
-            name,
-            KNOWN_PROVIDERS.join(", ")
-        );
-    }
 }
 
 /// Remove the hooks older versions of `tam init` wrote into the agent's
@@ -340,30 +314,30 @@ mod tests {
     #[test]
     fn defaults() {
         let config = Config::default();
-        assert_eq!(config.default_agent, "claude");
+        assert!(config.wrapper.is_empty() && config.animate);
     }
 
     #[test]
     fn retired_daemon_scrollback_setting_is_ignored() {
         // Its byte buffer is gone: the daemon keeps the agent's terminal.
         let config = parse_config("[daemon]\nscrollback = 1048576\n").unwrap();
-        assert_eq!(config.default_agent, "claude");
+        assert!(config.commands.is_empty());
     }
 
     #[test]
     fn parse_empty_toml() {
         let config = parse_config("").unwrap();
-        assert_eq!(config.default_agent, "claude");
+        assert!(config.commands.is_empty() && config.wrapper.is_empty());
     }
 
     #[test]
-    fn parse_spawn_section() {
+    fn the_retired_default_agent_setting_is_ignored() {
+        // Agents are Claude: configs written for other agents still load.
         let toml = r#"
 [spawn]
 default_agent = "codex"
 "#;
         let config = parse_config(toml).unwrap();
-        assert_eq!(config.default_agent, "codex");
         assert!(config.wrapper.is_empty());
     }
 
@@ -397,17 +371,6 @@ finder = "fzf"
             let err = parse_config(&toml).unwrap_err().to_string();
             assert!(err.contains("reserved"), "{key}: {err}");
         }
-    }
-
-    #[test]
-    fn validate_known_provider() {
-        assert!(validate_provider("claude").is_ok());
-    }
-
-    #[test]
-    fn validate_unknown_provider() {
-        let err = validate_provider("bash").unwrap_err();
-        assert!(err.to_string().contains("unknown agent 'bash'"));
     }
 
     #[test]

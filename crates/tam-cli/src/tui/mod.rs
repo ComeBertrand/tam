@@ -443,10 +443,10 @@ async fn run_loop(
                     }
                 }
                 Action::RunAgent { member } => {
-                    do_run(client, app, config, &member, SessionChoice::Current).await?;
+                    do_run(client, app, &member, SessionChoice::Current).await?;
                 }
                 Action::DoNewTask { name, dirs } => {
-                    do_new_task(client, app, &name, &dirs, config).await?;
+                    do_new_task(client, app, &name, &dirs).await?;
                 }
                 Action::CustomCommand {
                     name,
@@ -459,7 +459,7 @@ async fn run_loop(
                     Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
                 },
                 Action::RunNewSession { member } => {
-                    do_run(client, app, config, &member, SessionChoice::New).await?;
+                    do_run(client, app, &member, SessionChoice::New).await?;
                 }
                 Action::RepairTask { name } => {
                     repair_task(client, app, &name).await;
@@ -1259,7 +1259,6 @@ async fn do_new_task(
     app: &mut App,
     name: &str,
     dirs: &[PathBuf],
-    config: &Config,
 ) -> Result<()> {
     let join = app.tasks.iter().any(|t| t.name == name);
     // The picker gave main checkouts, each once.
@@ -1292,14 +1291,7 @@ async fn do_new_task(
     let mut failed = Vec::new();
     for member in new {
         let started = client
-            .run_agent(
-                &member.id,
-                None,
-                &config.default_agent,
-                SessionChoice::New,
-                None,
-                vec![],
-            )
+            .run_agent(&member.id, SessionChoice::New, None, vec![])
             .await;
         if let Err(e) = started {
             failed.push(format!("{}: {e:#}", task.member_label(member)));
@@ -1324,12 +1316,11 @@ async fn do_new_task(
     Ok(())
 }
 
-/// Start a member's agent (its last agent, else the default one) in the
-/// chosen session; the daemon resolves the member's current session.
+/// Start a member's agent in the chosen session; the daemon resolves the
+/// member's current session.
 async fn do_run(
     client: &mut Client,
     app: &mut App,
-    config: &Config,
     member: &str,
     session: SessionChoice,
 ) -> Result<()> {
@@ -1337,9 +1328,7 @@ async fn do_run(
         .find_member(member)
         .map(|(t, m)| t.member_label(m))
         .unwrap_or_else(|| member.to_string());
-    let started = client
-        .run_agent(member, None, &config.default_agent, session, None, vec![])
-        .await;
+    let started = client.run_agent(member, session, None, vec![]).await;
     match started {
         Ok((_, Some(_))) => {
             app.set_status(format!("Resumed '{label}'"), Duration::from_secs(3));

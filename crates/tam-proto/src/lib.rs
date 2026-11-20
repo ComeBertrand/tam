@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Protocol version. Increment on any breaking wire format change.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// What an agent is doing right now.
 /// Agents that exit (successfully or with error) are cleaned up immediately —
@@ -527,12 +527,10 @@ pub enum Request {
     /// default. Replies `Running`; refused while the member has an agent.
     RunAgent {
         member: String,
-        /// Agent to run (e.g. `claude`). Unset: the agent of the member's
-        /// last run, else `default_provider`.
+        /// Unset: Claude. A program to run in its place: for tam's tests,
+        /// no client sets it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
-        /// Agent of a member that never ran one (the client's default).
-        default_provider: String,
         #[serde(default)]
         session: SessionChoice,
         #[serde(default)]
@@ -1856,12 +1854,11 @@ mod tests {
     #[test]
     fn request_run_agent_serde() {
         // Defaults: the current session, no args, no prompt.
-        let json = r#"{"type":"run_agent","member":"m-1","default_provider":"claude"}"#;
+        let json = r#"{"type":"run_agent","member":"m-1"}"#;
         match serde_json::from_str::<Request>(json).unwrap() {
             Request::RunAgent {
                 member,
                 provider,
-                default_provider,
                 session,
                 args,
                 prompt,
@@ -1870,7 +1867,6 @@ mod tests {
             } => {
                 assert_eq!(member, "m-1");
                 assert_eq!(provider, None);
-                assert_eq!(default_provider, "claude");
                 assert_eq!(session, SessionChoice::Current);
                 assert!(args.is_empty());
                 assert_eq!(prompt, None);
@@ -1887,8 +1883,7 @@ mod tests {
         ] {
             let req = Request::RunAgent {
                 member: "m-1".into(),
-                provider: Some("codex".into()),
-                default_provider: "claude".into(),
+                provider: Some("sh".into()),
                 session: session.clone(),
                 args: vec![],
                 prompt: None,
@@ -1905,7 +1900,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(back, session);
-                    assert_eq!(provider.as_deref(), Some("codex"));
+                    assert_eq!(provider.as_deref(), Some("sh"));
                 }
                 other => panic!("wrong variant: {other:?}"),
             }
@@ -1921,7 +1916,6 @@ mod tests {
         let req = Request::RunAgent {
             member: "m-1".into(),
             provider: None,
-            default_provider: "claude".into(),
             session: SessionChoice::New,
             args: vec![],
             prompt: None,

@@ -88,7 +88,6 @@ impl Harness {
             member: self.member.clone(),
             provider: provider.map(str::to_string),
             // A member that ran an agent runs it again: never this one.
-            default_provider: "codex".into(),
             session,
             args: vec![],
             prompt: None,
@@ -164,7 +163,7 @@ async fn run_resumes_the_members_current_session() {
     std::env::set_var("PATH", path);
     let args_file = root.join("agent-args");
     fake_agent(&bin, "claude", &args_file);
-    fake_agent(&bin, "codex", &args_file);
+    fake_agent(&bin, "old-agent", &args_file);
     let project = home.join(".claude").join("projects").join("-work");
     std::fs::create_dir_all(&project).unwrap();
 
@@ -275,27 +274,20 @@ async fn run_resumes_the_members_current_session() {
     assert_eq!(resume_arg(&args), Some("s0"));
     h.stop().await;
 
-    // Codex reports no sessions: a new one unless given one.
-    let (resumed, args) = h.run(Some("codex"), SessionChoice::Current).await.unwrap();
-    assert_eq!(args, ["codex", "-C", &work.display().to_string()]);
-    assert_eq!(resumed, None);
-    h.stop().await;
+    // A run of another program (ledgers from when tam ran other agents
+    // have some) has no session, and takes nothing from Claude: the next
+    // agent is Claude, in the session it was last started in.
     let (resumed, args) = h
-        .run(Some("codex"), SessionChoice::Id("x1".into()))
+        .run(Some("old-agent"), SessionChoice::Current)
         .await
         .unwrap();
-    assert_eq!(resumed.as_deref(), Some("x1"));
-    assert_eq!(args[..3], ["codex", "resume", "x1"]);
+    assert_eq!(args[0], "old-agent");
+    assert_eq!(resumed, None);
     h.stop().await;
-    let (resumed, _) = h.run(None, SessionChoice::Current).await.unwrap();
-    assert_eq!(resumed, None, "codex resumes only on request");
-    h.stop().await;
-
-    // Claude's current session is still there for it: the one it was last
-    // started in.
     h.transcript("s0");
-    let (resumed, _) = h.run(Some("claude"), SessionChoice::Current).await.unwrap();
+    let (resumed, args) = h.run(None, SessionChoice::Current).await.unwrap();
     assert_eq!(resumed.as_deref(), Some("s0"));
+    assert_eq!(resume_arg(&args), Some("s0"));
     h.stop().await;
 
     // An agent that cannot resume refuses a session.

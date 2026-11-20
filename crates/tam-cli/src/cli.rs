@@ -63,9 +63,7 @@ pub enum Commands {
 
     /// Start an agent in a task, resuming its current session
     ///
-    /// The current session is the last one the agent had a turn in (Claude
-    /// reports it through its hooks). Agents without hooks (codex) start a
-    /// new session unless given one with --session.
+    /// The current session is the last one the agent had a turn in.
     Run {
         /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
         name: Option<String>,
@@ -77,11 +75,6 @@ pub enum Commands {
         /// Resume this agent session instead of the current one
         #[arg(long, value_name = "ID")]
         session: Option<String>,
-
-        /// Agent tool to use (e.g. claude, codex; default: the task's last
-        /// agent, else the configured one)
-        #[arg(short, long)]
-        agent: Option<String>,
 
         /// Initial prompt text (same as --prompt)
         prompt: Option<String>,
@@ -197,8 +190,8 @@ pub enum Commands {
     /// Remove the agent hooks older versions of tam installed globally
     /// (hooks are now injected into each agent tam spawns)
     Init {
-        /// Agent to clean up (e.g. claude)
-        #[arg(long)]
+        /// Agent to clean up
+        #[arg(long, default_value = "claude")]
         agent: String,
     },
 
@@ -234,11 +227,10 @@ pub enum Commands {
 
     /// Send a message to the agent of a task member
     ///
-    /// A Claude agent gets it right away: when idle it wakes up, when busy it
-    /// reads it at its next step. Other agents get it typed in once idle. A
-    /// member with no running agent gets it when its next agent starts. Sent
-    /// from an agent tam started, it comes from that agent's member; else
-    /// from the user.
+    /// The agent gets it right away: when idle it wakes up, when busy it
+    /// reads it at its next step. A member with no running agent gets it
+    /// when its next agent starts. Sent from an agent tam started, it comes
+    /// from that agent's member; else from the user.
     Msg {
         /// Recipient: task name, TASK/MEMBER or member id; from an agent,
         /// also the short name of another member of its task (see tam peers)

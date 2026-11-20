@@ -20,7 +20,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#configuration">Configuration</a> ·
-  <a href="#agent-providers">Providers</a>
+  <a href="#the-agent">The agent</a>
 </p>
 
 > Manage units of work, not just processes.
@@ -127,7 +127,7 @@ The daemon checks every task's worktree against git (`git worktree list`) when i
 
 `tam adopt` takes over a worktree made by hand (`git worktree add`), from the worktree or any directory in it: it must be a linked worktree (not the main checkout) on a branch. From then on it is a task like any other: `tam drop` removes it.
 
-`tam merge` and `tam split` change which task a member belongs to, and nothing else: worktrees, branches, sessions, run history, messages and running agents stay as they are. Started as two tasks, a backend and a frontend become one with `tam merge backend frontend`: the members of `frontend` join `backend` after its own, and `frontend` is gone. A member keeps its short name (its repository) unless the task has one by that name already; it is then `<repo>-<branch>`. Names through a task merged away (`frontend`, `frontend/web`) no longer resolve; member ids still do. `tam split backend/web` is the inverse: the member goes to a new task named after its branch, or NAME when a task has that name already. The only member of a task cannot be split out of it. Neither runs while one of the tasks is being dropped. Running Claude agents of the members involved learn of it at their next prompt or tool call: what changed, then their task and peers as they are now (an idle agent is not woken for it). Other agents are not told; `tam peers` shows their peers. The merged task keeps its brief (see Brief), and a task split off starts with the local `brief.md`; the directories of the tasks merged away stay in `~/.local/share/tam/tasks/`.
+`tam merge` and `tam split` change which task a member belongs to, and nothing else: worktrees, branches, sessions, run history, messages and running agents stay as they are. Started as two tasks, a backend and a frontend become one with `tam merge backend frontend`: the members of `frontend` join `backend` after its own, and `frontend` is gone. A member keeps its short name (its repository) unless the task has one by that name already; it is then `<repo>-<branch>`. Names through a task merged away (`frontend`, `frontend/web`) no longer resolve; member ids still do. `tam split backend/web` is the inverse: the member goes to a new task named after its branch, or NAME when a task has that name already. The only member of a task cannot be split out of it. Neither runs while one of the tasks is being dropped. Running agents of the members involved learn of it at their next prompt or tool call: what changed, then their task and peers as they are now (an idle agent is not woken for it). Other agents are not told; `tam peers` shows their peers. The merged task keeps its brief (see Brief), and a task split off starts with the local `brief.md`; the directories of the tasks merged away stay in `~/.local/share/tam/tasks/`.
 
 ### Observing
 
@@ -154,9 +154,9 @@ tam peers                      The other members of your task, and what their ag
 tam peers --all                ...of every task (--json: machine-readable)
 ```
 
-A Claude agent gets a message right away: when idle it wakes up, when busy it reads it at its next step (after a pending permission prompt is answered). Other agents get it typed in once idle. A member with no running agent gets it when its next agent starts. Sent from inside an agent TAM started, a message comes from that agent, which the recipient can answer with `tam msg`; otherwise it comes from you. The reply `--wait` prints is the recipient's next message back, or its response at the end of the turn that got the message. Two agents answering each other are stopped after 6 messages, until you prompt one of them; an agent sends at most 20 messages per 10 minutes.
+An agent gets a message right away: when idle it wakes up, when busy it reads it at its next step (after a pending permission prompt is answered). A member with no running agent gets it when its next agent starts. Sent from inside an agent TAM started, a message comes from that agent, which the recipient can answer with `tam msg`; otherwise it comes from you. The reply `--wait` prints is the recipient's next message back, or its response at the end of the turn that got the message. Two agents answering each other are stopped after 6 messages, until you prompt one of them; an agent sends at most 20 messages per 10 minutes.
 
-An agent TAM starts knows its task. A Claude agent is told when its session starts (again on resume, `/clear` and compaction): its task, its name, the other members with their repositories and worktrees, and the task's brief and scratch directory (see Brief), so a backend and a frontend session can agree on an API without you relaying. After `tam merge` or `tam split` changed its task, it is told again at its next prompt or tool call. Other agents have their member id in `$TAM_AGENT_ID` and can run `tam peers`. From an agent, `tam msg`, `tam run`, `tam stop`, `tam attach` and `tam split` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
+An agent TAM starts knows its task. It is told when its session starts (again on resume, `/clear` and compaction): its task, its name, the other members with their repositories and worktrees, and the task's brief and scratch directory (see Brief), so a backend and a frontend session can agree on an API without you relaying. After `tam merge` or `tam split` changed its task, it is told again at its next prompt or tool call. It also has its member id in `$TAM_AGENT_ID`, and `tam peers` for what changed since. From an agent, `tam msg`, `tam run`, `tam stop`, `tam attach` and `tam split` take the short name of another member of its task (`tam msg frontend ...`), unless a task has that name; `tam peers` prints the name that works from where you run it (`TASK/MEMBER` from outside the task).
 
 ### Brief
 
@@ -166,9 +166,9 @@ tam brief NAME --set REF       Make REF the brief: a URL, a ticket id, a path
 tam brief NAME --local         Make the local file brief.md the brief again
 ```
 
-The members of a task work from one brief: the reference you give with `tam new --brief REF` or `tam brief --set REF` (a URL, a ticket id, a path; TAM neither fetches nor reads it), else the file `brief.md` in the task's directory (`~/.local/share/tam/tasks/NAME/`), which TAM starts with a heading per member. Next to it, `scratch/` is a directory the members share for transient notes. A Claude agent is told both when its session starts, and how to write in the brief: under its own heading, and what the members agree on (an API shape, a name) under `Shared`, so that two agents do not overwrite each other's part. A changed brief reaches running agents at their next session start (resume, `/clear`, compaction); `tam peers` shows the current one. A pattern in the configuration can turn a ticket id into its URL and into the agents' start prompt (see Configuration). Dropping the task removes its directory: a `brief.md` the members wrote in is kept in `~/.local/share/tam/tasks/.dropped/`, and `tam drop` says where.
+The members of a task work from one brief: the reference you give with `tam new --brief REF` or `tam brief --set REF` (a URL, a ticket id, a path; TAM neither fetches nor reads it), else the file `brief.md` in the task's directory (`~/.local/share/tam/tasks/NAME/`), which TAM starts with a heading per member. Next to it, `scratch/` is a directory the members share for transient notes. An agent is told both when its session starts, and how to write in the brief: under its own heading, and what the members agree on (an API shape, a name) under `Shared`, so that two agents do not overwrite each other's part. A changed brief reaches running agents at their next session start (resume, `/clear`, compaction); `tam peers` shows the current one. A pattern in the configuration can turn a ticket id into its URL and into the agents' start prompt (see Configuration). Dropping the task removes its directory: a `brief.md` the members wrote in is kept in `~/.local/share/tam/tasks/.dropped/`, and `tam drop` says where.
 
-A Claude agent can also read the other members' worktrees without asking, but not edit them: TAM adds them to the session's directories with a rule denying edits there, which covers Claude's file tools and the file commands it recognises in shell commands, not every program a command may run. A member that joined after the agent started is readable from the agent's next start. The task's directory is open to the agent as its worktree is: edits there follow its permission mode.
+An agent can also read the other members' worktrees without asking, but not edit them: TAM adds them to the session's directories with a rule denying edits there, which covers Claude's file tools and the file commands it recognises in shell commands, not every program a command may run. A member that joined after the agent started is readable from the agent's next start. The task's directory is open to the agent as its worktree is: edits there follow its permission mode.
 
 With several repositories, every agent starts on the same prompt (`-p`, or the pattern's): each one is told its own repository and its peers, and takes its part of the brief. To tell one member more, `tam msg TASK/MEMBER`.
 
@@ -362,20 +362,20 @@ Running `tam` with no arguments opens the dashboard:
 
 ```
  tam  7 tasks  3 need you                                         by repository
- STATUS          TASK                                    BRANCH AGENT  CTX
+ STATUS          TASK                                           BRANCH CTX
  backend ───────────────────────────────────────────────────────────────────────
-▌▲ block      3m fix-allotment-rounding                  ↑2 *1  claude  67% ━━━━
- ⠹ run       20s perf                                    =      claude  31% ━━━━
- ◌ stale     45d spike-cache                             ↑5 ↓12 -
+▌▲ block      3m fix-allotment-rounding                         ↑2 *1   67% ━━━━
+ ⠹ run       20s perf                                           =       31% ━━━━
+ ◌ stale     45d spike-cache                                    ↑5 ↓12
  backend + frontend ────────────────────────────────────────────────────────────
                  unit-pricing
- ⠹ run        1m  ├ backend                              ↑1 *3  claude  12% ━━━━
- ? question   5m  └▸frontend                             ↑1     claude  40% ━━━━
+ ⠹ run        1m  ├ backend                                     ↑1 *3   12% ━━━━
+ ? question   5m  └▸frontend                                    ↑1      40% ━━━━
  frontend ──────────────────────────────────────────────────────────────────────
- ○ idle       2d nav                                     =      -
- ∅ gone       3d old-banner                                     -
+ ○ idle       2d nav                                            =
+ ∅ gone       3d old-banner
  rustpallet ────────────────────────────────────────────────────────────────────
- ◆ ready     12m offload-explain                         ↑3 ↓1  claude  55% ━━━━
+ ◆ ready     12m offload-explain                                ↑3 ↓1   55% ━━━━
  enter:attach  s:stop  d:drop  n:new  /:filter  ?:help  q:quit
 ```
 
@@ -389,17 +389,14 @@ The mouse: a click selects a task (with the pane open, a member's row shows that
 
 The pane is the terminal of the selected task's agent, as it is right now. `enter` gives it the keyboard: every key goes to the agent, the dashboard's own keys too (`q`, `d`…), a paste arrives as one paste, `shift-enter` or `alt-enter` is a new line in the agent's prompt, and the pane's border says so until `ctrl-]` (or a click in the list) gives the keyboard back. While you type to an agent, tam sends no notification about it. If the agent exits meanwhile, the keys you were still typing are dropped, not run as dashboard keys. `f` attaches on the whole screen instead, as `tam attach` does. Its bottom border keeps what the terminal may no longer show: why its turn failed, what auto mode refused, and messages still waiting for the agent. Without an agent there is no terminal, and the pane says instead how the last run ended or what is wrong with the worktree, the branch against the default branch with its diff stat, and the latest messages. In a task with several members it shows the one that needs you; `←`/`→` show another, and the member keys (`enter`, `f`, `s`, `r`, `R`, `a`) act on the member shown. From 136 columns the pane is beside the list (wide enough for an agent's 80-column screen), else below it.
 
-Quick replies, without attaching:
+Without attaching, `a` answers what the agent asks: a permission (the tool's whole input is shown; `y` allows it once, `n` says no, with a reason the agent reads and goes on with, or without one, which asks it to stop and wait for you), a plan to approve (`y`: the agent leaves plan mode, and edits keep asking for permission), or its questions (`↑`/`↓` and `enter` pick an option, `space` ticks several, the last row takes an answer of your own; with several questions, `←`/`→` move between them and a last step sends them all). It answers the request it shows and no other: once that request is over (answered in the agent's terminal, or the agent moved on), the dialog says so and nothing is sent. A yes given in the terminal shows late, when the tool has run: an answer sent meanwhile goes to a request Claude has already answered, and changes nothing. Nothing is ever allowed for more than once, and a request too long to show in full (over 16,000 characters) can only be refused from the dashboard. Claude's own dialog stays in the agent's terminal meanwhile, and the first answer wins. Without the dashboard, the request waits in the terminal as usual.
 
-- `a` answers what a Claude agent asks: a permission (the tool's whole input is shown; `y` allows it once, `n` says no, with a reason the agent reads and goes on with, or without one, which asks it to stop and wait for you), a plan to approve (`y`: the agent leaves plan mode, and edits keep asking for permission), or its questions (`↑`/`↓` and `enter` pick an option, `space` ticks several, the last row takes an answer of your own; with several questions, `←`/`→` move between them and a last step sends them all). It answers the request it shows and no other: once that request is over (answered in the agent's terminal, or the agent moved on), the dialog says so and nothing is sent. A yes given in the terminal shows late, when the tool has run: an answer sent meanwhile goes to a request Claude has already answered, and changes nothing. Nothing is ever allowed for more than once, and a request too long to show in full (over 16,000 characters) can only be refused from the dashboard. Claude's own dialog stays in the agent's terminal meanwhile, and the first answer wins. Without the dashboard, the request waits in the terminal as usual.
-- `m` sends the agent a message, as `tam msg` does: a Claude agent reads it at its next step (at once when idle), other agents get it typed in once idle, a member without an agent gets it when its next one starts.
-
-What the dashboard cannot answer (an MCP server's input request, a request older than a day, Codex and other agents, whose prompts tam does not see) says so: attach to answer it there.
+What the dashboard cannot answer (an MCP server's input request, a request older than a day) says so: attach to answer it there.
 
 ### Setup
 
 ```
-tam init --agent claude        Remove the Claude hooks older versions installed globally
+tam init                       Remove the Claude hooks older versions installed globally
 tam shutdown                   Stop all agents and kill the daemon
 tam status                     Check if the daemon is running
 ```
@@ -410,7 +407,6 @@ TAM reads `~/.config/tam/config.toml`:
 
 ```toml
 [spawn]
-default_agent = "claude"
 wrapper = ["direnv", "exec", "."]   # run every agent through it, in its worktree
 
 [worktree]
@@ -464,23 +460,19 @@ include = [".env", ".claude/**"]
 commands = ["npm install"]
 ```
 
-## Agent providers
+## The agent
 
-| Provider | State detection | Context tracking | Setup |
-|---|---|---|---|
-| **Claude Code** | Hook-based (immediate) | Reads the session transcript for token usage | None |
-| **Codex** | PTY heuristic (5s idle) | Reads session JSONL | None |
-| **Any CLI** | PTY heuristic (5s idle) | None | None |
+TAM runs Claude Code: `claude` must be on your `PATH`. Nothing to set up.
 
-Claude Code reports state changes through hooks that TAM injects into each agent it spawns (`claude --settings`, nothing is written to your Claude settings): TAM knows the moment an agent finishes, asks a question, needs a permission or fails on an API error. The permission hook also waits, up to a day, for an answer from the dashboard (`a`); Claude shows its own dialog meanwhile, and once the hook gives up the dialog is still there, nothing approved. Claude runs no hooks until a folder is trusted, so a new worktree shows `ready` while Claude's trust prompt waits. An interrupted turn fires no hook; TAM takes a working agent silent for 10s as back at the prompt. If you ran `tam init --agent claude` with an older version, run it again to remove the global hooks it installed. Other providers fall back to a PTY idle-time heuristic. Any command-line program can be used as a provider: `tam run feat -a my-tool`.
+Claude Code reports state changes through hooks that TAM injects into each agent it spawns (`claude --settings`, nothing is written to your Claude settings): TAM knows the moment an agent finishes, asks a question, needs a permission or fails on an API error. The permission hook also waits, up to a day, for an answer from the dashboard (`a`); Claude shows its own dialog meanwhile, and once the hook gives up the dialog is still there, nothing approved. Claude runs no hooks until a folder is trusted, so a new worktree shows `ready` while Claude's trust prompt waits. An interrupted turn fires no hook; TAM takes a working agent silent for 10s as back at the prompt. Context use is read from the session's transcript. If you ran `tam init --agent claude` with an older version, run `tam init` to remove the global hooks it installed.
 
 An agent runs in the environment of what started it: the shell you ran `tam new` or `tam run` in, or the one the dashboard was launched from (its `PATH`, tools, SSH agent and credentials), not the daemon's, which may come from another shell started long ago. A resumed session gets yours too. It is passed to the agent only, never written down or logged. Left out are what belongs to you rather than the agent: an agent's own `TAM_AGENT_ID` and `TAM_SOCKET` when an agent starts another one, the variables a Claude Code session sets for the commands it runs (a session started with them is taken as nested in it), your terminal pane (`TMUX`, `ZELLIJ`, …), size (`COLUMNS`, `LINES`) and directory (`PWD`). The agent gets `TERM=xterm-256color` when you have no `TERM`, e.g. from a script.
 
 Your shell is rarely the worktree's dev environment, the dashboard's least of all: set `wrapper` in `[spawn]` to a command that loads it, and every agent starts through it, in its worktree, on top of your environment. `["direnv", "exec", "."]` loads the worktree's `.envrc` (and unloads one loaded where you started). Any command that takes the agent's command as its last arguments and `exec`s it fits, such as `nix develop -c` or `mise exec --`. It runs at every start and resume, and what it prints or fails on shows on the agent's screen. direnv runs only an `.envrc` you allowed, and a new worktree's copy is not: add `direnv allow` to the `.tam.toml` init commands, or the agent stops at once. The wrapper is read at each start: no restart needed after a change.
 
-Each task member has a current session per agent, which `tam run` and `r` resume: for Claude Code, the last session the agent had a turn in, as its hooks report it (so a `/clear` followed by a prompt moves it). `tam run --new-session` and `R` start a new one, which becomes current once you use it. A session whose transcript Claude deleted is not resumed: TAM says so and you start a new one. Codex and other agents report no sessions: they start a new session unless given one (`tam run --session ID`, codex only).
+Each task member has a current session, which `tam run` and `r` resume: the last session the agent had a turn in, as its hooks report it (so a `/clear` followed by a prompt moves it). `tam run --new-session` and `R` start a new one, which becomes current once you use it. A session whose transcript Claude deleted is not resumed: TAM says so and you start a new one. `tam run --session ID` resumes any other session.
 
-Messages (`tam msg`) reach a Claude agent through one more injected hook, which runs in the background and wakes the session (shown as `tam message` in its transcript). Other providers get them typed into their input once idle: as a paste for Codex, as a single line for any other program.
+Messages (`tam msg`) reach the agent through one more injected hook, which runs in the background and wakes the session (shown as `tam message` in its transcript).
 
 ## Install
 

@@ -150,8 +150,16 @@ adopt). `tam-cli` depends on all three.
   worktree, on top of the caller's environment (direnv unloads an `.envrc`
   loaded elsewhere through `DIRENV_DIFF`, which is kept); its output and
   errors are on the agent's screen. A spawn error names it. Not recorded.
-- **Provider trait** — `tam-daemon/src/provider.rs`. Claude uses hooks for state
-  detection, generic/codex use PTY heuristic (5s idle timeout). Claude's hooks
+- **The agent is Claude** — the only agent a client starts: no `-a`, no
+  `default_agent` (an old config's is ignored), no AGENT column.
+  `tam-daemon/src/provider.rs` keeps the `Provider` trait for what tests
+  run in Claude's place: `Spawn`/`RunAgent` with `provider` set to a
+  program (`sleep`, `sh`) give a `GenericProvider`: state guessed from PTY
+  silence (5s), no hooks, so no note, no access, no session, and messages
+  wait for the member's next agent (nothing is typed into a PTY for them).
+  Old ledgers' runs of other programs still load; `handle_run_agent`
+  starts Claude whatever the member last ran, in Claude's own current
+  session. Claude's state comes from hooks, which
   are injected per spawn (`claude --settings`) and run `tam hook-notify`, which
   forwards the hook's JSON input to the daemon (`$TAM_SOCKET`, never starting
   one); `ClaudeProvider::handle_hook` maps it to a state and per-agent
@@ -159,24 +167,22 @@ adopt). `tam-cli` depends on all three.
   (interrupted turns fire no hook).
 - **One session per member, resumed by default** — clients start a member's
   agent with `RunAgent { session: current | new | id }` (`handle_run_agent`):
-  the daemon picks the agent (requested, else the member's last, else the
-  client's default) and the session, then spawns as usual. The current session
-  of a member for an agent is derived, not stored: the session of its latest
-  run of that agent that has one (`Ledger::current_session`). A run's session
+  the daemon picks the session, then spawns as usual. The current session
+  of a member is derived, not stored: the session of its latest
+  Claude run that has one (`Ledger::current_session`). A run's session
   is the one it resumed, or the last one the agent's hooks showed a turn in
   (`HookData::resumable_session` → `Ledger::session_reported`:
   `AgentSessionIdentified`, then `AgentSessionChanged` on e.g. `/clear`). A
   session nobody typed in has no transcript, so it never counts. `current`
-  resumes only for providers that `reports_sessions()` (Claude), and only if
-  `session_exists()` (Claude deletes old transcripts); codex resumes only an
-  explicit id, generic agents never. No session picker, no transcript scanning
+  resumes only if `session_exists()` (Claude deletes old transcripts); an
+  explicit id is not checked. No session picker, no transcript scanning
   in `tam-cli`.
 - **Messages** — `tam msg` (`SendMessage`; sender = the member of the
   caller's `$TAM_AGENT_ID`, resolved by the daemon, else the user). Messages
   are ledger events kept with the recipient member (`MessageSent`,
   `MessageDelivered`): undelivered ones survive restarts and wait for the
   member's next agent. Delivery is in `inbox.rs` (daemon handlers at the end
-  of `daemon.rs`). Claude agents get two more per-spawn hooks (`SessionStart`,
+  of `daemon.rs`). Agents get two more per-spawn hooks (`SessionStart`,
   `Stop`) running `tam inbox-wait` with `asyncRewake` (7-day timeout): it
   holds a `WaitInbox` connection (handled like Attach), the daemon hands it
   the queued messages, it prints them on stderr and exits 2, and Claude shows
@@ -184,9 +190,7 @@ adopt). `tam-cli` depends on all three.
   queue, also held while a permission dialog is open). The newest waiter
   wins. Handed over is not delivered: a message is delivered when its id
   shows in the next `UserPromptSubmit` prompt, and goes back to the queue if
-  the agent exits first. Agents without the hook (codex, generic) get it
-  typed into the PTY once idle (bracketed paste, else one line), written
-  outside the state lock. `WaitReply` (`--wait`): the recipient's next
+  the agent exits first. `WaitReply` (`--wait`): the recipient's next
   message to the sender, or its last response at the end of the turn that
   got it (a message a `--wait` returned counts as delivered in the waiting
   agent's turn, never shown again: two agents waiting on each other each
@@ -225,7 +229,7 @@ adopt). `tam-cli` depends on all three.
   terminal leaves the hook running), a newer `PermissionRequest` or a turn
   ending or starting comes
   (`Asks::ended_by`, `handle_answer_hook`), or the agent exits (its hooks
-  outlive it). MCP elicitation and codex/generic agents have nothing to
+  outlive it). MCP elicitation has nothing to
   answer from a client: attach, or `tam msg`. No CLI command answers (an
   approval path agents could call is #29's). The dashboard: `a`
   (`tui/answer.rs`, `Mode::Answer`) opens on the focused member's
@@ -240,7 +244,7 @@ adopt). `tam-cli` depends on all three.
 - **Peers and discovery** — an agent knows its task from its environment:
   `$TAM_AGENT_ID` (its member id, the only stable handle) and `$TAM_SOCKET`;
   never a task name or peer list, which change (a member joins; a merge,
-  #27, moves members). Claude agents are also told at every `SessionStart`
+  #27, moves members). Agents are also told at every `SessionStart`
   (startup, resume, `/clear`, compaction): the daemon replies
   `HookContext` to that `HookEvent` with `peers::session_note` (task, own
   name and id, each peer's address, id, repo, branch and worktree, how to
@@ -249,8 +253,7 @@ adopt). `tam-cli` depends on all three.
   so; what changes by the second (what peers' agents are doing) and later
   membership changes are for `tam peers [--all] [--json]` (`peers.rs` in
   `tam-cli`: the caller is the member of `$TAM_AGENT_ID`, else of the cwd;
-  JSON has `schema_version`). Codex and generic agents get no note (nothing
-  is typed into their PTY): the environment and `tam peers`. Short names:
+  JSON has `schema_version`). Short names:
   `Ledger::resolve_from` (`SendMessage`, `ResolveMember { from }`, which
   `Client::resolve_member` fills from `$TAM_AGENT_ID`) takes a member's
   short name from an agent of its task, after everything `resolve` takes,
@@ -391,7 +394,7 @@ adopt). `tam-cli` depends on all three.
   (`App::pending_g`). `t` (`App::toggle_order`, `Order`) switches to
   attention first: no groups, a REPO column. Columns: status and time in it
   (`state_since`, else the task's `last_activity`), task, branch
-  (`↑`/`↓`/`*` from `App::branches`), agent, context, and from 100 columns
+  (`↑`/`↓`/`*` from `App::branches`), context, and from 100 columns
   what the member waits on; `table::fit` drops columns (`DROP_ORDER`)
   before cutting task names. `ui::split`: the pane beside the list from
   136 columns (pane >= 82: an agent's 80-column screen), else below it,
@@ -399,7 +402,7 @@ adopt). `tam-cli` depends on all three.
   what-it-waits-on column shows only stacked, from 100 columns). The footer keeps the hints that
   fit (`ui::fit_hints`, by priority). `tam ps` (`ps.rs`) prints the same
   rows as text: a row per task, most urgent first, and below a task with
-  several members a row per member (status, agent, worktree, context).
+  several members a row per member (status, worktree, context).
 - **Dashboard colours** — `tui/theme.rs`: colours by role (`theme::get()`),
   never a `Color::` in the drawing code. `DARK` (24-bit) when `COLORTERM`
   says truecolor or `[tui] theme = "dark"`, else `ANSI` (the terminal's 16
@@ -461,7 +464,7 @@ adopt). `tam-cli` depends on all three.
   task directory, the peers' existing worktrees) and `deny` of
   `Edit(//<peer>/**)`. Not `--add-dir`: variadic, it would take the prompt
   as a directory. Claude restores neither on `--resume`: every spawn passes
-  them. Codex and generic agents get nothing (`provider::grants_access`).
+  them (`provider::grants_access`: not to a test's plain program).
   CLI (`tam-cli/src/brief.rs`): `tam new --brief REF` (set after
   `CreateMembers`, before the agents start), `tam brief [NAME] [--set REF |
   --local] [--json]`, and `tam peers` shows it. `[[brief.patterns]]`
@@ -497,8 +500,7 @@ adopt). `tam-cli` depends on all three.
   (`peers::merged_in`, `merged_away`, `split_away`, `split_off`), and their next
   `UserPromptSubmit` or `PostToolUse` (not a subagent's: payload `agent_id`) gets
   `HookContext` with it and `peers::session_note` (`peers::change_note`); a
-  `SessionStart` or the agent's exit forgets it. Codex and generic agents are not
-  told. Names through a merged task stop resolving; member ids do not. Briefs
+  `SessionStart` or the agent's exit forgets it. Names through a merged task stop resolving; member ids do not. Briefs
   (#25): the target keeps its brief, a source's `BriefSet` goes with its task,
   and a task split off starts with the local brief. The sources' directories
   stay in `tasks/` (a later task of that name moves one aside: `brief::ensure`).

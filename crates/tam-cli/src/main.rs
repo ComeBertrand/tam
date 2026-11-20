@@ -97,19 +97,15 @@ async fn run(cli: Cli) -> Result<()> {
             }
 
             let start = (!no_start).then_some(Start {
-                agent: None,
                 session: SessionChoice::New,
                 prompt,
                 args: vec![],
             });
             match start {
                 Some(start) if script::attaching(detach || json) => {
-                    start_members(&mut client, &task, &members, &config, start).await?
+                    start_members(&mut client, &task, &members, start).await?
                 }
-                start => {
-                    script::start_detached(&mut client, &task, &members, &config, start, json)
-                        .await?
-                }
+                start => script::start_detached(&mut client, &task, &members, start, json).await?,
             }
         }
 
@@ -117,7 +113,6 @@ async fn run(cli: Cli) -> Result<()> {
             name,
             new_session,
             session,
-            agent,
             prompt,
             args,
             prompt_option,
@@ -126,7 +121,6 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let mut client = client::Client::connect().await?;
             let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
-            config::validate_provider(agent.as_ref().unwrap_or(&config.default_agent))?;
 
             // The daemon resumes the member's current session by default.
             let session = match session {
@@ -135,17 +129,15 @@ async fn run(cli: Cli) -> Result<()> {
                 None => SessionChoice::Current,
             };
             let start = Start {
-                agent,
                 session,
                 prompt: prompt_option.or(prompt),
                 args,
             };
             if script::attaching(detach || json) {
-                run_and_attach(&mut client, &task, &member, &config, start).await?;
+                run_and_attach(&mut client, &task, &member, start).await?;
             } else {
                 let members = std::slice::from_ref(&member);
-                script::start_detached(&mut client, &task, members, &config, Some(start), json)
-                    .await?;
+                script::start_detached(&mut client, &task, members, Some(start), json).await?;
             }
         }
 
@@ -420,7 +412,6 @@ async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Init { agent } => {
-            config::validate_provider(&agent)?;
             config::remove_legacy_hooks(&agent)?;
         }
 
@@ -513,8 +504,6 @@ async fn run(cli: Cli) -> Result<()> {
 /// How to start a member's agent.
 #[derive(Clone)]
 struct Start {
-    /// Unset: the member's last agent, else the configured default.
-    agent: Option<String>,
     session: SessionChoice,
     prompt: Option<String>,
     args: Vec<String>,
@@ -526,18 +515,10 @@ async fn run_and_attach(
     client: &mut client::Client,
     task: &TaskInfo,
     member: &MemberInfo,
-    config: &config::Config,
     start: Start,
 ) -> Result<()> {
     let (id, _resumed) = client
-        .run_agent(
-            &member.id,
-            start.agent,
-            &config.default_agent,
-            start.session,
-            start.prompt,
-            start.args,
-        )
+        .run_agent(&member.id, start.session, start.prompt, start.args)
         .await?;
     let client = client::Client::connect().await?;
     client.attach(&id, &task.member_label(member)).await
@@ -667,25 +648,17 @@ async fn start_members(
     client: &mut client::Client,
     task: &TaskInfo,
     members: &[MemberInfo],
-    config: &config::Config,
     start: Start,
 ) -> Result<()> {
     if let [member] = members {
-        return run_and_attach(client, task, member, config, start).await;
+        return run_and_attach(client, task, member, start).await;
     }
     let mut started: Vec<(String, String)> = Vec::new();
     for member in members {
         let label = task.member_label(member);
         let start = start.clone();
         let run = client
-            .run_agent(
-                &member.id,
-                start.agent,
-                &config.default_agent,
-                start.session,
-                start.prompt,
-                start.args,
-            )
+            .run_agent(&member.id, start.session, start.prompt, start.args)
             .await;
         match run {
             Ok((id, _)) => started.push((id, label)),

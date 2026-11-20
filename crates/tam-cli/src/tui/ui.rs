@@ -2192,7 +2192,7 @@ mod tests {
         // The task name is not cut at 15 columns; time in state and branch.
         assert!(
             s.contains(
-                "▲ block      3m fix-allotment-rounding                  ↑2 *1  claude  67% ━━━━"
+                "▲ block      3m fix-allotment-rounding                         ↑2 *1   67% ━━━━"
             ),
             "{s}"
         );
@@ -2204,7 +2204,7 @@ mod tests {
         assert!(s.lines().any(|l| l.trim() == "unit-pricing"), "{s}");
         assert!(
             s.contains(
-                "● run        1m  ├ backend                              ↑1 *3  claude  12% ━━━━"
+                "● run        1m  ├ backend                                     ↑1 *3   12% ━━━━"
             ),
             "{s}"
         );
@@ -2273,8 +2273,8 @@ mod tests {
         let mut app = dashboard();
         let s = screen(&mut app, 50, 20);
         show("50x20", &s);
-        // The agent column goes first, then context.
-        assert!(!s.contains("AGENT"), "{s}");
+        // The context column goes first.
+        assert!(!s.contains("CTX"), "{s}");
         assert!(s.contains("fix-allotment-rounding"), "{s}");
         let s = screen(&mut app, 30, 20);
         show("30x20", &s);

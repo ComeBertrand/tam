@@ -176,7 +176,6 @@ pub async fn start_detached(
     client: &mut Client,
     task: &TaskInfo,
     members: &[MemberInfo],
-    config: &crate::config::Config,
     start: Option<crate::Start>,
     json: bool,
 ) -> Result<()> {
@@ -190,8 +189,6 @@ pub async fn start_detached(
             let run = client
                 .run_agent(
                     &member.id,
-                    start.agent.clone(),
-                    &config.default_agent,
                     start.session.clone(),
                     start.prompt.clone(),
                     start.args.clone(),

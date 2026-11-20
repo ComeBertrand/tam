@@ -262,23 +262,19 @@ impl Client {
         }
     }
 
-    /// Start a member's agent (`provider`: else the member's last agent, else
-    /// `default_provider`) in the chosen session, in our environment, through
+    /// Start a member's agent in the chosen session, in our environment, through
     /// the configured wrapper (read now: a dashboard sees a change). Returns
     /// the agent id and the session it resumed, if any.
     pub async fn run_agent(
         &mut self,
         member: &str,
-        provider: Option<String>,
-        default_provider: &str,
         session: SessionChoice,
         prompt: Option<String>,
         args: Vec<String>,
     ) -> Result<(String, Option<String>)> {
         let request = Request::RunAgent {
             member: member.into(),
-            provider,
-            default_provider: default_provider.into(),
+            provider: None,
             session,
             args,
             prompt,

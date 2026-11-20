@@ -151,7 +151,6 @@ fn run_agent(member: &str, provider: &str, args: Vec<String>, env: &AgentEnv) ->
     Request::RunAgent {
         member: member.into(),
         provider: Some(provider.into()),
-        default_provider: "claude".into(),
         session: SessionChoice::New,
         args,
         prompt: None,

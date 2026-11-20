@@ -46,13 +46,15 @@ pub enum HookResult {
     Handled { state: Option<AgentState> },
 }
 
-/// Adapter for a specific agent tool (claude, codex, etc.).
+/// How an agent is launched and how its state is known: Claude
+/// (`ClaudeProvider`), and the plain programs tests run in its place
+/// (`GenericProvider`).
 ///
 /// Providers know how to launch the agent and how to detect its state.
 /// Hook-based providers (e.g. Claude) return `None` from `detect_state_from_output`
 /// and push state via hooks instead. PTY-heuristic providers analyze output directly.
 pub trait Provider: Send + Sync {
-    /// Unique name for this provider (e.g. "claude", "codex").
+    /// Unique name for this provider ("claude").
     fn name(&self) -> &str;
 
     /// Build the command to launch the agent in a directory.
@@ -104,14 +106,6 @@ pub trait Provider: Send + Sync {
         None
     }
 
-    /// Session id of the running agent process, if the provider can tell
-    /// without hooks. Used to record new sessions in the ledger so they can
-    /// be resumed. Not asked of providers that `reports_sessions()`: a
-    /// session found this way may have no turn yet, and none to resume.
-    fn session_id(&self, _pid: u32) -> Option<String> {
-        None
-    }
-
     /// Whether the agent can start in an existing session (`resume_session`
     /// of `build_command`).
     fn can_resume(&self) -> bool {
@@ -131,17 +125,10 @@ pub trait Provider: Send + Sync {
         true
     }
 
-    /// Whether messages reach the agent through its inbox hook (`tam
-    /// inbox-wait`) rather than typed into its PTY.
+    /// Whether messages reach the agent, through its inbox hook (`tam
+    /// inbox-wait`). Without it they wait for the member's next agent.
     fn inbox_hook(&self) -> bool {
         false
-    }
-
-    /// Bytes that type `text` into the agent's input, before Enter. By
-    /// default one line: a program may take each line as a separate input,
-    /// and the bracketed paste markers literally.
-    fn pty_input(&self, text: &str) -> Vec<u8> {
-        crate::inbox::one_line(text).into_bytes()
     }
 }
 
@@ -366,10 +353,6 @@ impl Provider for ClaudeProvider {
 
     fn inbox_hook(&self) -> bool {
         self.hook_command.is_some() && self.inbox_command.is_some()
-    }
-
-    fn pty_input(&self, text: &str) -> Vec<u8> {
-        crate::inbox::bracketed_paste(text)
     }
 }
 
@@ -716,193 +699,9 @@ fn find_last_usage(content: &str) -> Option<(ClaudeUsage, Option<String>)> {
     None
 }
 
-/// Codex CLI provider.
-///
-/// State detection uses PTY idle heuristic (no useful hooks for per-turn detection).
-/// Context tracking reads Codex's JSONL session files.
-pub struct CodexProvider;
-
-impl Provider for CodexProvider {
-    fn name(&self) -> &str {
-        "codex"
-    }
-
-    fn build_command(
-        &self,
-        dir: &Path,
-        args: &[String],
-        resume_session: Option<&str>,
-        prompt: Option<&str>,
-    ) -> Command {
-        let mut cmd = Command::new("codex");
-        if let Some(id) = resume_session {
-            cmd.arg("resume").arg(id);
-        }
-        cmd.arg("-C").arg(dir);
-        cmd.args(args);
-        if let Some(text) = prompt {
-            cmd.arg(text);
-        }
-        cmd
-    }
-
-    fn detect_state_from_output(
-        &self,
-        _recent_output: &[u8],
-        idle_duration: Duration,
-    ) -> Option<AgentState> {
-        if idle_duration >= Duration::from_secs(5) {
-            Some(AgentState::Idle)
-        } else {
-            Some(AgentState::Working)
-        }
-    }
-
-    fn context_usage(
-        &self,
-        _pid: u32,
-        dir: &Path,
-        _transcript: Option<&Path>,
-    ) -> Option<ContextUsage> {
-        codex_context_usage(dir)
-    }
-
-    fn can_resume(&self) -> bool {
-        true
-    }
-
-    // Codex's TUI turns bracketed paste on (not tried with a live codex).
-    fn pty_input(&self, text: &str) -> Vec<u8> {
-        crate::inbox::bracketed_paste(text)
-    }
-}
-
-// --- Codex context usage parsing ---
-
-#[derive(Deserialize)]
-struct CodexJournalLine {
-    #[serde(rename = "type")]
-    line_type: Option<String>,
-    payload: Option<CodexPayload>,
-}
-
-#[derive(Deserialize)]
-struct CodexPayload {
-    #[serde(rename = "type")]
-    payload_type: Option<String>,
-    info: Option<CodexTokenInfo>,
-    // session_meta fields (flattened into payload)
-    cwd: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CodexTokenInfo {
-    last_token_usage: Option<CodexTokenUsage>,
-    model_context_window: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct CodexTokenUsage {
-    #[serde(default)]
-    input_tokens: u64,
-}
-
-/// Find the most recent Codex session file matching the given working directory.
-fn find_codex_session(codex_dir: &Path, agent_dir: &Path) -> Option<PathBuf> {
-    let sessions_dir = codex_dir.join("sessions");
-    if !sessions_dir.is_dir() {
-        return None;
-    }
-
-    // Walk YYYY/MM/DD directories in reverse chronological order
-    let mut year_dirs: Vec<_> = std::fs::read_dir(&sessions_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    year_dirs.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-
-    for year in year_dirs {
-        let mut month_dirs: Vec<_> = std::fs::read_dir(year.path())
-            .ok()?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect();
-        month_dirs.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-
-        for month in month_dirs {
-            let mut day_dirs: Vec<_> = std::fs::read_dir(month.path())
-                .ok()?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .collect();
-            day_dirs.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-
-            for day in day_dirs {
-                // List JSONL files in this day, sorted by name descending (most recent first)
-                let mut files: Vec<_> = std::fs::read_dir(day.path())
-                    .ok()?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-                    .collect();
-                files.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-
-                for file in files {
-                    // Read first line to check CWD
-                    if let Ok(content) = std::fs::read_to_string(file.path()) {
-                        if let Some(first_line) = content.lines().next() {
-                            if let Ok(meta) = serde_json::from_str::<CodexJournalLine>(first_line) {
-                                let cwd = meta.payload.as_ref().and_then(|p| p.cwd.as_deref());
-                                if cwd == Some(&agent_dir.to_string_lossy()) {
-                                    return Some(file.path());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn codex_context_usage(dir: &Path) -> Option<ContextUsage> {
-    let home = std::env::var("HOME").ok()?;
-    let codex_dir = PathBuf::from(&home).join(".codex");
-
-    let session_path = find_codex_session(&codex_dir, dir)?;
-    let content = std::fs::read_to_string(&session_path).ok()?;
-
-    // Find last token_count event
-    for line in content.lines().rev() {
-        let entry: CodexJournalLine = match serde_json::from_str(line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if entry.line_type.as_deref() != Some("event_msg") {
-            continue;
-        }
-        let payload = entry.payload?;
-        if payload.payload_type.as_deref() != Some("token_count") {
-            continue;
-        }
-        let info = payload.info?;
-        let usage = info.last_token_usage?;
-        let limit = info.model_context_window?;
-
-        return Some(ContextUsage {
-            used_tokens: usage.input_tokens,
-            limit_tokens: limit,
-        });
-    }
-
-    None
-}
-
-/// Generic provider for any CLI agent.
-///
-/// Uses the provider name as the command and PTY activity heuristic for state detection.
+/// Any program run as an agent: what tam's tests start in place of Claude
+/// (`sleep`, `sh`). No client offers it. The provider's name is the
+/// command; its state is guessed from the PTY's activity.
 pub struct GenericProvider {
     command: String,
     idle_timeout: Duration,
@@ -952,7 +751,6 @@ impl Provider for GenericProvider {
 pub fn resolve(name: &str) -> Box<dyn Provider> {
     match name {
         "claude" => Box::new(ClaudeProvider::with_current_exe()),
-        "codex" => Box::new(CodexProvider),
         other => Box::new(GenericProvider::new(other)),
     }
 }
@@ -968,7 +766,7 @@ pub struct TaskAccess {
 }
 
 /// Whether the agent `name` is given a member's `TaskAccess` (Claude only:
-/// codex and other programs get nothing more than their worktree).
+/// a plain program gets nothing more than its worktree).
 pub fn grants_access(name: &str) -> bool {
     name == "claude"
 }
@@ -1075,11 +873,11 @@ mod tests {
 
     #[test]
     fn generic_provider_basics() {
-        let p = GenericProvider::new("codex");
-        assert_eq!(p.name(), "codex");
+        let p = GenericProvider::new("sh");
+        assert_eq!(p.name(), "sh");
 
         let cmd = p.build_command(&PathBuf::from("/home"), &[], None, None);
-        assert_eq!(cmd.get_program(), "codex");
+        assert_eq!(cmd.get_program(), "sh");
     }
 
     #[test]
@@ -1393,7 +1191,6 @@ mod tests {
     fn only_claude_has_silent_working_timeout() {
         assert!(ClaudeProvider::new(None).silent_working_timeout().is_some());
         assert!(GenericProvider::new("x").silent_working_timeout().is_none());
-        assert!(CodexProvider.silent_working_timeout().is_none());
     }
 
     #[test]
@@ -1498,101 +1295,6 @@ mod tests {
         assert_eq!(usage.input_tokens, 42);
     }
 
-    // --- Codex provider tests ---
-
-    #[test]
-    fn codex_provider_basics() {
-        let p = CodexProvider;
-        assert_eq!(p.name(), "codex");
-
-        let cmd = p.build_command(&PathBuf::from("/tmp/project"), &[], None, None);
-        assert_eq!(cmd.get_program(), "codex");
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, &["-C", "/tmp/project"]);
-    }
-
-    #[test]
-    fn codex_resume_session() {
-        let p = CodexProvider;
-        let cmd = p.build_command(&PathBuf::from("/tmp"), &[], Some("sess-456"), None);
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, &["resume", "sess-456", "-C", "/tmp"]);
-    }
-
-    #[test]
-    fn codex_prompt_arg() {
-        let p = CodexProvider;
-        let cmd = p.build_command(&PathBuf::from("/tmp"), &[], None, Some("fix the bug"));
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, &["-C", "/tmp", "fix the bug"]);
-    }
-
-    #[test]
-    fn codex_resume_session_and_prompt() {
-        let p = CodexProvider;
-        let cmd = p.build_command(
-            &PathBuf::from("/tmp"),
-            &[],
-            Some("sess-456"),
-            Some("fix the bug"),
-        );
-        let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, &["resume", "sess-456", "-C", "/tmp", "fix the bug"]);
-    }
-
-    #[test]
-    fn codex_pty_heuristic_working() {
-        let p = CodexProvider;
-        assert_eq!(
-            p.detect_state_from_output(b"output", Duration::from_secs(1)),
-            Some(AgentState::Working)
-        );
-    }
-
-    #[test]
-    fn codex_pty_heuristic_idle() {
-        let p = CodexProvider;
-        assert_eq!(
-            p.detect_state_from_output(b"", Duration::from_secs(6)),
-            Some(AgentState::Idle)
-        );
-    }
-
-    #[test]
-    fn resolve_codex() {
-        let p = resolve("codex");
-        assert_eq!(p.name(), "codex");
-    }
-
-    #[test]
-    fn codex_find_last_token_count() {
-        // Simulate a Codex JSONL with a token_count event
-        let jsonl = r#"{"type":"session_meta","payload":{"cwd":"/tmp/project"}}
-{"type":"response_item","payload":{"type":"message","role":"user"}}
-{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50000},"model_context_window":258400}}}"#;
-
-        // Parse the last token_count event directly (unit test for the parsing logic)
-        for line in jsonl.lines().rev() {
-            let entry: CodexJournalLine = match serde_json::from_str(line) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if entry.line_type.as_deref() != Some("event_msg") {
-                continue;
-            }
-            let payload = entry.payload.unwrap();
-            if payload.payload_type.as_deref() != Some("token_count") {
-                continue;
-            }
-            let info = payload.info.unwrap();
-            let usage = info.last_token_usage.unwrap();
-            assert_eq!(usage.input_tokens, 50000);
-            assert_eq!(info.model_context_window.unwrap(), 258400);
-            return;
-        }
-        panic!("token_count event not found");
-    }
-
     #[test]
     fn claude_session_is_resumable_after_a_turn() {
         let mut d = HookData::default();
@@ -1658,10 +1360,6 @@ mod tests {
     fn session_capabilities() {
         let claude = ClaudeProvider::new(None);
         assert!(claude.can_resume() && claude.reports_sessions());
-        // Its hooks report sessions once they have a turn; a session found
-        // by pid could have none.
-        assert_eq!(claude.session_id(std::process::id()), None);
-        assert!(CodexProvider.can_resume() && !CodexProvider.reports_sessions());
         let generic = GenericProvider::new("sh");
         assert!(!generic.can_resume() && !generic.reports_sessions());
         assert!(generic.session_exists("anything"));
@@ -1726,24 +1424,7 @@ mod tests {
         let p = ClaudeProvider::with_current_exe();
         assert!(p.inbox_hook());
         assert!(p.inbox_command.unwrap().ends_with("' inbox-wait"));
-        assert!(!CodexProvider.inbox_hook());
         assert!(!GenericProvider::new("x").inbox_hook());
-    }
-
-    #[test]
-    fn pty_input_per_provider() {
-        let text = "[tam] Message msg-1 from the user:\nhi";
-        assert_eq!(
-            GenericProvider::new("x").pty_input(text),
-            b"[tam] Message msg-1 from the user: hi".to_vec()
-        );
-        for paste in [
-            CodexProvider.pty_input(text),
-            ClaudeProvider::new(None).pty_input(text),
-        ] {
-            assert!(paste.starts_with(b"\x1b[200~[tam] Message"));
-            assert!(paste.ends_with(b"user:\nhi\x1b[201~"));
-        }
     }
 
     #[test]
@@ -1829,6 +1510,6 @@ mod tests {
             Some("{}")
         );
         assert!(grants_access("claude"));
-        assert!(!grants_access("codex"));
+        assert!(!grants_access("sh"));
     }
 }

@@ -39,21 +39,13 @@ enum Col {
     Repo,
     /// Ahead, behind, uncommitted.
     Branch,
-    Agent,
     Ctx,
     /// What the member waits on.
     Note,
 }
 
 /// Columns dropped first when the list is too narrow for them all.
-const DROP_ORDER: [Col; 6] = [
-    Col::Note,
-    Col::Agent,
-    Col::Ctx,
-    Col::Branch,
-    Col::Repo,
-    Col::Age,
-];
+const DROP_ORDER: [Col; 5] = [Col::Note, Col::Ctx, Col::Branch, Col::Repo, Col::Age];
 
 impl Col {
     fn header(self) -> &'static str {
@@ -63,7 +55,6 @@ impl Col {
             Col::Task => "TASK",
             Col::Repo => "REPO",
             Col::Branch => "BRANCH",
-            Col::Agent => "AGENT",
             Col::Ctx => "CTX",
         }
     }
@@ -95,7 +86,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.order == Order::Attention {
         cols.push(Col::Repo);
     }
-    cols.extend([Col::Branch, Col::Agent, Col::Ctx]);
+    cols.extend([Col::Branch, Col::Ctx]);
     if width >= NOTE_FROM {
         cols.push(Col::Note);
     }
@@ -345,7 +336,6 @@ fn member_cell(
     app: &App,
     now: u64,
 ) -> Line<'static> {
-    let dim = Style::new().fg(theme::get().muted);
     let agent = member.agent_info.as_ref();
     match col {
         Col::Status => status_cell(task.member_status(member), app.spin),
@@ -369,10 +359,6 @@ fn member_cell(
         }
         Col::Repo => Line::default(),
         Col::Branch => branch_cell(member, app.branches.get(member.id())),
-        Col::Agent => match agent {
-            Some(a) => Line::raw(a.provider.clone()),
-            None => Line::styled("-", dim),
-        },
         Col::Ctx => agent
             .and_then(|a| a.context_percent)
             .map(context_display)

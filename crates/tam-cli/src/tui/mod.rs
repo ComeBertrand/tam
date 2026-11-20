@@ -123,6 +123,12 @@ pub async fn run() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     mouse_capture(true);
     bracketed_paste(true);
+    // Asked before the input reader starts: the answer comes on the tty.
+    KEYBOARD_PROTOCOL.store(
+        terminal::supports_keyboard_enhancement().unwrap_or(false),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    keyboard_protocol(true);
 
     theme::set(config.theme.as_deref(), config.animate);
     let mut app = App::new();
@@ -133,6 +139,7 @@ pub async fn run() -> Result<()> {
 
     mouse_capture(false);
     bracketed_paste(false);
+    keyboard_protocol(false);
     terminal::disable_raw_mode()?;
     std::io::stdout().execute(LeaveAlternateScreen)?;
 
@@ -146,6 +153,24 @@ pub async fn run() -> Result<()> {
 fn bracketed_paste(on: bool) {
     use std::io::Write;
     let seq = if on { "\x1b[?2004h" } else { "\x1b[?2004l" };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// The terminal has the kitty keyboard protocol.
+static KEYBOARD_PROTOCOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Have the terminal tell keys apart that send the same bytes otherwise
+/// (shift-enter from enter), where it can (the kitty keyboard protocol,
+/// its first flag), or stop. Off while attached: the agent's terminal is
+/// the user's then, with the agent's own modes.
+fn keyboard_protocol(on: bool) {
+    use std::io::Write;
+    if !KEYBOARD_PROTOCOL.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let seq = if on { "\x1b[>1u" } else { "\x1b[<1u" };
     let mut out = std::io::stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
@@ -373,6 +398,7 @@ async fn run_loop(
                     // Before the reader stops: no report may reach the agent.
                     mouse_capture(false);
                     bracketed_paste(false);
+                    keyboard_protocol(false);
                     // The dashboard reads nothing while attached.
                     unwatch_screen(client, app).await;
                     input.pause().await;
@@ -384,6 +410,7 @@ async fn run_loop(
                     let attached = attach_agent(terminal, app, &id, &label, &provider).await;
                     mouse_capture(true);
                     bracketed_paste(true);
+                    keyboard_protocol(true);
                     input.resume();
                     attached?;
                     // Attached, the agent took the terminal's size.
@@ -563,6 +590,13 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('d' | 'f'), KeyModifiers::CONTROL) => Action::ScrollPeek(Scroll::PageDown),
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => match selected_member(app) {
+            Some((task, member)) if member.agent_info.is_some() => Action::Attach {
+                id: member.id().to_string(),
+                label: task.member_label(member),
+            },
+            _ => Action::None,
+        },
         (KeyCode::Enter, _) => match selected_member(app) {
             // The pane takes the keyboard.
             Some((_, member)) if member.agent_info.is_some() => {
@@ -573,7 +607,8 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             }
             _ => Action::None,
         },
-        // The agent's terminal on the whole screen.
+        // The agent's terminal on the whole screen. (shift-enter where the
+        // terminal tells it from enter: see `keyboard_protocol`.)
         (KeyCode::Char('f'), _) => match selected_member(app) {
             Some((task, member)) if member.agent_info.is_some() => Action::Attach {
                 id: member.id().to_string(),
@@ -2078,6 +2113,14 @@ mod tests {
             ),
             Action::Quit
         ));
+
+        // shift-enter (told from enter by some terminals): full screen, as `f`.
+        let shift_enter = key(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert!(matches!(
+            handle_key_event(shift_enter, &mut app, &config),
+            Action::Attach { id, .. } if id == "m-2"
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
 
         // A click in the list gives it the keyboard back too.
         handle_key_event(enter, &mut app, &config);

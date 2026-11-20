@@ -248,7 +248,11 @@ adopt). `tam-cli` depends on all three.
   dropped, and the dashboard's terminal always reports pastes as such
   (`bracketed_paste`): outside the pane a paste goes into the prompt being
   typed in, else nowhere (`paste_into_prompt`). `f` is the full-screen attach
-  (`Action::Attach`, a reserved key like `enter`'s others).
+  (`Action::Attach`, a reserved key like `enter`'s others), `shift-enter`
+  too where the terminal tells it from `enter`: the dashboard asks for the
+  kitty keyboard protocol's first flag when the terminal has it
+  (`keyboard_protocol`, off while attached). Typed into the pane,
+  `shift-enter` is `ESC CR`, a new line in Claude's prompt.
   Its bottom border keeps what the screen may no longer show: why the turn
   failed, what auto mode refused (`ui::agent_detail_line`, not a request it
   waits on), and how many messages wait for the agent. Without an agent

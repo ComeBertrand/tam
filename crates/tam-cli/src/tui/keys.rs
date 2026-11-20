@@ -48,6 +48,9 @@ pub fn encode(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
                 None => c.encode_utf8(&mut bytes).as_bytes().to_vec(),
             })
         }
+        // shift-enter (when the terminal tells it apart): a new line, as
+        // alt-enter, which is what agents' prompts take for one.
+        KeyCode::Enter if shift => vec![ESC, b'\r'],
         KeyCode::Enter => meta(vec![b'\r']),
         KeyCode::Tab if shift => b"\x1b[Z".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
@@ -131,6 +134,7 @@ mod tests {
         assert_eq!(bytes(KeyCode::Char('1'), ctrl), b"1");
         assert_eq!(bytes(KeyCode::Enter, none), b"\r");
         assert_eq!(bytes(KeyCode::Enter, alt), b"\x1b\r");
+        assert_eq!(bytes(KeyCode::Enter, shift), b"\x1b\r");
         assert_eq!(bytes(KeyCode::Tab, none), b"\t");
         assert_eq!(bytes(KeyCode::BackTab, shift), b"\x1b[Z");
         assert_eq!(bytes(KeyCode::Backspace, none), [0x7f]);

@@ -143,6 +143,23 @@ pub struct AgentScreen {
 }
 
 impl AgentScreen {
+    /// The agent asked for application cursor keys.
+    pub fn application_cursor(&self) -> bool {
+        self.screen().application_cursor()
+    }
+
+    /// The agent asked for pastes between markers.
+    pub fn bracketed_paste(&self) -> bool {
+        self.screen().bracketed_paste()
+    }
+
+    /// Where the agent's cursor is on its screen, `(row, column)`; `None`
+    /// when it hides it.
+    pub fn cursor(&self) -> Option<(u16, u16)> {
+        let screen = self.screen();
+        (!screen.hide_cursor()).then(|| screen.cursor_position())
+    }
+
     pub fn new(info: &ScreenInfo) -> Self {
         let size = |n: u16| NonZeroU16::new(n).unwrap_or(NonZeroU16::MIN);
         let mut parser = vt100::Parser::new(size(info.rows), size(info.cols), 0);

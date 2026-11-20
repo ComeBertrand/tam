@@ -3,6 +3,7 @@ mod app;
 mod branch;
 mod fuzzy;
 mod input;
+mod keys;
 mod peek;
 mod table;
 mod theme;
@@ -85,6 +86,8 @@ enum Action {
         name: String,
     },
     ScrollPeek(Scroll),
+    /// Bytes to type into the agent the pane shows (see `keys`).
+    Keys(Vec<u8>),
     /// Switch to the next theme.
     NextTheme,
     /// Answer the request `ask` of agent `agent` (see `answer`).
@@ -128,10 +131,22 @@ pub async fn run() -> Result<()> {
     let result = run_loop(&mut terminal, &mut app, &mut client, &config).await;
 
     mouse_capture(false);
+    bracketed_paste(false);
     terminal::disable_raw_mode()?;
     std::io::stdout().execute(LeaveAlternateScreen)?;
 
     result
+}
+
+/// Have the terminal send pastes between markers (crossterm then reports
+/// them as one event), or stop: only while the pane has the keyboard, so
+/// that a pasted text with several lines is not typed line by line.
+fn bracketed_paste(on: bool) {
+    use std::io::Write;
+    let seq = if on { "\x1b[?2004h" } else { "\x1b[?2004l" };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 /// Have the terminal report mouse clicks and the wheel (`?1000`: no
@@ -246,8 +261,22 @@ async fn run_loop(
     // The agent's screen changed, or the pane scrolled: fetch it again.
     let mut screen_moved = true;
 
+    // The terminal reports pastes as such while the pane has the keyboard.
+    let mut pastes = false;
+
     loop {
         app.sync_focus();
+        // The pane keeps the keyboard only for the agent it took it for.
+        if let Mode::Terminal { agent } = &app.mode {
+            if app.peek_agent().as_deref() != Some(agent) {
+                app.mode = Mode::Normal;
+            }
+        }
+        let typing = matches!(app.mode, Mode::Terminal { .. });
+        if typing != pastes {
+            pastes = typing;
+            bracketed_paste(typing);
+        }
         // Whatever moved the selection (a key, a re-sort, an agent starting
         // or exiting), the preview follows.
         if app.peek_stale() || std::mem::take(&mut screen_moved) {
@@ -303,13 +332,27 @@ async fn run_loop(
             }
         };
 
+        // Typed into the pane in this batch: one write, in order.
+        let mut typed: Option<(String, Vec<u8>)> = None;
         for ev in events {
             // As if drawn between them: keys act on the member the pane
             // would show.
             app.sync_focus();
+            let typing = match &app.mode {
+                Mode::Terminal { agent } => Some(agent.clone()),
+                _ => None,
+            };
             let action = match ev {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key_event(key, app, config)
+                }
+                Event::Paste(text) if typing.is_some() => {
+                    let bracketed = app
+                        .peek
+                        .screen
+                        .as_ref()
+                        .is_some_and(|s| s.bracketed_paste());
+                    Action::Keys(keys::paste(&text, bracketed))
                 }
                 Event::Mouse(mouse) => handle_mouse(mouse, app),
                 _ => Action::None,
@@ -388,6 +431,15 @@ async fn run_loop(
                     app.peek.scroll(scroll);
                     screen_moved = true;
                 }
+                Action::Keys(bytes) => {
+                    if let Some(agent) = typing {
+                        typed.get_or_insert((agent, Vec::new())).1.extend(bytes);
+                    }
+                    // Typing shows the live screen again.
+                    if app.peek.from.take().is_some() {
+                        screen_moved = true;
+                    }
+                }
                 Action::NextTheme => {
                     let name = theme::next();
                     app.set_status(format!("theme: {name}"), Duration::from_secs(2));
@@ -405,6 +457,26 @@ async fn run_loop(
                 Action::None => {}
             }
         }
+        if let Some((agent, bytes)) = typed {
+            type_keys(client, app, agent, &bytes).await;
+        }
+    }
+}
+
+/// Type `bytes` into `agent`'s terminal; the pane gives the keyboard back
+/// when it cannot (the agent is gone).
+async fn type_keys(client: &mut Client, app: &mut App, id: String, bytes: &[u8]) {
+    let data = String::from_utf8_lossy(bytes).into_owned();
+    let failed = match client.send(tam_proto::Request::Keys { id, data }).await {
+        Ok(tam_proto::Response::Error { message }) => Some(message),
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    };
+    if let Some(why) = failed {
+        if matches!(app.mode, Mode::Terminal { .. }) {
+            app.mode = Mode::Normal;
+        }
+        app.set_status(format!("Not typed: {why}"), Duration::from_secs(4));
     }
 }
 
@@ -429,7 +501,23 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         }
         Mode::NewTaskPickProject(_) => handle_picker_key(key, app, config),
         Mode::Answer(_) => handle_answer_key(key, app),
+        Mode::Terminal { .. } => handle_terminal_key(key, app),
     }
+}
+
+/// The pane has the keyboard: ctrl-] gives it back to the list, every
+/// other key goes to the agent as its bytes.
+fn handle_terminal_key(key: KeyEvent, app: &mut App) -> Action {
+    if keys::is_leave(key) {
+        app.mode = Mode::Normal;
+        return Action::None;
+    }
+    let app_cursor = app
+        .peek
+        .screen
+        .as_ref()
+        .is_some_and(|s| s.application_cursor());
+    keys::encode(key, app_cursor).map_or(Action::None, Action::Keys)
 }
 
 fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
@@ -443,6 +531,17 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
         (KeyCode::Enter, _) => match selected_member(app) {
+            // The pane takes the keyboard.
+            Some((_, member)) if member.agent_info.is_some() => {
+                app.mode = Mode::Terminal {
+                    agent: member.id().to_string(),
+                };
+                Action::None
+            }
+            _ => Action::None,
+        },
+        // The agent's terminal on the whole screen.
+        (KeyCode::Char('f'), _) => match selected_member(app) {
             Some((task, member)) if member.agent_info.is_some() => Action::Attach {
                 id: member.id().to_string(),
                 label: task.member_label(member),
@@ -656,6 +755,13 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
     let click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
     match &mut app.mode {
         Mode::Normal => {}
+        // A click in the list gives it the keyboard back; the wheel scrolls
+        // as in the list.
+        Mode::Terminal { .. } => {
+            if click && app.hits.list.contains(at) {
+                app.mode = Mode::Normal;
+            }
+        }
         Mode::Help if click => {
             app.mode = Mode::Normal;
             return Action::None;
@@ -1776,15 +1882,91 @@ mod tests {
         app
     }
 
+    /// The member `f` (and so every member key) acts on.
     fn attach_target(app: &mut App) -> Option<String> {
         match handle_normal_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
             app,
             &Config::default(),
         ) {
             Action::Attach { id, .. } => Some(id),
             _ => None,
         }
+    }
+
+    #[test]
+    fn enter_gives_the_pane_the_keyboard_until_ctrl_bracket() {
+        use tam_proto::AgentState::{Blocked, Working};
+        let config = Config::default();
+        let mut app = two_member_app(&[("m-1", Working), ("m-2", Blocked)]);
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "m-2"));
+
+        // Every key is the agent's, the dashboard's own keys too.
+        let typed = |app: &mut App, code, modifiers| match handle_key_event(
+            key(code, modifiers),
+            app,
+            &Config::default(),
+        ) {
+            Action::Keys(bytes) => bytes,
+            _ => panic!("not typed"),
+        };
+        assert_eq!(
+            typed(&mut app, KeyCode::Char('q'), KeyModifiers::NONE),
+            b"q"
+        );
+        assert_eq!(
+            typed(&mut app, KeyCode::Char('d'), KeyModifiers::NONE),
+            b"d"
+        );
+        assert_eq!(typed(&mut app, KeyCode::Enter, KeyModifiers::NONE), b"\r");
+        assert_eq!(
+            typed(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            [3]
+        );
+        assert_eq!(typed(&mut app, KeyCode::Up, KeyModifiers::NONE), b"\x1b[A");
+        assert!(matches!(app.mode, Mode::Terminal { .. }));
+
+        // ctrl-] (read as ctrl-5 without the kitty protocol): back to the list.
+        let leave = key(KeyCode::Char('5'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            handle_key_event(leave, &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(matches!(
+            handle_key_event(
+                key(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut app,
+                &config
+            ),
+            Action::Quit
+        ));
+
+        // A click in the list gives it the keyboard back too.
+        handle_key_event(enter, &mut app, &config);
+        app.hits.list = ratatui::layout::Rect::new(0, 1, 40, 10);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 9,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(click, &mut app);
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // No agent: nothing to type into.
+        app.remove_agent("m-1");
+        app.remove_agent("m-2");
+        handle_key_event(enter, &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

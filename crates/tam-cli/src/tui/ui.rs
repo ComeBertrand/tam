@@ -51,7 +51,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_footer(frame, footer_area, app);
 
     // Overlay popups, over a dimmed dashboard
-    if !matches!(app.mode, Mode::Normal) {
+    if !matches!(app.mode, Mode::Normal | Mode::Terminal { .. }) {
         let dim = Style::reset().fg(theme::get().muted);
         // Not the footer: it has the dialog's keys.
         frame.buffer_mut().set_style(header_area.union(body), dim);
@@ -65,7 +65,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         answer::render(frame, dialog, stale);
     }
     match &app.mode {
-        Mode::Normal | Mode::NewTaskPickProject(_) | Mode::Answer(_) => {}
+        Mode::Normal | Mode::Terminal { .. } | Mode::NewTaskPickProject(_) | Mode::Answer(_) => {}
         Mode::Help => render_help_popup(frame, app),
         Mode::NewTaskEnterName { name, project_dirs } => {
             let joins = app.tasks.iter().any(|t| t.name == name.value());
@@ -273,6 +273,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(" any", Style::new().bold()),
                 Span::raw(":close"),
             ],
+            Mode::Terminal { .. } => vec![
+                Span::styled(" ctrl-]", Style::new().bold()),
+                Span::raw(":back to the list  "),
+                Span::raw("every other key goes to the agent"),
+            ],
             Mode::Answer(ref dialog) => {
                 let mut hints = vec![Span::raw(" ")];
                 for (key, what) in dialog.hints(app.answer_stale()) {
@@ -357,7 +362,8 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         hints.push(("a", "answer".into(), 0));
     }
     if has_agent {
-        hints.push(("enter", "attach".into(), 0));
+        hints.push(("enter", "type".into(), 0));
+        hints.push(("f", "full screen".into(), 3));
         hints.push(("s", "stop".into(), 1));
     } else if selected.is_some() {
         hints.push(("r", "run".into(), 0));
@@ -489,11 +495,22 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
         None => format!(" {label} "),
     };
     let t = theme::get();
+    // The pane has the keyboard: its border says so.
+    let typing = matches!(app.mode, Mode::Terminal { .. });
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(t.subtle))
+        .border_type(if typing {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(Style::new().fg(if typing { t.accent } else { t.subtle }))
         .title(Line::styled(title, Style::new().fg(t.accent).bold()));
+    if typing {
+        block = block.title_top(
+            Line::styled(" typing · ctrl-] back to the list ", t.chip(t.accent)).right_aligned(),
+        );
+    }
     // Not a request it waits on: its screen shows that one.
     let waiting = |state| matches!(state, AgentState::Blocked | AgentState::Question);
     if let Some((text, color)) = agent
@@ -523,13 +540,13 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if t.rainbow {
+    if t.rainbow && !typing {
         rainbow_border(frame, area);
     }
     peek.room = (inner.width, inner.height);
 
     let Some((task, member)) = focused.filter(|_| agent.is_none()) else {
-        render_screen(frame, inner, peek);
+        render_screen(frame, inner, peek, typing);
         return;
     };
     let view = triage::triage(
@@ -572,16 +589,23 @@ fn rainbow_border(frame: &mut Frame, area: Rect) {
 /// The agent's screen, as the daemon's terminal emulator has it: its live
 /// screen (the content's bottom when the area is shorter) or history, cut
 /// at the area's right edge.
-fn render_screen(frame: &mut Frame, area: Rect, peek: &mut Peek) {
+fn render_screen(frame: &mut Frame, area: Rect, peek: &mut Peek, typing: bool) {
     peek.height = area.height;
     let message = match (&peek.agent, &peek.screen, &peek.error) {
         (None, _, _) => "(no agent running)".to_string(),
         (Some(_), Some(screen), _) => {
+            let first = screen.first_row(peek.from, area.height);
             let view = ScreenView {
                 screen: screen.screen(),
-                first: screen.first_row(peek.from, area.height),
+                first,
             };
             frame.render_widget(view, area);
+            // The agent's cursor, where typing goes (on its live screen).
+            if let Some((row, col)) = screen.cursor().filter(|_| typing && peek.from.is_none()) {
+                if row >= first && row - first < area.height && col < area.width {
+                    frame.set_cursor_position((area.x + col, area.y + row - first));
+                }
+            }
             return;
         }
         (Some(_), None, Some(error)) => format!("(error: {error})"),
@@ -762,7 +786,8 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
             "Task",
             vec![
                 entry("j/k ↑/↓", "select"),
-                entry("enter", "attach (ctrl-] back)"),
+                entry("enter", "type (ctrl-] back)"),
+                entry("f", "full-screen terminal"),
                 entry("r", "run, resuming"),
                 entry("R", "run, new session"),
                 entry("s", "stop the agent"),
@@ -2331,7 +2356,7 @@ mod tests {
         show("help 80x24", &s);
         for text in [
             "Keys",
-            "attach (ctrl-] back)",
+            "type (ctrl-] back)",
             "by repo / attention",
             "Custom commands",
             "open in editor",
@@ -2346,7 +2371,7 @@ mod tests {
         // Narrow and short: one column, cut, but not garbled.
         let s = screen(&mut app, 50, 20);
         show("help 50x20", &s);
-        assert!(s.contains("attach (ctrl-] back)"), "{s}");
+        assert!(s.contains("type (ctrl-] back)"), "{s}");
     }
 
     /// The screen, and where the terminal's cursor is (when shown).
@@ -2487,6 +2512,9 @@ mod tests {
             vec![
                 Mode::Normal,
                 Mode::Help,
+                Mode::Terminal {
+                    agent: "m-5".into(),
+                },
                 Mode::NewTaskPickProject(PickerState::new(
                     "Pick project",
                     vec![item("api"), item("web")],
@@ -2539,7 +2567,7 @@ mod tests {
         }
         // The new-task name, longer than its popup: the end, where one types.
         let mut app = App::new();
-        app.mode = modes().swap_remove(3);
+        app.mode = modes().swap_remove(4);
         let s = screen(&mut app, 80, 24);
         show("long name", &s);
         assert!(s.contains("narrow-popup"), "{s}");

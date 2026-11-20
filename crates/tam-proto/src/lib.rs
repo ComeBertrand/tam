@@ -589,7 +589,10 @@ pub enum Request {
     /// is (keys as a terminal sends them). Replies `Ok`. For a while after,
     /// the screen this connection watches is reported sooner (typing shows
     /// at once).
-    Keys { id: String, data: String },
+    Keys {
+        id: String,
+        data: String,
+    },
     /// Send a message to a task member's agent. Replies `Sent`; pushes
     /// `MessageSent`, then `MessageDelivered` once the agent has it. A member
     /// with no running agent gets it when its next agent starts.

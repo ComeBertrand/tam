@@ -2344,7 +2344,10 @@ async fn keys_are_typed_into_the_agent_and_show_at_once() {
     }
     assert_eq!(shown, 20);
     // Far under the 100ms of an agent nobody types into (generous: CI).
-    assert!(slowest < std::time::Duration::from_millis(80), "{slowest:?}");
+    assert!(
+        slowest < std::time::Duration::from_millis(80),
+        "{slowest:?}"
+    );
 
     // More keys in one write, Enter among them.
     conn.request(&Request::Keys {

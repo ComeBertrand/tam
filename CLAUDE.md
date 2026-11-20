@@ -225,7 +225,21 @@ adopt). `tam-cli` depends on all three.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
 - **The pane** — always shown (`App::peek`, `ui::render_pane`): the screen
   of the focused member's agent, on the whole pane, and nothing said twice
-  (to answer or type, attach; `a` answers a request without attaching).
+  (`a` answers a request without attaching). `enter` gives the pane the
+  keyboard (`Mode::Terminal { agent }`, drawn as `Normal`): every key but
+  ctrl-] (`keys::is_leave`; crossterm reads it as ctrl-5) is encoded as a
+  terminal sends it (`tui/keys.rs`: `encode`, with the agent's cursor-key
+  mode; `paste`, with its bracketed-paste mode: both come with `Screen`,
+  whose contents end with `input_mode_formatted`) and typed with
+  `Request::Keys { id, data }`, one write per input batch (`type_keys`).
+  The daemon writes it to the PTY and, for 2s after, reports the screen
+  that connection watches every 15 ms instead of 100 (`ScreenWatch::
+  typing_until`): the daemon stays the only terminal emulator, and typing
+  echoes at once. The dashboard's terminal reports pastes as such only
+  meanwhile (`bracketed_paste`), the agent's cursor is shown, the border is
+  thick. The mode ends when the pane shows another agent or none, on a
+  click in the list, or when a write fails. `f` is the full-screen attach
+  (`Action::Attach`, a reserved key like `enter`'s others).
   Its bottom border keeps what the screen may no longer show: why the turn
   failed, what auto mode refused (`ui::agent_detail_line`, not a request it
   waits on), and how many messages wait for the agent. Without an agent

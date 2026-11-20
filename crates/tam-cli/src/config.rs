@@ -174,7 +174,7 @@ pub fn run_custom_command(
 }
 
 const RESERVED_KEYS: &[char] = &[
-    'q', 'j', 'k', 'h', 'l', 'n', 'r', 'R', 's', 'd', '/', 'g', 'G', 't', 'T', '?', 'a',
+    'q', 'j', 'k', 'h', 'l', 'n', 'r', 'R', 's', 'd', 'f', '/', 'g', 'G', 't', 'T', '?', 'a',
 ];
 
 fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {

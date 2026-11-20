@@ -65,6 +65,11 @@ pub enum Mode {
     Help,
     /// The request a member's agent waits on, to answer (`a`).
     Answer(AnswerDialog),
+    /// The pane has the keyboard: what is typed goes to this agent, until
+    /// ctrl-] (see `keys`). The dashboard is drawn as in `Normal`.
+    Terminal {
+        agent: String,
+    },
 }
 
 /// How the task list is ordered.

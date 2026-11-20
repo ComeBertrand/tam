@@ -92,7 +92,10 @@ impl Terminal {
         // The offset is shared by all readers: back to the live screen
         // before anyone else looks.
         screen.set_scrollback(back as usize);
-        let contents = screen.contents_formatted();
+        let mut contents = screen.contents_formatted();
+        // And how it wants its keys (cursor keys, pastes): a viewer that
+        // types into it encodes them so.
+        contents.push_str(&screen.input_mode_formatted());
         screen.set_scrollback(0);
         let (rows, cols) = screen.size();
         ScreenInfo {

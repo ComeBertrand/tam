@@ -25,14 +25,15 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tam_proto::ServerMessage;
 
+use crate::chat::{self as chats, Chat, Closes};
 use crate::client::{self, Client, DropOutcome};
-use crate::config::{self, Config};
+use crate::config::{self, CommandValues, Config, CustomCommand};
 use crate::repos;
-use crate::task::{Member, Task};
+use crate::task::Task;
 use tam_proto::SessionChoice;
 
 use self::answer::{AnswerDialog, Outcome};
-use self::app::{App, MemberChoice, Mode, PickerItem, PickerState, TaskDetail};
+use self::app::{App, Focused, MemberChoice, Mode, Pick, PickerItem, PickerState, TaskDetail};
 use self::input::TextInput;
 use self::peek::{Peek, Scroll};
 
@@ -42,10 +43,36 @@ enum Action {
     Quit,
     SelectNext,
     SelectPrev,
-    /// Attach to a member's agent (`id` is the member id).
+    /// Attach to a member's or chat's agent (`id`: the member's or chat's).
     Attach {
         id: String,
         label: String,
+    },
+    /// Start a chat's agent, in its session (resuming is never a step of
+    /// its own for a chat: the key that types or attaches does it), then
+    /// attach with `attach`, else type into it (the pane has the keyboard
+    /// already: see `App::starting`).
+    Resume {
+        id: String,
+        label: String,
+        attach: bool,
+    },
+    /// Close a chat.
+    CloseChat {
+        id: String,
+        label: String,
+    },
+    /// Keep a chat, or stop keeping it.
+    KeepChat {
+        id: String,
+        label: String,
+        keep: bool,
+    },
+    /// Name a chat (`None`: Claude's title again).
+    RenameChat {
+        id: String,
+        label: String,
+        name: Option<String>,
     },
     StopAgent {
         id: String,
@@ -70,10 +97,14 @@ enum Action {
         name: String,
         dirs: Vec<PathBuf>,
     },
+    /// A custom command, on the focused member or chat: `task` and `dir`
+    /// are its task's name and worktree, or the chat's label and main
+    /// checkout; `id` its agent's id.
     CustomCommand {
         name: String,
         command: String,
         task: String,
+        id: String,
         dir: PathBuf,
         provider: String,
     },
@@ -112,7 +143,7 @@ pub async fn run() -> Result<()> {
     // Subscribe before the snapshot: a change racing it is applied after.
     client.subscribe().await?;
 
-    let tasks = build_task_list(&mut client).await?;
+    let (tasks, chats) = build_lists(&mut client).await?;
 
     let mut stdout = std::io::stdout();
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
@@ -133,6 +164,8 @@ pub async fn run() -> Result<()> {
     theme::set(config.theme.as_deref(), config.animate);
     let mut app = App::new();
     app.commands = config.commands.clone();
+    // Chats first: the selection starts on the list's top entry.
+    app.set_chats(chats);
     app.set_tasks(tasks);
 
     let result = run_loop(&mut terminal, &mut app, &mut client, &config).await;
@@ -291,13 +324,7 @@ async fn run_loop(
     loop {
         app.sync_focus();
         // The pane keeps the keyboard only for the agent it took it for.
-        if let Mode::Terminal { agent } = &app.mode {
-            match app.peek_agent() {
-                Some(shown) if shown == *agent => {}
-                Some(_) => app.stop_typing("the pane shows another agent"),
-                None => app.stop_typing("the agent exited"),
-            }
-        }
+        app.check_typing();
         // Typing into it is looking at it: the daemon is told with the
         // watch (see `refresh_peek`).
         if app.peek.viewing != matches!(app.mode, Mode::Terminal { .. }) {
@@ -395,29 +422,33 @@ async fn run_loop(
                 Action::SelectNext => app.select_next(),
                 Action::SelectPrev => app.select_prev(),
                 Action::Attach { id, label } => {
-                    // Before the reader stops: no report may reach the agent.
-                    mouse_capture(false);
-                    bracketed_paste(false);
-                    keyboard_protocol(false);
-                    // The dashboard reads nothing while attached.
-                    unwatch_screen(client, app).await;
-                    input.pause().await;
-                    let provider = app
-                        .find_member(&id)
-                        .and_then(|(_, m)| m.agent_info.as_ref())
-                        .map(|a| a.provider.clone())
-                        .unwrap_or_default();
-                    let attached = attach_agent(terminal, app, &id, &label, &provider).await;
-                    mouse_capture(true);
-                    bracketed_paste(true);
-                    keyboard_protocol(true);
-                    input.resume();
-                    attached?;
-                    // Attached, the agent took the terminal's size.
-                    app.peek.asked = None;
+                    attach(terminal, app, client, &mut input, &id, &label).await?;
                     screen_moved = true;
                     // What came before attaching is not for the dashboard.
                     break;
+                }
+                Action::Resume {
+                    id,
+                    label,
+                    attach: full,
+                } => {
+                    if resume_chat(client, app, &id, &label).await && full {
+                        attach(terminal, app, client, &mut input, &id, &label).await?;
+                    }
+                    screen_moved = true;
+                    // The keys queued behind are not for the dashboard: for
+                    // the agent, or typed before a notice said why not.
+                    break;
+                }
+                Action::CloseChat { id, label } => {
+                    close_chat(client, app, &id, &label).await;
+                    screen_moved = true;
+                }
+                Action::KeepChat { id, label, keep } => {
+                    keep_chat(client, app, &id, &label, keep).await;
+                }
+                Action::RenameChat { id, label, name } => {
+                    rename_chat(client, app, &id, &label, name).await;
                 }
                 Action::StopAgent { id, label } => {
                     stop_agent(client, app, &id, &label).await?;
@@ -452,9 +483,18 @@ async fn run_loop(
                     name,
                     command,
                     task,
+                    id,
                     dir,
                     provider,
-                } => match config::run_custom_command(&command, &task, &dir, &provider) {
+                } => match config::run_custom_command(
+                    &command,
+                    &CommandValues {
+                        task: &task,
+                        id: &id,
+                        dir: &dir,
+                        provider: &provider,
+                    },
+                ) {
                     Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
                     Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
                 },
@@ -543,18 +583,23 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::NewTaskPickProject(_) => handle_picker_key(key, app, config),
         Mode::Answer(_) => handle_answer_key(key, app),
         Mode::Terminal { .. } => handle_terminal_key(key, app),
+        Mode::ConfirmCloseChat { .. } => handle_close_chat_key(key, app),
+        Mode::RenameChat { .. } => handle_rename_chat_key(key, app),
     }
 }
 
 /// A paste outside the pane: text for the prompt being typed in (the
-/// filter, the project picker, a task name, a path), its line ends and
+/// filter, the project picker, a task or chat name, a path), its line ends and
 /// other control characters left out. Anywhere else it is dropped: read as
 /// keys, it would run the dashboard's commands.
 fn paste_into_prompt(text: &str, app: &mut App, config: &Config) {
     let prompt = app.filter_active
         || matches!(
             app.mode,
-            Mode::NewTaskPickProject(_) | Mode::NewTaskEnterName { .. } | Mode::SpawnEnterPath(_)
+            Mode::NewTaskPickProject(_)
+                | Mode::NewTaskEnterName { .. }
+                | Mode::SpawnEnterPath(_)
+                | Mode::RenameChat { .. }
         );
     if !prompt {
         return;
@@ -583,6 +628,16 @@ fn handle_terminal_key(key: KeyEvent, app: &mut App) -> Action {
 fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
     // `gg`: only two `g` in a row.
     let after_g = std::mem::take(&mut app.pending_g);
+    // A key of the dashboard's that a custom command took is the command's.
+    if let (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) = (key.code, key.modifiers)
+    {
+        if let Some(cmd) = app.key_taken(c) {
+            return custom_command(app, cmd);
+        }
+    }
+    let chat = app
+        .selected_chat()
+        .map(|c| (c.info.clone(), c.agent.is_some()));
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::Quit,
         // Vim's scroll keys, before the letters' own keys (ctrl-d is not drop).
@@ -590,30 +645,33 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('d' | 'f'), KeyModifiers::CONTROL) => Action::ScrollPeek(Scroll::PageDown),
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
-        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => match selected_member(app) {
-            Some((task, member)) if member.agent_info.is_some() => Action::Attach {
-                id: member.id().to_string(),
-                label: task.member_label(member),
-            },
-            _ => Action::None,
-        },
-        (KeyCode::Enter, _) => match selected_member(app) {
+        // The agent's terminal on the whole screen; a chat's agent started
+        // first. (shift-enter where the terminal tells it from enter: see
+        // `keyboard_protocol`.)
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => full_screen(app),
+        (KeyCode::Char('f'), _) => full_screen(app),
+        (KeyCode::Enter, _) => match app.focused() {
             // The pane takes the keyboard.
-            Some((_, member)) if member.agent_info.is_some() => {
+            Some(focused) if focused.agent().is_some() => {
                 app.mode = Mode::Terminal {
-                    agent: member.id().to_string(),
+                    agent: focused.id().to_string(),
                 };
                 Action::None
             }
-            _ => Action::None,
-        },
-        // The agent's terminal on the whole screen. (shift-enter where the
-        // terminal tells it from enter: see `keyboard_protocol`.)
-        (KeyCode::Char('f'), _) => match selected_member(app) {
-            Some((task, member)) if member.agent_info.is_some() => Action::Attach {
-                id: member.id().to_string(),
-                label: task.member_label(member),
-            },
+            // A chat's agent is started for it (see `App::starting`).
+            Some(Focused::Chat(chat)) => {
+                let (id, label) = (chat.info.id.clone(), chat.info.label());
+                app.mode = Mode::Terminal { agent: id.clone() };
+                if app.starting.as_ref() == Some(&id) {
+                    return Action::None;
+                }
+                app.starting = Some(id.clone());
+                Action::Resume {
+                    id,
+                    label,
+                    attach: false,
+                }
+            }
             _ => Action::None,
         },
         (KeyCode::Char('/'), _) => {
@@ -621,6 +679,14 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             Action::None
         }
         (KeyCode::Char('n'), _) => Action::NewTask,
+        // A chat is its session: enter resumes it.
+        (KeyCode::Char('r' | 'R'), _) if chat.as_ref().is_some_and(|(_, running)| !running) => {
+            app.set_status(
+                "A chat resumes when you type in it: enter".into(),
+                Duration::from_secs(3),
+            );
+            Action::None
+        }
         (KeyCode::Char('r'), _) => match selected_member(app) {
             Some((_, member)) if member.agent_info.is_none() => Action::RunAgent {
                 member: member.id().to_string(),
@@ -633,10 +699,10 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             },
             _ => Action::None,
         },
-        (KeyCode::Char('s'), _) => match selected_member(app) {
-            Some((task, member)) if member.agent_info.is_some() => Action::StopAgent {
-                id: member.id().to_string(),
-                label: task.member_label(member),
+        (KeyCode::Char('s'), _) => match app.focused() {
+            Some(focused) if focused.agent().is_some() => Action::StopAgent {
+                id: focused.id().to_string(),
+                label: focused.label(),
             },
             _ => Action::None,
         },
@@ -674,6 +740,34 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             app.cycle_member(-1);
             Action::None
         }
+        // A chat: close it, once confirmed.
+        (KeyCode::Char('d'), _) if chat.is_some() => {
+            let (info, _) = chat.expect("a chat");
+            app.mode = Mode::ConfirmCloseChat {
+                label: info.label(),
+                id: info.id,
+            };
+            Action::None
+        }
+        (KeyCode::Char('p'), _) => match chat {
+            Some((info, _)) => Action::KeepChat {
+                label: info.label(),
+                keep: !info.keep,
+                id: info.id,
+            },
+            None => Action::None,
+        },
+        (KeyCode::Char('N'), _) => {
+            if let Some((info, _)) = chat {
+                app.mode = Mode::RenameChat {
+                    label: info.label(),
+                    name: TextInput::from(info.name.as_deref().unwrap_or("")),
+                    title: info.title,
+                    id: info.id,
+                };
+            }
+            Action::None
+        }
         // A gone worktree: recreate it, or drop the task.
         (KeyCode::Char('d'), _)
             if app
@@ -694,34 +788,91 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             }
             Action::None
         }
-        (KeyCode::Char(c), _) => {
-            if let Some(cmd) = config.commands.iter().find(|cmd| cmd.key_char() == c) {
-                if let Some((task, member)) = selected_member(app) {
-                    let provider = member
-                        .agent_info
-                        .as_ref()
-                        .map(|a| a.provider.clone())
-                        .unwrap_or_default();
-                    Action::CustomCommand {
-                        name: cmd.name.clone(),
-                        command: cmd.command.clone(),
-                        task: task.name.clone(),
-                        dir: member.info.dir.clone(),
-                        provider,
-                    }
-                } else {
-                    Action::None
-                }
-            } else {
-                Action::None
-            }
-        }
+        (KeyCode::Char(c), _) => match config.commands.iter().find(|cmd| cmd.key_char() == c) {
+            Some(cmd) => custom_command(app, cmd),
+            None => Action::None,
+        },
         (KeyCode::PageUp, _) => Action::ScrollPeek(Scroll::PageUp),
         (KeyCode::PageDown, _) => Action::ScrollPeek(Scroll::PageDown),
         (KeyCode::Home, _) => Action::ScrollPeek(Scroll::Oldest),
         (KeyCode::End, _) => Action::ScrollPeek(Scroll::Live),
         _ => Action::None,
     }
+}
+
+/// `f` (or shift-enter): attach to the focused agent on the whole screen,
+/// starting a chat's first.
+fn full_screen(app: &App) -> Action {
+    match app.focused() {
+        Some(focused) if focused.agent().is_some() => Action::Attach {
+            id: focused.id().to_string(),
+            label: focused.label(),
+        },
+        Some(Focused::Chat(chat)) => Action::Resume {
+            id: chat.info.id.clone(),
+            label: chat.info.label(),
+            attach: true,
+        },
+        _ => Action::None,
+    }
+}
+
+/// A custom command on the focused member or chat (nothing without one).
+fn custom_command(app: &App, cmd: &CustomCommand) -> Action {
+    let Some(focused) = app.focused() else {
+        return Action::None;
+    };
+    let (task, dir) = focused.task_and_dir();
+    Action::CustomCommand {
+        name: cmd.name.clone(),
+        command: cmd.command.clone(),
+        task,
+        id: focused.id().to_string(),
+        dir: dir.to_path_buf(),
+        provider: focused
+            .agent()
+            .map(|a| a.provider.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// `y`/enter: close the chat; anything else cancels.
+fn handle_close_chat_key(key: KeyEvent, app: &mut App) -> Action {
+    let Mode::ConfirmCloseChat { id, label } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return Action::None;
+    };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => Action::CloseChat { id, label },
+        _ => Action::None,
+    }
+}
+
+/// The chat's name: enter names it (empty: Claude's title again), esc
+/// cancels.
+fn handle_rename_chat_key(key: KeyEvent, app: &mut App) -> Action {
+    let Mode::RenameChat { name, .. } = &mut app.mode else {
+        return Action::None;
+    };
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Enter => {
+            let typed = name.value().trim().to_string();
+            let Mode::RenameChat { id, label, .. } = std::mem::replace(&mut app.mode, Mode::Normal)
+            else {
+                unreachable!("renaming a chat");
+            };
+            return Action::RenameChat {
+                id,
+                label,
+                name: (!typed.is_empty()).then_some(typed),
+            };
+        }
+        _ => {
+            name.handle(key);
+        }
+    }
+    Action::None
 }
 
 fn handle_filter_key(key: KeyEvent, app: &mut App) -> Action {
@@ -988,8 +1139,8 @@ fn handle_repair_or_drop_key(key: KeyEvent, app: &mut App) -> Action {
 }
 
 /// The selected task and the member actions apply to: the one the detail
-/// pane shows.
-fn selected_member(app: &App) -> Option<(&Task, &Member)> {
+/// pane shows (`None` on a chat).
+fn selected_member(app: &App) -> Option<(&Task, &crate::task::Member)> {
     app.focused_member()
 }
 
@@ -997,11 +1148,11 @@ fn selected_member(app: &App) -> Option<(&Task, &Member)> {
 /// shown now (the dialog keeps it: the one it answers), or why there is
 /// none to answer from here.
 fn open_answer(app: &mut App) {
-    let Some((task, member)) = selected_member(app) else {
+    let Some(focused) = app.focused() else {
         return;
     };
-    let label = task.member_label(member);
-    let why = match &member.agent_info {
+    let label = focused.label();
+    let why = match focused.agent() {
         Some(agent) => match &agent.detail.ask {
             Some(ask) => {
                 let dialog = AnswerDialog::new(agent.id.clone(), label, ask.clone());
@@ -1209,21 +1360,21 @@ async fn fit_agent(client: &mut Client, app: &mut App) {
         .await;
 }
 
-/// Fetch the selected task's runs and messages for the detail pane (it
-/// follows the daemon's events from then on).
+/// Fetch the selected task's (or chat's) runs and messages for the detail
+/// pane (it follows the daemon's events from then on).
 async fn refresh_detail(client: &mut Client, app: &mut App) {
-    let Some(name) = app.selected_task().map(|t| t.name.clone()) else {
+    let Some(pick) = app.pick() else {
         app.detail = None;
         return;
     };
     // Shown without them when they cannot be had: no retry until it changes.
-    let runs = match client.get_task(&name).await {
-        Ok((_, runs)) => runs,
-        Err(_) => Vec::new(),
+    let (runs, of) = match &pick {
+        Pick::Task(name) => (client.get_task(name).await.map(|(_, runs)| runs), name),
+        Pick::Chat(id) => (client.get_chat(id).await.map(|(_, runs)| runs), id),
     };
     let messages = match client
         .send(tam_proto::Request::ListMessages {
-            task: Some(name.clone()),
+            task: Some(of.clone()),
         })
         .await
     {
@@ -1231,10 +1382,9 @@ async fn refresh_detail(client: &mut Client, app: &mut App) {
         _ => Vec::new(),
     };
     app.detail = Some(TaskDetail {
-        task: name,
-        runs,
+        runs: runs.unwrap_or_default(),
         messages,
-        stale: false,
+        ..TaskDetail::of(pick)
     });
 }
 
@@ -1314,6 +1464,140 @@ async fn do_new_task(
         );
     }
     Ok(())
+}
+
+/// Attach to the agent `id` on the whole screen (named `label` in its status
+/// bar), the dashboard reading nothing meanwhile.
+async fn attach(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    client: &mut Client,
+    input: &mut InputReader,
+    id: &str,
+    label: &str,
+) -> Result<()> {
+    // Before the reader stops: no report may reach the agent.
+    mouse_capture(false);
+    bracketed_paste(false);
+    keyboard_protocol(false);
+    // The dashboard reads nothing while attached.
+    unwatch_screen(client, app).await;
+    input.pause().await;
+    // An agent just started may not be in the list yet: it is Claude.
+    let provider = app
+        .find_agent(id)
+        .map_or_else(|| "claude".to_string(), |a| a.provider.clone());
+    let attached = attach_agent(terminal, app, id, label, &provider).await;
+    mouse_capture(true);
+    bracketed_paste(true);
+    keyboard_protocol(true);
+    input.resume();
+    attached?;
+    // Attached, the agent took the terminal's size.
+    app.peek.asked = None;
+    Ok(())
+}
+
+/// Start a chat's agent in its session. `false` when it did not start: a
+/// notice says why (with the way out when its session is gone), and the
+/// pane gives the keyboard back.
+async fn resume_chat(client: &mut Client, app: &mut App, id: &str, label: &str) -> bool {
+    match client
+        .run_agent(id, SessionChoice::Current, None, vec![])
+        .await
+    {
+        Ok((_, Some(_))) => {
+            app.set_status(format!("Resumed '{label}'"), Duration::from_secs(3));
+            true
+        }
+        Ok((_, None)) => {
+            app.set_status(
+                format!("Started a new session in '{label}'"),
+                Duration::from_secs(3),
+            );
+            true
+        }
+        Err(e) => {
+            if app.starting.as_deref() == Some(id) {
+                app.starting = None;
+            }
+            let lines = match chats::session_gone(&e) {
+                Some(why) => vec![
+                    format!("{why}."),
+                    "A chat is its session: d closes this one.".into(),
+                ],
+                None => format!("{e:#}").lines().map(str::to_string).collect(),
+            };
+            app.mode = Mode::Notice {
+                title: "Resume Failed".into(),
+                lines,
+            };
+            false
+        }
+    }
+}
+
+/// Close a chat (the daemon stops its agent); the list follows its events.
+async fn close_chat(client: &mut Client, app: &mut App, id: &str, label: &str) {
+    match client.close_chat(id).await {
+        Ok(_) => app.set_status(format!("Closed '{label}'"), Duration::from_secs(4)),
+        Err(e) => {
+            app.mode = Mode::Notice {
+                title: "Close Failed".into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
+        }
+    }
+}
+
+/// Keep a chat, or stop keeping it: the status line says when it closes
+/// then.
+async fn keep_chat(client: &mut Client, app: &mut App, id: &str, label: &str, keep: bool) {
+    let chat = match client.keep_chat(id, keep).await {
+        Ok(chat) => chat,
+        Err(e) => {
+            app.set_status(format!("Error: {e:#}"), Duration::from_secs(5));
+            return;
+        }
+    };
+    let what = match Closes::of(&chat, crate::task::now()) {
+        Closes::Kept => format!("Kept '{label}': never closed for want of turns"),
+        Closes::Off => format!("'{label}' is no longer kept (autoclean is off)"),
+        Closes::Due => format!("'{label}' is no longer kept: closes when idle"),
+        Closes::In(left) => format!(
+            "'{label}' is no longer kept: closes in {}",
+            chats::time_left(left)
+        ),
+    };
+    app.upsert_chat(chat);
+    app.set_status(what, Duration::from_secs(4));
+}
+
+/// Name a chat (`None`: Claude's title again); a refusal (a name taken by
+/// another chat or a task) opens a notice.
+async fn rename_chat(
+    client: &mut Client,
+    app: &mut App,
+    id: &str,
+    label: &str,
+    name: Option<String>,
+) {
+    match client.rename_chat(id, name.as_deref()).await {
+        Ok(chat) => {
+            let what = match &name {
+                Some(name) => format!("Renamed '{label}' to '{name}'"),
+                None => format!("'{label}' is unnamed: it shows '{}'", chat.label()),
+            };
+            app.upsert_chat(chat);
+            app.set_status(what, Duration::from_secs(4));
+        }
+        Err(e) => {
+            app.mode = Mode::Notice {
+                title: "Rename Refused".into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
+        }
+    }
 }
 
 /// Start a member's agent in the chosen session; the daemon resolves the
@@ -1580,22 +1864,31 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
             );
             app.note_message(message);
         }
-        // The dashboard does not show chats yet.
-        tam_proto::Event::ChatCreated { .. }
-        | tam_proto::Event::ChatUpdated { .. }
-        | tam_proto::Event::ChatClosed { .. } => {}
+        tam_proto::Event::ChatCreated { chat } | tam_proto::Event::ChatUpdated { chat } => {
+            app.upsert_chat(chat);
+        }
+        tam_proto::Event::ChatClosed { id } => {
+            app.remove_chat(&id);
+        }
     }
 }
 
-async fn build_task_list(client: &mut Client) -> Result<Vec<Task>> {
+/// The tasks and the chats, with their running agents.
+async fn build_lists(client: &mut Client) -> Result<(Vec<Task>, Vec<Chat>)> {
     // Fresh worktree health; the daemon pushes its changes from then on.
     let infos = client.reconcile().await?;
+    let chats = client.list_chats().await?;
     let agents = client.list_agents().await.unwrap_or_default();
 
-    Ok(infos
+    let tasks = infos
         .into_iter()
         .map(|info| Task::from_info(info, &agents))
-        .collect())
+        .collect();
+    let chats = chats
+        .into_iter()
+        .map(|info| Chat::new(info, &agents))
+        .collect();
+    Ok((tasks, chats))
 }
 
 /// Recreate the task's gone worktrees that can be (running the project's
@@ -2258,6 +2551,473 @@ mod tests {
         }
     }
 
+    // -- Chats --------------------------------------------------------------
+
+    fn chat_info(id: &str, title: &str) -> tam_proto::ChatInfo {
+        tam_proto::ChatInfo {
+            id: id.into(),
+            name: None,
+            repo: "api".into(),
+            dir: PathBuf::from("/src/api"),
+            created_at: task::now() - 3600,
+            keep: false,
+            session: Some(format!("s-{id}")),
+            last_turn_at: None,
+            closes_at: Some(task::now() + 3 * 86400),
+            run_count: 1,
+            title: Some(title.into()),
+            last_prompt: None,
+        }
+    }
+
+    fn agent_info(id: &str, state: tam_proto::AgentState) -> tam_proto::AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "provider": "claude", "dir": "/src/api", "state": state,
+            "pid": 1, "uptime_secs": 1,
+        }))
+        .unwrap()
+    }
+
+    /// Tasks `feat` (two members, `m-1` working) and `other`, and chats
+    /// `c-1` (its agent ready) and `c-2` (none), the first chat selected.
+    fn chat_app() -> App {
+        use tam_proto::AgentState::{Ready, Working};
+        let mut app = two_member_app(&[("m-1", Working)]);
+        app.set_chats(vec![
+            Chat::new(
+                chat_info("c-1", "Running chat"),
+                &[agent_info("c-1", Ready)],
+            ),
+            Chat::new(chat_info("c-2", "Idle chat"), &[]),
+        ]);
+        app.selected = 0;
+        app.sync_focus();
+        app
+    }
+
+    fn selected(app: &App) -> Option<Pick> {
+        app.pick()
+    }
+
+    fn select(app: &mut App, pick: Pick) {
+        app.selected = app
+            .visible_entries()
+            .iter()
+            .position(|e| e.pick() == pick)
+            .unwrap();
+        app.sync_focus();
+    }
+
+    #[test]
+    fn the_selection_goes_from_the_chats_to_the_tasks() {
+        let config = Config::default();
+        let mut app = chat_app();
+        assert_eq!(selected(&app), Some(Pick::Chat("c-1".into())));
+        app.select_next();
+        assert_eq!(selected(&app), Some(Pick::Chat("c-2".into())));
+        app.select_next();
+        assert_eq!(selected(&app), Some(Pick::Task("feat".into())));
+        assert_eq!(app.focused().map(|f| f.id()), Some("m-1"));
+        app.select_prev();
+        assert!(app.focused_member().is_none(), "a chat has no member");
+        handle_key_event(press('G'), &mut app, &config);
+        assert_eq!(selected(&app), Some(Pick::Task("other".into())));
+        handle_key_event(press('g'), &mut app, &config);
+        handle_key_event(press('g'), &mut app, &config);
+        assert_eq!(selected(&app), Some(Pick::Chat("c-1".into())));
+
+        // A click on a chat's row.
+        app.hits.list = ratatui::layout::Rect::new(0, 1, 40, 10);
+        app.hits.rows = vec![
+            None,
+            Some((0, None)),
+            Some((1, None)),
+            None,
+            Some((2, None)),
+        ];
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(click(3), &mut app);
+        assert_eq!(selected(&app), Some(Pick::Chat("c-2".into())));
+        handle_mouse(click(5), &mut app);
+        assert_eq!(selected(&app), Some(Pick::Task("feat".into())));
+
+        // A new dashboard starts on the top entry: the first chat.
+        let mut fresh = App::new();
+        fresh.set_chats(app.chats.clone());
+        fresh.set_tasks(app.tasks.clone());
+        assert_eq!(selected(&fresh), Some(Pick::Chat("c-1".into())));
+    }
+
+    #[test]
+    fn enter_types_into_a_chat_resuming_it_first() {
+        use tam_proto::AgentState::Working;
+        let config = Config::default();
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        let leave = key(KeyCode::Char('5'), KeyModifiers::CONTROL);
+        let mut app = chat_app();
+
+        // Its agent runs: the pane takes the keyboard.
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "c-1"));
+        app.check_typing();
+        assert!(matches!(app.mode, Mode::Terminal { .. }));
+        handle_key_event(leave, &mut app, &config);
+
+        // None runs: started, the pane taking the keyboard at once, kept
+        // while its agent is on its way.
+        app.select_next();
+        match handle_key_event(enter, &mut app, &config) {
+            Action::Resume { id, label, attach } => {
+                assert_eq!((id.as_str(), label.as_str()), ("c-2", "Idle chat"));
+                assert!(!attach);
+            }
+            _ => panic!("not resumed"),
+        }
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "c-2"));
+        assert_eq!(app.starting.as_deref(), Some("c-2"));
+        app.check_typing();
+        assert!(matches!(app.mode, Mode::Terminal { .. }));
+        // It shows up: typing goes on.
+        apply_event(
+            &mut app,
+            tam_proto::Event::AgentSpawned {
+                id: "c-2".into(),
+                info: agent_info("c-2", Working),
+            },
+        );
+        assert_eq!(app.starting, None);
+        app.check_typing();
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "c-2"));
+        // It exits: back to the list.
+        apply_event(
+            &mut app,
+            tam_proto::Event::AgentExited {
+                id: "c-2".into(),
+                exit_code: 0,
+            },
+        );
+        app.check_typing();
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // Not starting, or starting for a chat the pane no longer shows:
+        // the keyboard goes back.
+        app.dropping_keys_until = None;
+        app.mode = Mode::Terminal {
+            agent: "c-2".into(),
+        };
+        app.check_typing();
+        assert!(matches!(app.mode, Mode::Normal));
+        app.mode = Mode::Terminal {
+            agent: "c-2".into(),
+        };
+        app.starting = Some("c-2".into());
+        app.select_next();
+        app.sync_focus();
+        app.check_typing();
+        assert!(matches!(app.mode, Mode::Normal));
+        app.select_prev();
+        app.starting = None;
+        app.dropping_keys_until = None;
+
+        // `f` and shift-enter start it too, then attach; on a running one
+        // they attach.
+        for key in [press('f'), key(KeyCode::Enter, KeyModifiers::SHIFT)] {
+            assert!(matches!(
+                handle_key_event(key, &mut app, &config),
+                Action::Resume { id, attach: true, .. } if id == "c-2"
+            ));
+        }
+        app.select_prev();
+        assert!(matches!(
+            handle_key_event(press('f'), &mut app, &config),
+            Action::Attach { id, .. } if id == "c-1"
+        ));
+        app.select_next();
+
+        // A chat is its session: `r` and `R` say enter resumes it, and
+        // never start another session.
+        for c in ['r', 'R'] {
+            assert!(matches!(
+                handle_key_event(press(c), &mut app, &config),
+                Action::None
+            ));
+            let status = app.status_message().unwrap().to_string();
+            assert!(status.contains("enter"), "{status}");
+        }
+    }
+
+    #[test]
+    fn d_closes_a_chat_once_confirmed_p_keeps_it_and_n_names_it() {
+        let config = Config::default();
+        let mut app = chat_app();
+        app.select_next();
+
+        handle_key_event(press('d'), &mut app, &config);
+        assert!(matches!(
+            &app.mode,
+            Mode::ConfirmCloseChat { id, label } if id == "c-2" && label == "Idle chat"
+        ));
+        assert!(matches!(
+            handle_key_event(press('n'), &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        for confirm in [
+            press('y'),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            handle_key_event(press('d'), &mut app, &config);
+            assert!(matches!(
+                handle_key_event(confirm, &mut app, &config),
+                Action::CloseChat { id, .. } if id == "c-2"
+            ));
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+
+        // Keep, then stop keeping.
+        assert!(matches!(
+            handle_key_event(press('p'), &mut app, &config),
+            Action::KeepChat { id, keep: true, .. } if id == "c-2"
+        ));
+        let mut kept = chat_info("c-2", "Idle chat");
+        kept.keep = true;
+        app.upsert_chat(kept);
+        assert!(matches!(
+            handle_key_event(press('p'), &mut app, &config),
+            Action::KeepChat { keep: false, .. }
+        ));
+
+        // Name it; empty, Claude's title again.
+        handle_key_event(press('N'), &mut app, &config);
+        let Mode::RenameChat { name, title, .. } = &app.mode else {
+            panic!("no rename");
+        };
+        assert!(name.is_empty());
+        assert_eq!(title.as_deref(), Some("Idle chat"));
+        for c in "  deploy ".chars() {
+            handle_key_event(press(c), &mut app, &config);
+        }
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::RenameChat { id, name: Some(name), .. } if id == "c-2" && name == "deploy"
+        ));
+        let mut named = chat_info("c-2", "Idle chat");
+        named.name = Some("deploy".into());
+        app.upsert_chat(named);
+        handle_key_event(press('N'), &mut app, &config);
+        assert!(matches!(&app.mode, Mode::RenameChat { name, .. } if name.value() == "deploy"));
+        let erase = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        handle_key_event(erase, &mut app, &config);
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::RenameChat { name: None, .. }
+        ));
+        handle_key_event(press('N'), &mut app, &config);
+        handle_key_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app,
+            &config,
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+        // A paste goes into the name.
+        handle_key_event(press('N'), &mut app, &config);
+        paste_into_prompt("-v2\n", &mut app, &config);
+        assert!(matches!(&app.mode, Mode::RenameChat { name, .. } if name.value() == "deploy-v2"));
+        app.mode = Mode::Normal;
+
+        // On a task: `p` and `N` do nothing, `d` drops.
+        app.select_next();
+        assert!(matches!(
+            handle_key_event(press('p'), &mut app, &config),
+            Action::None
+        ));
+        handle_key_event(press('N'), &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+        handle_key_event(press('d'), &mut app, &config);
+        assert!(matches!(app.mode, Mode::ConfirmDropTask { .. }));
+    }
+
+    #[test]
+    fn custom_commands_on_a_chat_and_the_keys_they_took() {
+        let mut app = chat_app();
+        let command = |key: &str| CustomCommand {
+            name: format!("cmd {key}"),
+            key: key.into(),
+            command: "true".into(),
+        };
+        let config = Config {
+            commands: vec![command("o"), command("p")],
+            ..Config::default()
+        };
+        app.commands = config.commands.clone();
+        let run = |app: &mut App, c| match handle_key_event(press(c), app, &config) {
+            Action::CustomCommand {
+                name,
+                task,
+                id,
+                dir,
+                ..
+            } => (name, task, id, dir),
+            _ => panic!("no command"),
+        };
+        // `{task}` is the chat's label, `{id}` its id, `{dir}` its main
+        // checkout.
+        assert_eq!(
+            run(&mut app, 'o'),
+            (
+                "cmd o".into(),
+                "Running chat".into(),
+                "c-1".into(),
+                PathBuf::from("/src/api")
+            )
+        );
+        // `p` is the custom command's, also on a chat.
+        assert_eq!(run(&mut app, 'p').0, "cmd p");
+        // On a task: its name, the member's id and worktree.
+        select(&mut app, Pick::Task("feat".into()));
+        assert_eq!(
+            run(&mut app, 'o'),
+            (
+                "cmd o".into(),
+                "feat".into(),
+                "m-1".into(),
+                PathBuf::from("/w/app--feat")
+            )
+        );
+    }
+
+    #[test]
+    fn a_chat_s_request_is_answered_and_its_events_followed() {
+        use tam_proto::AgentState::{Blocked, Question, Ready};
+        let config = Config::default();
+        let mut app = chat_app();
+        let mut info = agent_info("c-1", Blocked);
+        info.detail.ask = Some(bash_ask("ask-9"));
+        apply_event(
+            &mut app,
+            tam_proto::Event::AgentUpdated {
+                id: "c-1".into(),
+                info,
+            },
+        );
+        handle_key_event(press('a'), &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Answer(d) if d.agent == "c-1"));
+        assert!(!app.answer_stale());
+        draw(&mut app, 100, 30);
+        assert!(matches!(
+            handle_key_event(press('y'), &mut app, &config),
+            Action::Answer { agent, ask, label, .. }
+                if agent == "c-1" && ask == "ask-9" && label == "Running chat"
+        ));
+        assert!(matches!(
+            handle_key_event(press('s'), &mut app, &config),
+            Action::StopAgent { id, .. } if id == "c-1"
+        ));
+
+        // The header's count and the spinner take chats.
+        assert_eq!(app.needs_attention_count(), 1);
+        apply_event(
+            &mut app,
+            tam_proto::Event::StateChange {
+                id: "c-1".into(),
+                old: Blocked,
+                new: Ready,
+            },
+        );
+        apply_event(
+            &mut app,
+            tam_proto::Event::ContextUpdate {
+                id: "c-1".into(),
+                context_percent: 42,
+            },
+        );
+        let agent = app.chats[0].agent.as_ref().unwrap();
+        assert_eq!((agent.state, agent.context_percent), (Ready, Some(42)));
+
+        // Attention first, the selection follows its chat as it moves.
+        select(&mut app, Pick::Chat("c-2".into()));
+        app.toggle_order();
+        assert_eq!(selected(&app), Some(Pick::Chat("c-2".into())));
+        apply_event(
+            &mut app,
+            tam_proto::Event::AgentSpawned {
+                id: "c-2".into(),
+                info: agent_info("c-2", Question),
+            },
+        );
+        assert_eq!(app.selected, 0, "the most urgent: {:?}", app.pick());
+        assert_eq!(selected(&app), Some(Pick::Chat("c-2".into())));
+        app.toggle_order();
+
+        // Made, renamed (its agent kept), closed.
+        let mut made = chat_info("c-3", "Made elsewhere");
+        apply_event(
+            &mut app,
+            tam_proto::Event::ChatCreated { chat: made.clone() },
+        );
+        let ids: Vec<&str> = app.chats.iter().map(|c| c.info.id.as_str()).collect();
+        assert_eq!(ids, ["c-1", "c-2", "c-3"], "creation order");
+        let mut renamed = chat_info("c-1", "Running chat");
+        renamed.name = Some("release".into());
+        apply_event(&mut app, tam_proto::Event::ChatUpdated { chat: renamed });
+        assert_eq!(app.chats[0].info.label(), "release");
+        assert!(app.chats[0].agent.is_some());
+        made.keep = true;
+        apply_event(&mut app, tam_proto::Event::ChatUpdated { chat: made });
+        assert!(app.chats[2].info.keep);
+        assert_eq!(selected(&app), Some(Pick::Chat("c-2".into())));
+        apply_event(&mut app, tam_proto::Event::ChatClosed { id: "c-2".into() });
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(selected(&app), Some(Pick::Chat("c-3".into())));
+    }
+
+    #[test]
+    fn the_pane_keeps_a_chat_s_runs_and_messages() {
+        let mut app = chat_app();
+        assert!(app.detail_stale());
+        app.detail = Some(TaskDetail::of(Pick::Chat("c-1".into())));
+        assert!(!app.detail_stale());
+        let message = |id: &str, to: &str| tam_proto::MessageInfo {
+            id: id.into(),
+            from: Some("m-1".into()),
+            from_label: "feat/app".into(),
+            to: to.into(),
+            to_label: to.into(),
+            text: "hello".into(),
+            hop: 0,
+            reply_to: None,
+            sent_at: task::now(),
+            delivered_at: None,
+        };
+        app.note_message(message("msg-1", "c-1"));
+        app.note_message(message("msg-2", "c-2"));
+        let ids: Vec<&str> = app
+            .detail
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ids, ["msg-1"]);
+        // A run started or ended: fetched again.
+        app.upsert_chat(chat_info("c-1", "Running chat"));
+        assert!(app.detail_stale());
+        app.select_next();
+        app.detail = Some(TaskDetail::of(Pick::Chat("c-1".into())));
+        assert!(app.detail_stale(), "another chat shown");
+    }
+
     #[test]
     fn a_answers_the_request_it_opened_on_and_nothing_else() {
         use tam_proto::AgentState::{Blocked, Working};
@@ -2368,10 +3128,7 @@ mod tests {
         let mut app = two_member_app(&[]);
         app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
         assert!(app.detail_stale());
-        app.detail = Some(TaskDetail {
-            task: "feat".into(),
-            ..Default::default()
-        });
+        app.detail = Some(TaskDetail::of(Pick::Task("feat".into())));
         assert!(!app.detail_stale());
 
         let message = |id: &str, from: Option<&str>, to: &str| tam_proto::MessageInfo {

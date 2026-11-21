@@ -4,10 +4,11 @@ use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 
-use tam_proto::{AgentInfo, MessageInfo, RunInfo, TaskInfo};
+use tam_proto::{AgentInfo, ChatInfo, MessageInfo, RunInfo, TaskInfo};
 
+use crate::chat::Chat;
 use crate::config::CustomCommand;
-use crate::task::{Member, Task};
+use crate::task::{Member, Task, TaskStatus};
 
 use ratatui::layout::Rect;
 
@@ -70,6 +71,18 @@ pub enum Mode {
     Terminal {
         agent: String,
     },
+    /// Asks to close a chat.
+    ConfirmCloseChat {
+        id: String,
+        label: String,
+    },
+    /// A chat's name; empty: Claude's title (`title`) again.
+    RenameChat {
+        id: String,
+        label: String,
+        title: Option<String>,
+        name: TextInput,
+    },
 }
 
 /// How the task list is ordered.
@@ -86,6 +99,10 @@ pub enum Order {
 /// A row of the task list.
 #[derive(Debug, Clone, Copy)]
 pub enum Row<'a> {
+    /// The header of the chats' section.
+    Chats,
+    /// A chat. Selected like a task.
+    Chat(&'a Chat),
     /// The repositories of the tasks below it.
     Group(&'a Task),
     /// A task: the row of its only member, or the head of its members'
@@ -97,6 +114,100 @@ pub enum Row<'a> {
         member: &'a Member,
         last: bool,
     },
+}
+
+/// What the list shows and the selection lands on: a chat or a task.
+#[derive(Debug, Clone, Copy)]
+pub enum Entry<'a> {
+    Chat(&'a Chat),
+    Task(&'a Task),
+}
+
+impl Entry<'_> {
+    /// Which entry it is, to find it again (a chat by id, a task by name:
+    /// never by label, which changes).
+    pub fn pick(&self) -> Pick {
+        match self {
+            Entry::Chat(chat) => Pick::Chat(chat.info.id.clone()),
+            Entry::Task(task) => Pick::Task(task.name.clone()),
+        }
+    }
+
+    pub fn status(&self) -> TaskStatus {
+        match self {
+            Entry::Chat(chat) => chat.status(),
+            Entry::Task(task) => task.status(),
+        }
+    }
+
+    /// Where attention order puts it: the most urgent first, then by name.
+    fn urgency(&self) -> (u8, String) {
+        let name = match self {
+            Entry::Chat(chat) => chat.info.label(),
+            Entry::Task(task) => task.name.clone(),
+        };
+        (self.status().sort_priority(), name.to_lowercase())
+    }
+}
+
+/// An entry of the list, to find it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// A chat, by id.
+    Chat(String),
+    /// A task, by name.
+    Task(String),
+}
+
+/// What member actions (enter, attach, stop, answer, custom commands) apply
+/// to, the one the pane shows: a member of the selected task, or the
+/// selected chat.
+#[derive(Debug, Clone, Copy)]
+pub enum Focused<'a> {
+    Member(&'a Task, &'a Member),
+    Chat(&'a Chat),
+}
+
+impl<'a> Focused<'a> {
+    /// Its agent's id (a member's or chat's id).
+    pub fn id(&self) -> &'a str {
+        match self {
+            Focused::Member(_, member) => member.id(),
+            Focused::Chat(chat) => &chat.info.id,
+        }
+    }
+
+    /// How to name it to the user.
+    pub fn label(&self) -> String {
+        match self {
+            Focused::Member(task, member) => task.member_label(member),
+            Focused::Chat(chat) => chat.info.label(),
+        }
+    }
+
+    /// Its running agent.
+    pub fn agent(&self) -> Option<&'a AgentInfo> {
+        match self {
+            Focused::Member(_, member) => member.agent_info.as_ref(),
+            Focused::Chat(chat) => chat.agent.as_ref(),
+        }
+    }
+
+    pub fn chat(&self) -> Option<&'a Chat> {
+        match self {
+            Focused::Chat(chat) => Some(chat),
+            Focused::Member(..) => None,
+        }
+    }
+
+    /// What its custom commands' `{task}` and `{dir}` stand for: its task's
+    /// name and its worktree, or a chat's label and its main checkout.
+    pub fn task_and_dir(&self) -> (String, &'a std::path::Path) {
+        match self {
+            Focused::Member(task, member) => (task.name.clone(), member.info.dir.as_path()),
+            Focused::Chat(chat) => (chat.info.label(), chat.info.dir.as_path()),
+        }
+    }
 }
 
 /// A member a drop dialog offers to drop alone.
@@ -115,17 +226,29 @@ pub struct Focus {
     pub member: String,
 }
 
-/// What the detail pane shows of the selected task beyond the task list,
-/// fetched when the task is selected.
-#[derive(Debug, Default)]
+/// What the detail pane shows of the selected task or chat beyond the
+/// list, fetched when it is selected.
+#[derive(Debug)]
 pub struct TaskDetail {
-    pub task: String,
-    /// The task's agent runs, oldest first.
+    pub of: Pick,
+    /// The task's (or chat's) agent runs, oldest first.
     pub runs: Vec<RunInfo>,
-    /// Messages to or from its members, oldest first.
+    /// Messages to or from its members (or the chat), oldest first.
     pub messages: Vec<MessageInfo>,
     /// To fetch again (e.g. a run started or ended).
     pub stale: bool,
+}
+
+impl TaskDetail {
+    /// Of this task or chat, with no runs or messages.
+    pub fn of(of: Pick) -> Self {
+        Self {
+            of,
+            runs: Vec::new(),
+            messages: Vec::new(),
+            stale: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +371,7 @@ impl PickerState {
 pub struct Hits {
     /// The task list's rows (below its column names).
     pub list: Rect,
-    /// For each row of `list` from its top: the visible task it belongs
+    /// For each row of `list` from its top: the visible entry it belongs
     /// to (its index), and the member it is about.
     pub rows: Vec<Option<(usize, Option<String>)>>,
     /// The detail pane.
@@ -263,6 +386,9 @@ const TYPING_PAUSE: std::time::Duration = std::time::Duration::from_millis(700);
 
 pub struct App {
     pub tasks: Vec<Task>,
+    /// In creation order.
+    pub chats: Vec<Chat>,
+    /// Index in [`App::visible_entries`].
     pub selected: usize,
     pub status: Option<(String, Instant)>,
     pub mode: Mode,
@@ -296,12 +422,17 @@ pub struct App {
     /// Projects are being looked for.
     pub discovering: bool,
     pub hits: Hits,
+    /// The agent of this chat was just started for the pane to type into:
+    /// the pane keeps the keyboard until it shows up (see
+    /// [`App::check_typing`]).
+    pub starting: Option<String>,
 }
 
 impl App {
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
+            chats: Vec::new(),
             selected: 0,
             status: None,
             mode: Mode::Normal,
@@ -320,15 +451,23 @@ impl App {
             projects: None,
             discovering: false,
             hits: Hits::default(),
+            starting: None,
         }
     }
 
     /// Replace the task list, preserving selection.
     pub fn set_tasks(&mut self, tasks: Vec<Task>) {
-        let prev_name = self.selected_task().map(|t| t.name.clone());
+        let prev = self.pick();
         self.tasks = tasks;
         self.sort_tasks();
-        self.reselect(prev_name);
+        self.reselect(prev);
+    }
+
+    /// Replace the chats (in creation order), preserving selection.
+    pub fn set_chats(&mut self, chats: Vec<Chat>) {
+        let prev = self.pick();
+        self.chats = chats;
+        self.reselect(prev);
     }
 
     fn sort_tasks(&mut self) {
@@ -348,7 +487,7 @@ impl App {
 
     /// Group the list by repository, or show the most urgent first.
     pub fn toggle_order(&mut self) {
-        let prev = self.selected_task().map(|t| t.name.clone());
+        let prev = self.pick();
         self.order = match self.order {
             Order::Repo => Order::Attention,
             Order::Attention => Order::Repo,
@@ -357,13 +496,24 @@ impl App {
         self.reselect(prev);
     }
 
-    /// The task list's rows: the visible tasks in order, a header row
-    /// before each repository's tasks (when grouped), a row per member
-    /// below a task with several.
+    /// The list's rows: grouped by repository, the chats' section (a header
+    /// row, a row per chat), then a header row before each repository's
+    /// tasks; attention first, chats and tasks in one list. Below a task
+    /// with several members, a row per member.
     pub fn rows(&self) -> Vec<Row<'_>> {
         let mut rows = Vec::new();
         let mut group: Option<String> = None;
-        for task in self.visible_tasks() {
+        for entry in self.visible_entries() {
+            let task = match entry {
+                Entry::Chat(chat) => {
+                    if self.order == Order::Repo && rows.is_empty() {
+                        rows.push(Row::Chats);
+                    }
+                    rows.push(Row::Chat(chat));
+                    continue;
+                }
+                Entry::Task(task) => task,
+            };
             if self.order == Order::Repo {
                 let name = repo_group(task);
                 if group.as_ref() != Some(&name) {
@@ -389,6 +539,20 @@ impl App {
         rows
     }
 
+    /// What the list shows, in its order: grouped by repository, the chats
+    /// (in creation order) then the tasks; attention first, both in one
+    /// list, the most urgent first.
+    pub fn visible_entries(&self) -> Vec<Entry<'_>> {
+        let chats = self.visible_chats().into_iter().map(Entry::Chat);
+        let tasks = self.visible_tasks().into_iter().map(Entry::Task);
+        let mut entries: Vec<Entry> = chats.chain(tasks).collect();
+        if self.order == Order::Attention {
+            // Stable: chats keep their order, tasks theirs.
+            entries.sort_by_cached_key(Entry::urgency);
+        }
+        entries
+    }
+
     /// The tasks the filter matches (by name, or a member's name,
     /// repository or branch), in the list's order.
     pub fn visible_tasks(&self) -> Vec<&Task> {
@@ -408,9 +572,29 @@ impl App {
             .collect()
     }
 
-    /// Empty the filter, the task found with it still selected.
+    /// The chats the filter matches (by name, title, id or repository), in
+    /// creation order.
+    pub fn visible_chats(&self) -> Vec<&Chat> {
+        let query = self.filter.value();
+        if query.is_empty() {
+            return self.chats.iter().collect();
+        }
+        let matches = |text: &str| fuzzy(query, text).is_some();
+        self.chats
+            .iter()
+            .filter(|c| {
+                let info = &c.info;
+                info.name.as_deref().is_some_and(matches)
+                    || info.title.as_deref().is_some_and(matches)
+                    || matches(&info.id)
+                    || matches(&info.repo)
+            })
+            .collect()
+    }
+
+    /// Empty the filter, the entry found with it still selected.
     pub fn clear_filter(&mut self) {
-        let prev = self.selected_task().map(|t| t.name.clone());
+        let prev = self.pick();
         self.filter.clear();
         self.reselect(prev);
     }
@@ -433,10 +617,10 @@ impl App {
         self.projects = Some(projects);
     }
 
-    /// Select the visible task at `index` (e.g. clicked), focusing
-    /// `member` when the pane shows one.
+    /// Select the visible entry at `index` (e.g. clicked), focusing
+    /// `member` (of a task) when the pane shows one.
     pub fn select_at(&mut self, index: usize, member: Option<String>) {
-        if index >= self.visible_tasks().len() {
+        if index >= self.visible_entries().len() {
             return;
         }
         self.selected = index;
@@ -450,7 +634,7 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        let count = self.visible_tasks().len();
+        let count = self.visible_entries().len();
         if count > 0 {
             self.selected = (self.selected + 1).min(count - 1);
         }
@@ -465,15 +649,36 @@ impl App {
     }
 
     pub fn select_last(&mut self) {
-        self.selected = self.visible_tasks().len().saturating_sub(1);
+        self.selected = self.visible_entries().len().saturating_sub(1);
     }
 
+    pub fn selected_entry(&self) -> Option<Entry<'_>> {
+        self.visible_entries().get(self.selected).copied()
+    }
+
+    /// The selected task (`None` when a chat is selected).
     pub fn selected_task(&self) -> Option<&Task> {
-        self.visible_tasks().get(self.selected).copied()
+        match self.selected_entry()? {
+            Entry::Task(task) => Some(task),
+            Entry::Chat(_) => None,
+        }
+    }
+
+    /// The selected chat (`None` when a task is selected).
+    pub fn selected_chat(&self) -> Option<&Chat> {
+        match self.selected_entry()? {
+            Entry::Chat(chat) => Some(chat),
+            Entry::Task(_) => None,
+        }
+    }
+
+    /// The selected entry, to find it again.
+    pub fn pick(&self) -> Option<Pick> {
+        self.selected_entry().map(|e| e.pick())
     }
 
     fn clamp_selection(&mut self) {
-        let count = self.visible_tasks().len();
+        let count = self.visible_entries().len();
         if count == 0 {
             self.selected = 0;
         } else {
@@ -483,7 +688,7 @@ impl App {
 
     /// Add a task, or replace the one with the same name.
     pub fn upsert_task(&mut self, task: Task) {
-        let prev = self.selected_task().map(|t| t.name.clone());
+        let prev = self.pick();
         match self.tasks.iter_mut().find(|t| t.name == task.name) {
             Some(existing) => *existing = task,
             None => self.tasks.push(task),
@@ -494,9 +699,11 @@ impl App {
 
     /// Apply the daemon's latest summary of a task.
     pub fn update_task_info(&mut self, info: TaskInfo) {
-        let prev = self.selected_task().map(|t| t.name.clone());
-        if let Some(detail) = self.detail.as_mut().filter(|d| d.task == info.name) {
-            detail.stale = true;
+        let prev = self.pick();
+        if let Some(detail) = self.detail.as_mut() {
+            if detail.of == Pick::Task(info.name.clone()) {
+                detail.stale = true;
+            }
         }
         if let Some(task) = self.tasks.iter_mut().find(|t| t.name == info.name) {
             task.update_info(info);
@@ -506,15 +713,41 @@ impl App {
     }
 
     pub fn remove_task(&mut self, name: &str) {
-        let prev = self.selected_task().map(|t| t.name.clone());
+        let prev = self.pick();
         self.tasks.retain(|t| t.name != name);
         self.reselect(prev);
     }
 
-    /// Keep the selection on the named task if it is still visible.
-    fn reselect(&mut self, name: Option<String>) {
-        if let Some(name) = name {
-            if let Some(pos) = self.visible_tasks().iter().position(|t| t.name == name) {
+    /// Add a chat (last: chats are in creation order), or take the daemon's
+    /// latest view of it, keeping its running agent.
+    pub fn upsert_chat(&mut self, info: ChatInfo) {
+        let prev = self.pick();
+        if let Some(detail) = self.detail.as_mut() {
+            // A run started or ended.
+            if detail.of == Pick::Chat(info.id.clone()) {
+                detail.stale = true;
+            }
+        }
+        match self.chats.iter_mut().find(|c| c.info.id == info.id) {
+            Some(chat) => chat.info = info,
+            None => self.chats.push(Chat::new(info, &[])),
+        }
+        self.reselect(prev);
+    }
+
+    pub fn remove_chat(&mut self, id: &str) {
+        let prev = self.pick();
+        self.chats.retain(|c| c.info.id != id);
+        if self.starting.as_deref() == Some(id) {
+            self.starting = None;
+        }
+        self.reselect(prev);
+    }
+
+    /// Keep the selection on this entry if it is still visible.
+    fn reselect(&mut self, pick: Option<Pick>) {
+        if let Some(pick) = pick {
+            if let Some(pos) = self.visible_entries().iter().position(|e| e.pick() == pick) {
                 self.selected = pos;
                 return;
             }
@@ -530,15 +763,21 @@ impl App {
             return false;
         };
         let current = self
-            .find_member(&dialog.agent)
-            .and_then(|(_, m)| m.agent_info.as_ref())
+            .find_agent(&dialog.agent)
             .and_then(|a| a.detail.ask.as_ref());
         current.is_none_or(|ask| ask.id != dialog.ask.id)
     }
 
-    /// The member an agent runs for (agent ids are member ids).
-    fn member_mut(&mut self, id: &str) -> Option<&mut Member> {
-        self.tasks.iter_mut().find_map(|t| t.member_mut(id))
+    /// Where an agent's info is kept: the member or chat it runs for (agent
+    /// ids are member and chat ids).
+    fn agent_slot(&mut self, id: &str) -> Option<&mut Option<AgentInfo>> {
+        if let Some(member) = self.tasks.iter_mut().find_map(|t| t.member_mut(id)) {
+            return Some(&mut member.agent_info);
+        }
+        self.chats
+            .iter_mut()
+            .find(|c| c.info.id == id)
+            .map(|c| &mut c.agent)
     }
 
     /// A member and its task, by member id.
@@ -546,21 +785,36 @@ impl App {
         self.tasks.iter().find_map(|t| t.member(id).map(|m| (t, m)))
     }
 
-    /// Update the agent info of the member it runs for.
+    /// A running agent, by id (a member's or a chat's).
+    pub fn find_agent(&self, id: &str) -> Option<&AgentInfo> {
+        match self.find_member(id) {
+            Some((_, member)) => member.agent_info.as_ref(),
+            None => self
+                .chats
+                .iter()
+                .find(|c| c.info.id == id)
+                .and_then(|c| c.agent.as_ref()),
+        }
+    }
+
+    /// Update the agent info of the member or chat it runs for.
     pub fn update_agent(&mut self, info: AgentInfo) {
-        let selected = self.selected_task().map(|t| t.name.clone());
-        if let Some(member) = self.member_mut(&info.id) {
-            member.agent_info = Some(info);
+        let prev = self.pick();
+        if self.starting.as_deref() == Some(info.id.as_str()) {
+            self.starting = None;
+        }
+        if let Some(slot) = self.agent_slot(&info.id) {
+            *slot = Some(info);
             self.sort_tasks();
-            // The selection stays on its task, wherever the order puts it.
-            self.reselect(selected);
+            // The selection stays on its entry, wherever the order puts it.
+            self.reselect(prev);
         }
     }
 
     pub fn update_state(&mut self, id: &str, new_state: tam_proto::AgentState) {
-        let selected = self.selected_task().map(|t| t.name.clone());
-        if let Some(member) = self.member_mut(id) {
-            if let Some(ref mut info) = member.agent_info {
+        let prev = self.pick();
+        if let Some(slot) = self.agent_slot(id) {
+            if let Some(info) = slot {
                 // Already taken from the daemon's info (with its time)
                 // when a hook changed it.
                 if info.state != new_state {
@@ -569,27 +823,28 @@ impl App {
                 }
             }
             self.sort_tasks();
-            self.reselect(selected);
+            self.reselect(prev);
         }
         // A turn ended or began: its changes are worth a new look.
         self.branch_changed(id);
     }
 
     pub fn update_context(&mut self, id: &str, context_percent: u8) {
-        if let Some(member) = self.member_mut(id) {
-            if let Some(ref mut info) = member.agent_info {
-                info.context_percent = Some(context_percent);
-            }
+        if let Some(Some(info)) = self.agent_slot(id) {
+            info.context_percent = Some(context_percent);
         }
     }
 
-    /// Remove agent info from a member (agent exited, member becomes idle).
+    /// Remove agent info from a member or chat (agent exited: idle).
     pub fn remove_agent(&mut self, id: &str) {
-        let selected = self.selected_task().map(|t| t.name.clone());
-        if let Some(member) = self.member_mut(id) {
-            member.agent_info = None;
+        let prev = self.pick();
+        if self.starting.as_deref() == Some(id) {
+            self.starting = None;
+        }
+        if let Some(slot) = self.agent_slot(id) {
+            *slot = None;
             self.sort_tasks();
-            self.reselect(selected);
+            self.reselect(prev);
         }
         self.clamp_selection();
         self.branch_changed(id);
@@ -609,16 +864,31 @@ impl App {
         self.status.as_ref().map(|(msg, _)| msg.as_str())
     }
 
-    /// The agent the preview pane should show: the focused member's.
+    /// The agent the preview pane should show: the focused member's or
+    /// chat's.
     pub fn peek_agent(&self) -> Option<String> {
-        self.focused_member()
-            .and_then(|(_, m)| m.agent_info.as_ref())
-            .map(|a| a.id.clone())
+        self.focused().and_then(|f| f.agent()).map(|a| a.id.clone())
     }
 
     /// The preview pane shows another agent than the one it should.
     pub fn peek_stale(&self) -> bool {
         self.peek.agent != self.peek_agent()
+    }
+
+    /// The pane keeps the keyboard only for the agent it took it for: while
+    /// the pane shows it, or while it starts for the chat the pane is on.
+    pub fn check_typing(&mut self) {
+        let Mode::Terminal { agent } = &self.mode else {
+            return;
+        };
+        let starting = self.starting.as_deref() == Some(agent.as_str())
+            && self.focused().is_some_and(|f| f.id() == agent);
+        match self.peek_agent() {
+            Some(shown) if shown == *agent => {}
+            Some(_) => self.stop_typing("the pane shows another agent"),
+            None if starting => {}
+            None => self.stop_typing("the agent exited"),
+        }
     }
 
     /// The pane gives the keyboard back without having been asked to
@@ -651,34 +921,59 @@ impl App {
         }
     }
 
+    /// The custom command that took one of the dashboard's keys a custom
+    /// command may still bind (`config::YIELDING_KEYS`): the key is the
+    /// command's then.
+    pub fn key_taken(&self, key: char) -> Option<&CustomCommand> {
+        if !crate::config::YIELDING_KEYS.contains(&key) {
+            return None;
+        }
+        self.commands.iter().find(|c| c.key_char() == key)
+    }
+
     /// An agent is working: its spinner turns.
     pub fn any_running(&self) -> bool {
-        self.tasks.iter().any(|t| {
+        let tasks = self.tasks.iter().any(|t| {
             t.members
                 .iter()
-                .any(|m| matches!(t.member_status(m), crate::task::TaskStatus::Run))
-        })
+                .any(|m| matches!(t.member_status(m), TaskStatus::Run))
+        });
+        tasks || self.chats.iter().any(|c| c.status() == TaskStatus::Run)
     }
 
-    /// Count tasks needing attention (input, blocked, question or error).
+    /// Count tasks and chats needing attention (ready, blocked, question or
+    /// error).
     pub fn needs_attention_count(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter(|t| t.status().needs_attention())
-            .count()
+        let tasks = self.tasks.iter().filter(|t| t.status().needs_attention());
+        let chats = self.chats.iter().filter(|c| c.status().needs_attention());
+        tasks.count() + chats.count()
     }
 
-    /// The member the detail pane shows and member actions apply to: the
-    /// one focused in the selected task, else the one that most needs the
-    /// user.
-    pub fn focused_member(&self) -> Option<(&Task, &Member)> {
-        let task = self.selected_task()?;
+    /// What the detail pane shows and member actions apply to: the selected
+    /// chat, or the member focused in the selected task, else the one that
+    /// most needs the user.
+    pub fn focused(&self) -> Option<Focused<'_>> {
+        let task = match self.selected_entry()? {
+            Entry::Chat(chat) => return Some(Focused::Chat(chat)),
+            Entry::Task(task) => task,
+        };
         let focused = self
             .focus
             .as_ref()
             .filter(|f| f.task == task.name)
             .and_then(|f| task.member(&f.member));
-        Some((task, focused.or_else(|| most_urgent(task))?))
+        Some(Focused::Member(
+            task,
+            focused.or_else(|| most_urgent(task))?,
+        ))
+    }
+
+    /// The focused member of the selected task (`None` on a chat).
+    pub fn focused_member(&self) -> Option<(&Task, &Member)> {
+        match self.focused()? {
+            Focused::Member(task, member) => Some((task, member)),
+            Focused::Chat(_) => None,
+        }
     }
 
     /// Focus the selected task's most urgent
@@ -720,26 +1015,30 @@ impl App {
         });
     }
 
-    /// The pane shows another task's runs and messages than the selected
+    /// The pane shows another entry's runs and messages than the selected
     /// one's, or they changed.
     pub fn detail_stale(&self) -> bool {
-        let selected = self.selected_task().map(|t| t.name.as_str());
+        let selected = self.pick();
         match &self.detail {
-            Some(detail) => detail.stale || Some(detail.task.as_str()) != selected,
+            Some(detail) => detail.stale || Some(&detail.of) != selected.as_ref(),
             None => selected.is_some(),
         }
     }
 
     /// A message was sent or delivered: keep it if it is to or from a
-    /// member of the task shown.
+    /// member of the task shown, or the chat shown.
     pub fn note_message(&mut self, message: MessageInfo) {
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
-        let Some(task) = self.tasks.iter().find(|t| t.name == detail.task) else {
-            return;
+        let ours = |id: &str| match &detail.of {
+            Pick::Chat(chat) => chat == id,
+            Pick::Task(name) => self
+                .tasks
+                .iter()
+                .find(|t| t.name == *name)
+                .is_some_and(|t| t.member(id).is_some()),
         };
-        let ours = |id: &str| task.member(id).is_some();
         if !ours(&message.to) && !message.from.as_deref().is_some_and(ours) {
             return;
         }

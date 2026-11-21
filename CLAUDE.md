@@ -269,7 +269,7 @@ adopt). `tam-cli` depends on all three.
   `CLAUDE*` variables, or nested Claude sessions write no transcript.
 - **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
 - **The pane** — always shown (`App::peek`, `ui::render_pane`): the screen
-  of the focused member's agent, on the whole pane, and nothing said twice
+  of the focused member's agent (or the selected chat's), on the whole pane, and nothing said twice
   (`a` answers a request without attaching). `enter` gives the pane the
   keyboard (`Mode::Terminal { agent }`, drawn as `Normal`): every key but
   ctrl-] (`keys::is_leave`; crossterm reads it as ctrl-5) is encoded as a
@@ -284,10 +284,12 @@ adopt). `tam-cli` depends on all three.
   thick. Typing counts as viewing (`WatchScreen.viewing`, a `Viewer` in the
   daemon's `ScreenWatch`): no notification about that agent meanwhile.
   The mode ends on ctrl-] or a click in the list; and, unasked, when the
-  pane shows another agent or none or a write fails (`App::stop_typing`):
+  pane shows another agent or none or a write fails (`App::check_typing`,
+  `App::stop_typing`; not while the agent of the chat it shows starts:
+  `App::starting`, see Chats in the dashboard):
   the keys still coming are then dropped until typing pauses
   (`App::drops_key`), never run as the dashboard's. For the same reason a
-  re-sort keeps the selection on its task (`update_state`, `update_agent`,
+  re-sort keeps the selection on its entry (`update_state`, `update_agent`,
   `remove_agent` reselect), the wheel over the list does nothing while
   typing, the keys of the batch that brought the focusing `enter` are
   dropped, and the dashboard's terminal always reports pastes as such
@@ -300,7 +302,8 @@ adopt). `tam-cli` depends on all three.
   `shift-enter` is `ESC CR`, a new line in Claude's prompt.
   Its bottom border keeps what the screen may no longer show: why the turn
   failed, what auto mode refused (`ui::agent_detail_line`, not a request it
-  waits on), and how many messages wait for the agent. Without an agent
+  waits on), how many messages wait for the agent, and when a chat in its
+  last day closes. Without an agent
   there is no screen: `tui/triage.rs` says how its last run ended (`GetTask`
   runs) or what is wrong with its worktree, its branch against the default
   branch with its diff stat, and its latest messages (`ListMessages`, then
@@ -309,8 +312,9 @@ adopt). `tam-cli` depends on all three.
   (`App::branch_due`: the focused member every 10s, the others every 60s for
   the task list, any after its state changes). `h`/`l` like `←`/`→`,
   `ctrl-u`/`ctrl-d` like `pgup`/`pgdn`. Member actions (enter, `s`, `r`,
-  `R`, `a`, custom commands) apply to the focused member
-  (`App::focused_member`): the one the pane shows: the most urgent one when
+  `R`, `a`, custom commands) apply to the focused member or chat
+  (`App::focused`, an `app::Focused`; `focused_member` for task-only
+  code): the one the pane shows: the most urgent one when
   the selection landed on the task, pinned while the task stays selected (a
   key never acts on a member the pane did not show), and `←`/`→` move it.
   The dashboard redraws every second (times in state).
@@ -386,16 +390,21 @@ adopt). `tam-cli` depends on all three.
   drop dialogs of a task with several members offer the focused member alone
   (`m`, `M` with its branch; `MemberChoice`), sent by member id: `<task>/<member>`
   could name another task.
-- **Task list** — `tui/table.rs` draws `App::rows`: a header row per
+- **Task list** — `tui/table.rs` draws `App::rows`: the chats' section
+  (`Row::Chats`, then a `Row::Chat` each, in creation order), then a header row per
   repository (`app::repo_group`: the set of a task's repositories, `api +
   web`), a row per task, and below a task with several members a row per
   member (`▸` marks `App::focused_member`); such a task's own row has
-  its name only, no status (an agent's, so a member's). Only task rows are selected
-  (`App::selected` indexes visible tasks); `App::table_offset` keeps the
+  its name only, no status (an agent's, so a member's). Only task and chat
+  rows are selected: `App::selected` indexes `App::visible_entries` (an
+  `app::Entry` each), found again after a change by `app::Pick` (a chat's
+  id, a task's name: never a label); `App::table_offset` keeps the
   scroll between draws so the selected task's member rows (and its group's
-  header) stay in view. `gg`/`G` select the first/last task
-  (`App::pending_g`). `t` (`App::toggle_order`, `Order`) switches to
-  attention first: no groups, a REPO column. Columns: status and time in it
+  header) stay in view. `gg`/`G` select the first/last entry
+  (`App::pending_g`); `j`/`k` go from the chats to the tasks; the
+  dashboard starts on the top entry (`set_chats` before `set_tasks`). `t`
+  (`App::toggle_order`, `Order`) switches to attention first: no groups,
+  chats and tasks in one list (`Entry::urgency`), a REPO column. Columns: status and time in it
   (`state_since`, else the task's `last_activity`), task, branch
   (`↑`/`↓`/`*` from `App::branches`), context, and from 100 columns
   what the member waits on; `table::fit` drops columns (`DROP_ORDER`)
@@ -406,6 +415,43 @@ adopt). `tam-cli` depends on all three.
   fit (`ui::fit_hints`, by priority). `tam ps` (`ps.rs`) prints the same
   rows as text: a row per task, most urgent first, and below a task with
   several members a row per member (status, worktree, context).
+- **Chats in the dashboard (#67)** — `App::chats` (`chat::Chat`: the info
+  and its running agent), from `ListChats` at start, then `ChatCreated`/
+  `ChatUpdated` (`App::upsert_chat`, keeping the agent) and `ChatClosed`;
+  agent events find a chat's agent as a member's (`App::agent_slot`,
+  `find_agent`). A chat's row (`table::chat_cell`): its agent's status,
+  else idle; time in state, else since its last turn (`Chat::last`); its
+  label (dimmed when neither named nor titled: its id); its repository
+  (dim) where a task has its branch, `chat` there attention first (the
+  repository in REPO); context; what it waits on, else its last prompt.
+  After the name, one cell: `◔` (warn, the name dimmed) in its last day
+  (`chat::Closes::last_day`: less than a day before autoclean, or due), `∞`
+  (dim) when kept; `table::chat_name` cuts the name before it, never the
+  mark. The filter takes its name, title, id and repository. The header
+  counts chats, and "need you" and the spinner take them. The pane: its
+  screen; without an agent, `triage::chat` (how its last run ended,
+  `GetChat` runs; what enter does; its last prompt; its main checkout;
+  messages, `ListMessages` with its id); in its last day, the bottom border
+  says `closes in 5h · p keeps it` (`ui::closing`; `closes when idle` once
+  due). Keys on a chat: `enter` types into it, starting its agent first
+  when none runs (`Action::Resume`: the pane takes the keyboard at once,
+  `App::starting` keeps it until `AgentSpawned`; a failure gives it back
+  with a notice, the way out when its session is gone:
+  `chat::session_gone`); `f`/`shift-enter` start it too, then attach; `r`/`R` only say
+  that enter resumes it (a chat is its session: never `SessionChoice::New`);
+  `d` asks (`Mode::ConfirmCloseChat`, `y`/`enter`) then `CloseChat`; `p`
+  keeps or unkeeps (`KeepChat`; the status line says when it closes then);
+  `N` names it (`Mode::RenameChat`, empty: Claude's title again; a refusal
+  opens a notice); `s`, `a` and custom commands as on a task. Custom
+  commands (`config::CommandValues`): `{task}` the task's name or the
+  chat's label, `{id}` the member's or chat's id, `{dir}` the worktree or
+  the main checkout, `{provider}`. `c`, `p` and `N` came after custom
+  commands could bind them (`config::YIELDING_KEYS`): a config that binds
+  one still loads (every command reads it, hooks too), the key runs the
+  custom command (`App::key_taken`, checked first in `handle_normal_key`),
+  the footer leaves the dashboard's action out and the help marks it
+  taken. The other reserved keys still refuse the config
+  (`RESERVED_KEYS`).
 - **Dashboard colours** — `tui/theme.rs`: colours by role (`theme::get()`),
   never a `Color::` in the drawing code. `DARK` (24-bit) when `COLORTERM`
   says truecolor or `[tui] theme = "dark"`, else `ANSI` (the terminal's 16
@@ -558,8 +604,8 @@ adopt). `tam-cli` depends on all three.
   a chat (id or name) is no task member, and the cwd never names a chat
   (`member_at` stays members only): `tam run`/`attach` with no name in a
   main checkout find no task, `tam peers` says "not in a task". Notify:
-  `{task}` is a chat's label, `{id}` its id; custom commands (#67) are to give the same, `{dir}`
-  being the main checkout. Titles and history (#64): the daemon's
+  `{task}` is a chat's label, `{id}` its id; custom commands give the same, `{dir}`
+  being the main checkout (see Chats in the dashboard). Titles and history (#64): the daemon's
   `sessions.rs` is the only reader of Claude's session files
   (`<claude dir>/projects/<project>/<session>.jsonl`; `project_name` is Claude's
   encoding: every UTF-16 unit but ASCII letters and digits a `-`, past 200
@@ -581,7 +627,7 @@ adopt). `tam-cli` depends on all three.
   the one its agent is in). Context use reads a chat's transcript from
   `chat_transcript`, never guesses it (several sessions share its
   directory). Known limit: under the daemon's `HOME`/`CLAUDE_CONFIG_DIR`.
-  The dashboard ignores chat events for now (#67).
+  The dashboard: see Chats in the dashboard.
   CLI (#66, `tam-cli/src/chat.rs`): `tam chat [REPO]` (`repos::resolve`,
   as `new -r`: from a worktree, its main checkout) is `CreateChat`, then
   `KeepChat` with `--keep`, then `RunAgent` (`Current`); a failure after
@@ -704,6 +750,17 @@ cargo test
   closed at start or not, a change of the setting reaching clients; on the
   timer, a fake `claude` with played hooks kept open while blocked,
   working, asking or typed in, an answer recorded as a turn, then closed.
+- The dashboard's chats (synchronous, no daemon): `ui.rs` render tests on
+  `chat_dashboard()` (the day's `dashboard()` fixture, left as it is, plus
+  four chats): the section first and its order, the marks and their
+  colours, a cut name keeping its mark, attention first mixing chats and
+  tasks, the filter, the pane (screen, `triage::chat`, the closing border,
+  `p` taken), the footer and help, the dialogs; `mod.rs` key and event
+  tests on `chat_app()`: selection across the sections, enter resuming then
+  typing (`App::check_typing` while starting), `f`, `r`/`R`, close with its
+  confirmation, keep, rename, custom commands and the keys they took, an
+  answer, chat and agent events. Resuming against a live daemon (the
+  dashboard always starts Claude) is not covered by a test.
 - `agent_env.rs`, in both crates: the daemon's runs an agent found only on
   the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
   value) in replies, events, errors and every file next to the ledger,

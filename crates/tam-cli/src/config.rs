@@ -150,18 +150,28 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-pub fn run_custom_command(
-    template: &str,
-    task: &str,
-    dir: &std::path::Path,
-    provider: &str,
-) -> Result<()> {
-    let dir_str = dir.to_string_lossy();
-    let cmd = template
-        .replace("{task}", &shell_quote(task))
-        .replace("{id}", &shell_quote(task))
-        .replace("{dir}", &shell_quote(&dir_str))
-        .replace("{provider}", &shell_quote(provider));
+/// What a custom command's placeholders stand for: for a task member, its
+/// task's name, its id and its worktree; for a chat, its label, its id and
+/// its repository's main checkout. `provider` is its agent's, else empty.
+pub struct CommandValues<'a> {
+    pub task: &'a str,
+    pub id: &'a str,
+    pub dir: &'a Path,
+    pub provider: &'a str,
+}
+
+/// `template` with its placeholders replaced, each quoted for the shell.
+fn expand_command(template: &str, values: &CommandValues) -> String {
+    let dir = values.dir.to_string_lossy();
+    template
+        .replace("{task}", &shell_quote(values.task))
+        .replace("{id}", &shell_quote(values.id))
+        .replace("{dir}", &shell_quote(&dir))
+        .replace("{provider}", &shell_quote(values.provider))
+}
+
+pub fn run_custom_command(template: &str, values: &CommandValues) -> Result<()> {
+    let cmd = expand_command(template, values);
 
     unsafe {
         std::process::Command::new("sh")
@@ -183,6 +193,12 @@ pub fn run_custom_command(
 const RESERVED_KEYS: &[char] = &[
     'q', 'j', 'k', 'h', 'l', 'n', 'r', 'R', 's', 'd', 'f', '/', 'g', 'G', 't', 'T', '?', 'a',
 ];
+
+/// The dashboard's keys a custom command may still bind: those that came
+/// after custom commands could have taken them (a config that binds one
+/// keeps working, every command reads it, agents' hooks too). Bound, the
+/// key runs the custom command, and the dashboard's action has no key.
+pub const YIELDING_KEYS: &[char] = &['c', 'p', 'N'];
 
 fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
@@ -371,6 +387,30 @@ finder = "fzf"
             let err = parse_config(&toml).unwrap_err().to_string();
             assert!(err.contains("reserved"), "{key}: {err}");
         }
+    }
+
+    #[test]
+    fn the_newer_dashboard_keys_yield_to_a_custom_command() {
+        for key in YIELDING_KEYS {
+            let toml =
+                format!("[[tui.commands]]\nname = \"x\"\nkey = \"{key}\"\ncommand = \"true\"\n");
+            let config = parse_config(&toml).unwrap();
+            assert_eq!(config.commands[0].key_char(), *key);
+        }
+    }
+
+    #[test]
+    fn custom_command_placeholders() {
+        let values = CommandValues {
+            task: "Chat design",
+            id: "c-0000abcd",
+            dir: Path::new("/src/my tam"),
+            provider: "claude",
+        };
+        assert_eq!(
+            expand_command("x {task} {id} {dir} {provider}", &values),
+            "x 'Chat design' c-0000abcd '/src/my tam' claude"
+        );
     }
 
     #[test]

@@ -410,10 +410,12 @@ adopt). `tam-cli` depends on all three.
   says truecolor or `[tui] theme = "dark"`, else `ANSI` (the terminal's 16
   colours; what tests draw with). `UNICORN` (`theme = "unicorn"`, Dracula's
   colours) has `Theme::rainbow`: `theme::rainbow(cell, tick)` gives the
-  hues; the logo, the selection's bar and the spinners move with
-  `App::spin` (the loop then ticks all the time: `theme::animated`, off
-  with `[tui] animate = false`), group rules and the pane's border
-  (`ui::rainbow_border`, over the drawn block) stand still. `T`
+  hues; the logo, the selection's bar, the spinners, the group rules
+  (along them) and the pane's border move with `App::spin` (the loop then
+  ticks all the time: `theme::animated`, off with `[tui] animate =
+  false`). The border (`ui::rainbow_border`, over the drawn block) goes
+  clockwise round `ui::border_path` with `theme::rainbow_around`: a
+  whole number of turns of the hues round it, so no seam. `T`
   (`Action::NextTheme`, `theme::next`) switches theme while the dashboard
   runs, never written to the config. Backgrounds only on the header and footer
   bars, the selected row, chips and dialogs: never behind the agent's screen

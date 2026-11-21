@@ -34,7 +34,8 @@ pub struct Theme {
     pub block: Color,
     pub question: Color,
     /// Rainbows: the logo, the selection's bar and the spinners cycle
-    /// through the hues, rules and the pane's border fade through them.
+    /// through the hues, rules and the pane's border fade through them
+    /// (moving along the rules, clockwise round the border).
     pub rainbow: bool,
 }
 
@@ -140,13 +141,35 @@ const HUE_SPEED: usize = 9;
 /// right as ticks go, and stands still when animation is off): bright
 /// pastels, the same lightness all along.
 pub fn rainbow(i: usize, tick: usize) -> Color {
-    let tick = if ANIMATE.load(Ordering::Relaxed) {
+    let hue = (i * HUE_STEP + 360 - (moving(tick) * HUE_SPEED) % 360) % 360;
+    hsl(hue as f32, 0.9, 0.74)
+}
+
+/// The colour at `pos` along a closed line `len` long (a border, going
+/// round): as `rainbow`, the line's end meeting its start.
+pub fn rainbow_around(pos: usize, len: usize, tick: usize) -> Color {
+    hsl(hue_around(pos, len, moving(tick)) as f32, 0.9, 0.74)
+}
+
+/// `tick`, or 0 when rainbows stand still.
+fn moving(tick: usize) -> usize {
+    if ANIMATE.load(Ordering::Relaxed) {
         tick
     } else {
         0
-    };
-    let hue = (i * HUE_STEP + 360 - (tick * HUE_SPEED) % 360) % 360;
-    hsl(hue as f32, 0.9, 0.74)
+    }
+}
+
+/// The hue at `pos` along a closed line `len` long, at `tick`: about half
+/// a rainbow's step from one position to the next, fitted so that a whole
+/// number of turns of the hues goes round (no seam), moving towards
+/// higher positions as fast as a rainbow does, in positions per tick.
+fn hue_around(pos: usize, len: usize, tick: usize) -> f64 {
+    let len = len.max(1) as f64;
+    let turns = (len * HUE_STEP as f64 / 720.0).round().max(1.0);
+    let step = 360.0 * turns / len;
+    let shift = tick as f64 * step * HUE_SPEED as f64 / HUE_STEP as f64;
+    (pos as f64 * step - shift).rem_euclid(360.0)
 }
 
 /// `text`, each character in the next colour of a rainbow.
@@ -239,5 +262,32 @@ mod tests {
         let spans = rainbow_spans("────", 0, Style::new());
         assert_eq!(spans.len(), 4);
         assert_ne!(spans[0].style.fg, spans[3].style.fg);
+    }
+
+    #[test]
+    fn a_rainbow_round_a_border_has_no_seam_and_goes_round() {
+        // How far `b` is past `a`, round the hues.
+        let ahead = |a: f64, b: f64| (b - a).rem_euclid(360.0);
+        let close = |a: f64, b: f64| ahead(a, b).min(ahead(b, a)) < 1e-6;
+        // Pane borders, small to wide.
+        for len in 26..2000 {
+            for tick in [0, 1, 7, 1000, 123_456_789] {
+                let hue = |pos| hue_around(pos, len, tick);
+                let step = ahead(hue(0), hue(1));
+                assert!(
+                    (HUE_STEP as f64 / 3.0..HUE_STEP as f64).contains(&step),
+                    "{len}: {step}"
+                );
+                // From the last position back to the first: one more step.
+                assert!(close(ahead(hue(len - 1), hue(0)), step), "{len}");
+                assert!(close(hue(len), hue(0)), "{len}");
+                // It moves towards higher positions, as a rainbow does.
+                let later = hue_around(HUE_SPEED + 3, len, tick + HUE_STEP);
+                assert!(close(later, hue(3)), "{len}");
+            }
+        }
+        // 100 long: two turns of the hues, half a turn a quarter of the way.
+        assert_ne!(rainbow_around(0, 100, 0), rainbow_around(25, 100, 0));
+        assert_eq!(rainbow_around(0, 100, 0), rainbow_around(50, 100, 0));
     }
 }

@@ -541,7 +541,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if t.rainbow && !typing {
-        rainbow_border(frame, area);
+        rainbow_border(frame, area, app.spin.unwrap_or(0));
     }
     peek.room = (inner.width, inner.height);
 
@@ -563,27 +563,47 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     peek.height = 0;
 }
 
-/// The border of `area` fading through the hues (still: it frames the
-/// agent's screen), its titles left as they are.
-fn rainbow_border(frame: &mut Frame, area: Rect) {
+/// The border of `area` fading through the hues, moving clockwise round
+/// it as ticks go, its titles left as they are.
+fn rainbow_border(frame: &mut Frame, area: Rect, tick: usize) {
+    let (path, len) = border_path(area);
     let buf = frame.buffer_mut();
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            let edge = y == area.top()
-                || y + 1 == area.bottom()
-                || x == area.left()
-                || x + 1 == area.right();
-            if !edge {
-                continue;
-            }
-            let cell = &mut buf[(x, y)];
-            if matches!(cell.symbol(), "─" | "│" | "╭" | "╮" | "╰" | "╯") {
-                // Along the diagonal: rows count double (cells are tall).
-                let i = usize::from(x - area.left()) + 2 * usize::from(y - area.top());
-                cell.set_fg(theme::rainbow(i / 2, 0));
-            }
+    for (x, y, pos) in path {
+        let cell = &mut buf[(x, y)];
+        if matches!(cell.symbol(), "─" | "│" | "╭" | "╮" | "╰" | "╯") {
+            cell.set_fg(theme::rainbow_around(pos, len, tick));
         }
     }
+}
+
+/// The cells of `area`'s edge, clockwise from its top left corner, each
+/// with how far along it is (a step down or up counts double: cells are
+/// tall), and the length of the way round.
+fn border_path(area: Rect) -> (Vec<(u16, u16, usize)>, usize) {
+    if area.width < 2 || area.height < 2 {
+        return (Vec::new(), 0);
+    }
+    let (left, top) = (area.left(), area.top());
+    let (right, bottom) = (area.right() - 1, area.bottom() - 1);
+    let mut path = Vec::new();
+    let mut pos = 0;
+    for x in left..right {
+        path.push((x, top, pos));
+        pos += 1;
+    }
+    for y in top..bottom {
+        path.push((right, y, pos));
+        pos += 2;
+    }
+    for x in (left + 1..=right).rev() {
+        path.push((x, bottom, pos));
+        pos += 1;
+    }
+    for y in (top + 1..=bottom).rev() {
+        path.push((left, y, pos));
+        pos += 2;
+    }
+    (path, pos)
 }
 
 /// The agent's screen, as the daemon's terminal emulator has it: its live
@@ -1176,6 +1196,39 @@ mod tests {
 
     fn text(state: AgentState, d: &AgentDetail) -> Option<String> {
         agent_detail_line(state, d).map(|(t, _)| t)
+    }
+
+    #[test]
+    fn the_border_path_goes_clockwise_round_the_edge() {
+        for (w, h) in [(2, 2), (3, 2), (2, 5), (82, 40)] {
+            let area = Rect::new(5, 3, w, h);
+            let (path, len) = border_path(area);
+            assert_eq!(path.len(), 2 * usize::from(w + h) - 4, "{w}x{h}");
+            assert_eq!(path[0], (5, 3, 0), "from the top left corner");
+            // Every edge cell once, nothing inside.
+            let cells: std::collections::HashSet<_> =
+                path.iter().map(|&(x, y, _)| (x, y)).collect();
+            assert_eq!(cells.len(), path.len());
+            for &(x, y) in &cells {
+                assert!(x == 5 || y == 3 || x + 1 == 5 + w || y + 1 == 3 + h);
+            }
+            // Cell to cell, and back to the start: a step across is one, a
+            // step down or up two.
+            let next = path.iter().skip(1).copied().chain([(5, 3, len)]);
+            for (&(x, y, pos), (nx, ny, npos)) in path.iter().zip(next) {
+                let step = match (i32::from(nx) - i32::from(x), i32::from(ny) - i32::from(y)) {
+                    (1 | -1, 0) => 1,
+                    (0, 1 | -1) => 2,
+                    d => panic!("{w}x{h}: ({x}, {y}) to ({nx}, {ny}): {d:?}"),
+                };
+                assert_eq!(npos, pos + step, "{w}x{h}: ({x}, {y})");
+            }
+            // Clockwise: right along the top first.
+            if w > 2 {
+                assert_eq!((path[1].0, path[1].1), (6, 3));
+            }
+        }
+        assert_eq!(border_path(Rect::new(0, 0, 1, 10)), (Vec::new(), 0));
     }
 
     #[test]

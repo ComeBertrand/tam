@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -19,15 +19,17 @@ use tracing::{error, info, warn};
 use crate::agent::Agent;
 use crate::answer::{self, Delivery};
 use crate::inbox::{self, Handover, Inbox, ReplyOutcome};
-use crate::ledger::{Ledger, Owner};
+use crate::ledger::{ChatSession, Ledger, Owner};
 use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
+use crate::sessions;
 use crate::worktrees::{self, Checked, Observation, Recorded, Removal};
 
 pub struct Daemon {
     socket_path: PathBuf,
     ledger_path: PathBuf,
     reconcile_every: Duration,
+    chat_sessions_every: Duration,
 }
 
 struct DaemonState {
@@ -85,7 +87,15 @@ impl Daemon {
             socket_path,
             ledger_path,
             reconcile_every: RECONCILE_INTERVAL,
+            chat_sessions_every: CHAT_SESSION_INTERVAL,
         }
+    }
+
+    /// Read what Claude's files say of the chats' sessions every
+    /// `interval` instead of [`CHAT_SESSION_INTERVAL`] (and on start).
+    pub fn chat_sessions_every(mut self, interval: Duration) -> Self {
+        self.chat_sessions_every = interval;
+        self
     }
 
     /// Check the members' worktrees against git every `interval` instead of
@@ -143,6 +153,9 @@ impl Daemon {
             asks: answer::Asks::default(),
         }));
 
+        // The chats' titles before the first client asks.
+        refresh_chat_sessions(&state).await;
+
         // Create socket directory
         if let Some(parent) = self.socket_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -177,6 +190,10 @@ impl Daemon {
         tokio::spawn(async move {
             reconcile_loop(reconcile_state, reconcile_every).await;
         });
+        tokio::spawn(chat_session_loop(
+            Arc::downgrade(&state),
+            self.chat_sessions_every,
+        ));
 
         loop {
             tokio::select! {
@@ -292,12 +309,19 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             context_counter = 0;
 
             // Phase 1: collect metadata under lock (cheap). Several chats
-            // share a directory: without the transcript their hooks report,
-            // the guess (the newest one there) may be another chat's.
+            // share a directory: a chat's transcript is known (its hooks',
+            // else its session's), never guessed (the newest one there may
+            // be another chat's).
             let jobs: Vec<_> = state
                 .agents
                 .iter()
-                .map(|(id, agent)| agent.context_refresh_job(id))
+                .map(|(id, agent)| {
+                    let mut job = agent.context_refresh_job(id);
+                    if state.ledger.is_chat(id) {
+                        job.transcript = state.chat_transcript(id);
+                    }
+                    job
+                })
                 .filter(|job| job.transcript.is_some() || !state.ledger.is_chat(&job.id))
                 .collect();
 
@@ -977,6 +1001,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             handle_change_chat(state, &chat, |ledger, id| ledger.keep_chat(id, keep)).await
         }
         Request::CloseChat { chat } => handle_close_chat(state, &chat).await,
+        Request::ChatHistory { dir } => handle_chat_history(state, dir).await,
     }
 }
 
@@ -3164,17 +3189,19 @@ async fn handle_create_chat(
     name: Option<String>,
     session: Option<String>,
 ) -> Response {
-    // Git runs before the lock.
+    // Git and Claude's files are read before the lock.
+    let given = session.clone();
     let checked = run_git(move || {
-        if !dir.is_absolute() {
-            anyhow::bail!("{}: not an absolute path", dir.display());
-        }
-        worktrees::check_main_checkout(&dir)?;
-        Ok(worktree::resolve_path(&dir))
+        let dir = main_checkout(&dir)?;
+        let said = match given {
+            Some(session) => claude_session_of(&dir, &session)?,
+            None => None,
+        };
+        Ok((dir, said))
     })
     .await;
-    let dir = match checked {
-        Ok(dir) => dir,
+    let (dir, said) = match checked {
+        Ok(checked) => checked,
         Err(e) => {
             return Response::Error {
                 message: format!("{e:#}"),
@@ -3187,6 +3214,13 @@ async fn handle_create_chat(
         .create_chat(&dir, name.as_deref(), session.as_deref())
     {
         Ok(chat) => {
+            let chat = match said {
+                Some(said) => state
+                    .ledger
+                    .set_chat_session(&chat.id, said)
+                    .unwrap_or(chat),
+                None => chat,
+            };
             info!(chat = %chat.id, dir = %chat.dir.display(), session = ?chat.session, "chat created");
             state.broadcast(Event::ChatCreated { chat: chat.clone() });
             Response::Chat {
@@ -3272,4 +3306,175 @@ async fn handle_close_chat(state: &Arc<Mutex<DaemonState>>, target: &str) -> Res
         let _ = tokio::task::spawn_blocking(move || agent.kill_and_drop()).await;
     }
     response
+}
+
+// ---------------------------------------------------------------------------
+// Chats' sessions in Claude's files (`crate::sessions`): each open chat's
+// title and last prompt, read again every 10s and kept in the ledger's
+// memory; a repository's history, for `CreateChat` to take a session from.
+// Read off the state lock.
+// ---------------------------------------------------------------------------
+
+/// How often the daemon reads again what Claude's files say of each open
+/// chat's session (title, last prompt).
+pub const CHAT_SESSION_INTERVAL: Duration = Duration::from_secs(10);
+
+impl DaemonState {
+    /// The file of the Claude session chat `id` is in: the transcript its
+    /// agent's hooks reported, else (before its first hook) the session its
+    /// agent resumed, else (no agent) its current session's, in its
+    /// checkout's Claude project. `None`: no such chat, or a new session
+    /// nobody typed in yet.
+    fn chat_transcript(&self, id: &str) -> Option<PathBuf> {
+        let chat = self.ledger.chat(id)?;
+        let session = match self.agents.get(id) {
+            Some(agent) => {
+                if let Some(path) = agent.context_refresh_job(id).transcript {
+                    return Some(path);
+                }
+                let run = self.ledger.runs_of(id).pop();
+                run.filter(|r| r.ended_at.is_none())?.session_id?
+            }
+            None => chat.session?,
+        };
+        sessions::session_file(&sessions::claude_dir()?, &chat.dir, &session)
+    }
+}
+
+/// `dir` as a chat's: an absolute path to a repository's main checkout,
+/// resolved. Runs git.
+fn main_checkout(dir: &Path) -> Result<PathBuf> {
+    if !dir.is_absolute() {
+        anyhow::bail!("{}: not an absolute path", dir.display());
+    }
+    worktrees::check_main_checkout(dir)?;
+    Ok(worktree::resolve_path(dir))
+}
+
+/// What Claude's files say of `session`, a session run in `dir`; an error
+/// when they hold no such session. Not looked for (`None`) when Claude's
+/// directory is unknown; an empty id is the ledger's to refuse.
+fn claude_session_of(dir: &Path, session: &str) -> Result<Option<ChatSession>> {
+    let Some(claude) = sessions::claude_dir().filter(|_| !session.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match sessions::session_file(&claude, dir, session).filter(|f| f.is_file()) {
+        Some(file) => Ok(Some(chat_session(sessions::read(&file)))),
+        None => anyhow::bail!(
+            "Claude has no session {} run in {} (looked in {})",
+            session,
+            dir.display(),
+            sessions::project_dir(&claude, dir).display()
+        ),
+    }
+}
+
+fn chat_session(read: Option<tam_proto::SessionInfo>) -> ChatSession {
+    read.map(|s| ChatSession {
+        title: s.title,
+        last_prompt: s.last_prompt,
+    })
+    .unwrap_or_default()
+}
+
+/// Holds the state only while it reads: a daemon shut down lets go of its
+/// ledger at once (a test starts the next one in the same process).
+async fn chat_session_loop(state: Weak<Mutex<DaemonState>>, every: Duration) {
+    // The first pass ran before the daemon took clients.
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Some(state) = state.upgrade() else {
+            break;
+        };
+        if state.lock().await.shutdown {
+            break;
+        }
+        refresh_chat_sessions(&state).await;
+    }
+}
+
+/// Read again what Claude's files say of each open chat's session, and
+/// push `ChatUpdated` for each chat where it changed.
+async fn refresh_chat_sessions(state: &Arc<Mutex<DaemonState>>) {
+    let files: Vec<(String, Option<PathBuf>)> = {
+        let state = state.lock().await;
+        let chats = state.ledger.chats();
+        chats
+            .into_iter()
+            .map(|chat| {
+                let file = state.chat_transcript(&chat.id);
+                (chat.id, file)
+            })
+            .collect()
+    };
+    if files.is_empty() {
+        return;
+    }
+    let read = tokio::task::spawn_blocking(move || {
+        files
+            .into_iter()
+            .map(|(id, file)| {
+                let said = chat_session(file.as_deref().and_then(sessions::read));
+                (id, file, said)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    let Ok(read) = read else {
+        return;
+    };
+    let mut state = state.lock().await;
+    for (id, file, said) in read {
+        // Its agent went to another session meanwhile: the next pass reads it.
+        if state.chat_transcript(&id) != file {
+            continue;
+        }
+        if let Some(chat) = state.ledger.set_chat_session(&id, said) {
+            state.broadcast(Event::ChatUpdated { chat });
+        }
+    }
+}
+
+/// The Claude sessions of the repository whose main checkout is `dir`,
+/// newest first, but those an open chat holds.
+async fn handle_chat_history(state: &Arc<Mutex<DaemonState>>, dir: PathBuf) -> Response {
+    let dir = match run_git(move || main_checkout(&dir)).await {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    let Some(claude) = sessions::claude_dir() else {
+        return Response::Sessions {
+            sessions: Vec::new(),
+        };
+    };
+    // A chat holds its current session, and the one its agent is in (a
+    // new session, before its first turn is recorded).
+    let held: HashSet<String> = {
+        let state = state.lock().await;
+        let chats = state.ledger.chats();
+        chats
+            .into_iter()
+            .flat_map(|chat| {
+                let running = state
+                    .chat_transcript(&chat.id)
+                    .and_then(|f| Some(f.file_stem()?.to_string_lossy().into_owned()));
+                chat.session.into_iter().chain(running)
+            })
+            .collect()
+    };
+    let history = tokio::task::spawn_blocking(move || sessions::history(&claude, &dir))
+        .await
+        .unwrap_or_default();
+    Response::Sessions {
+        sessions: history
+            .into_iter()
+            .filter(|s| !held.contains(&s.id))
+            .collect(),
+    }
 }

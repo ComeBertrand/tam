@@ -345,7 +345,7 @@ impl Provider for ClaudeProvider {
     }
 
     fn session_exists(&self, session: &str) -> bool {
-        match claude_config_dir() {
+        match crate::sessions::claude_dir() {
             Some(dir) => claude_transcript_exists(&dir, session),
             None => true,
         }
@@ -581,14 +581,6 @@ struct ClaudeUsage {
     cache_read_input_tokens: u64,
 }
 
-/// Claude's data directory: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn claude_config_dir() -> Option<PathBuf> {
-    match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
-        _ => Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude")),
-    }
-}
-
 /// Whether a transcript of `session` is in one of Claude's project
 /// directories (`<claude dir>/projects/<encoded cwd>/<session>.jsonl`).
 /// Every project is looked at: the encoding of the directory is Claude's.
@@ -632,12 +624,8 @@ fn claude_context_usage(pid: u32, dir: &Path, transcript: Option<&Path>) -> Opti
 }
 
 fn claude_guess_transcript(pid: u32, dir: &Path) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let claude_dir = PathBuf::from(&home).join(".claude");
-
-    // Encode directory path the way Claude does: /home/user/foo → -home-user-foo
-    let encoded_dir = encode_claude_path(dir);
-    let project_dir = claude_dir.join("projects").join(&encoded_dir);
+    let claude_dir = crate::sessions::claude_dir()?;
+    let project_dir = crate::sessions::project_dir(&claude_dir, dir);
 
     // Claude's sessionId in the PID file doesn't always match the JSONL filename
     // (e.g. when resuming a session, the JSONL keeps its original name).
@@ -674,11 +662,6 @@ fn claude_most_recent_jsonl(project_dir: &Path) -> Option<PathBuf> {
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
         })
         .map(|e| e.path())
-}
-
-fn encode_claude_path(dir: &Path) -> String {
-    let s = dir.to_string_lossy();
-    s.replace('/', "-")
 }
 
 fn find_last_usage(content: &str) -> Option<(ClaudeUsage, Option<String>)> {
@@ -1247,19 +1230,6 @@ mod tests {
             limit_tokens: 200_000,
         };
         assert_eq!(cu.percent(), 100);
-    }
-
-    #[test]
-    fn encode_claude_path_basic() {
-        assert_eq!(
-            encode_claude_path(Path::new("/home/user/Workspace/tam")),
-            "-home-user-Workspace-tam"
-        );
-    }
-
-    #[test]
-    fn encode_claude_path_root() {
-        assert_eq!(encode_claude_path(Path::new("/")), "-");
     }
 
     #[test]

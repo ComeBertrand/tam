@@ -178,7 +178,8 @@ adopt). `tam-cli` depends on all three.
   session nobody typed in has no transcript, so it never counts. `current`
   resumes only if `session_exists()` (Claude deletes old transcripts); an
   explicit id is not checked. No session picker, no transcript scanning
-  in `tam-cli`.
+  in `tam-cli`, for a member; a chat is made from its repository's
+  history, which the daemon reads (see Chats).
 - **Messages** — `tam msg` (`SendMessage`; sender = the member of the
   caller's `$TAM_AGENT_ID`, resolved by the daemon, else the user). Messages
   are ledger events kept with the recipient member (`MessageSent`,
@@ -530,18 +531,19 @@ adopt). `tam-cli` depends on all three.
   and turn. Listed in creation order (`ChatRecord::order`). Requests (handlers
   at the end of `daemon.rs`): `CreateChat { dir, name, session }` records only
   (`worktrees::check_main_checkout`, the same check as `check_new`; the dir
-  resolved; a session another chat holds is refused, its existence is checked
-  at the first start); `RunAgent { member: <chat id> }` starts its agent in
-  the checkout, `Current` being the latest session it had a turn in, else the
-  one it was made from (`ChatInfo::session`); `ListChats`, `GetChat`,
+  resolved; a session is refused unless Claude's files have it in that
+  checkout's project (`claude_session_of`), and when another chat holds it;
+  checked again at the first start); `RunAgent { member: <chat id> }`
+  starts its agent in the checkout, `Current` being the latest session it
+  had a turn in, else the one it was made from (`ChatInfo::session`); `ListChats`, `GetChat`,
   `RenameChat`, `KeepChat`, `CloseChat` (agent taken out, `ChatClosed`, then
   killed and waited for outside the lock; replies the chat as it was, with
   its session, to make it again; never touches the checkout, its branch or
   Claude's transcript). Chat targets: an id or a name (`resolve_chat`; names
   unique among chats, trimmed, never id-shaped). Events `ChatCreated`,
-  `ChatUpdated`, `ChatClosed`. `ChatInfo::label()`: the name, else the id
-  (#64 puts the title between). Last turn (#65): `ChatTurn` at a
-  `UserPromptSubmit` the user typed, neither a tam message being delivered
+  `ChatUpdated`, `ChatClosed`. `ChatInfo::label()`: the name, else the
+  title, else the id (only the name and the id resolve). Last turn (#65):
+  `ChatTurn` at a `UserPromptSubmit` the user typed, neither a tam message being delivered
   nor a `<task-notification>` (`handle_inbox_hook`), `ChatInfo::last_turn_at`.
   What does not apply: worktree creation, reconciliation and health, repair,
   adopt, drop, brief and task directory, `TaskAccess` (`member_access` is
@@ -557,11 +559,29 @@ adopt). `tam-cli` depends on all three.
   stays members only): `tam run`/`attach` with no name in a main checkout
   find no task, `tam peers` says "not in a task". Notify: `{task}` is a chat's
   label, `{id}` its id; custom commands (#67) are to give the same, `{dir}`
-  being the main checkout. A session given to `CreateChat` is not checked
-  against that repository's own history (the first start only checks that a
-  transcript exists in some project): #64's, with the history. Context use
-  never guesses a chat's transcript (several sessions share its directory):
-  the hooks' only. The dashboard ignores chat events for now (#67).
+  being the main checkout. Titles and history (#64): the daemon's
+  `sessions.rs` is the only reader of Claude's session files
+  (`<claude dir>/projects/<project>/<session>.jsonl`; `project_name` is Claude's
+  encoding: every UTF-16 unit but ASCII letters and digits a `-`, past 200
+  cut and hashed), an undocumented format: a file it cannot read gives
+  nothing. From the last 64 KiB, then the first (`WINDOW`: what Claude reads
+  for its own list, and Claude writes these lines again every 32 KiB): the
+  latest `custom-title` (the user's `/rename`; an empty one takes it back),
+  else the latest `ai-title`; the latest `last-prompt`; the file's mtime.
+  `ChatInfo::title`/`last_prompt` are those of the session the chat is in
+  (`DaemonState::chat_transcript`: its agent's hooks' transcript, else the
+  session its agent resumed, else its current session's file; none for a new
+  session nobody typed in), kept in the ledger's memory
+  (`Ledger::set_chat_session`, never written), read off the lock on start
+  before the socket is bound, then every 10s (`CHAT_SESSION_INTERVAL`,
+  `Daemon::chat_sessions_every` in tests), `ChatUpdated` when they change.
+  `ChatHistory { dir }` (a main checkout) replies `Sessions` (`SessionInfo`:
+  id, title, last prompt, `modified_at`), newest first, without the sessions
+  with neither title nor prompt and those a chat holds (its `session`, and
+  the one its agent is in). Context use reads a chat's transcript from
+  `chat_transcript`, never guesses it (several sessions share its
+  directory). Known limit: under the daemon's `HOME`/`CLAUDE_CONFIG_DIR`.
+  The dashboard ignores chat events for now (#67).
 
 ## Build & check
 
@@ -600,9 +620,15 @@ cargo test
   refusals, two chats at once, a restart, close leaving a dirty checkout as
   it was, messages with a member) and `chat_claude.rs` (one test, a fake
   `claude` on the `PATH` sent with `RunAgent`, `CLAUDE_CONFIG_DIR` set:
-  resume from a session, no start note or task access, which prompts are
-  turns, inbox delivery, an answer, a restart, close keeping the transcript
-  and making the chat again).
+  resume from a session of its repository, its title from the transcript
+  its hooks report, no start note or task access,
+  which prompts are turns, inbox delivery, an answer, a restart, close
+  keeping the transcript and making the chat again) and `chat_history.rs`
+  (one test, `CLAUDE_CONFIG_DIR` set, session files written by hand: the
+  history, a chat made from a session of its repository only, its title
+  read again as Claude rewrites it, gone while its agent runs a new
+  session, there at once after a restart); `sessions.rs` unit tests write
+  fixture lines by hand (never copied from real files).
 - `agent_env.rs`, in both crates: the daemon's runs an agent found only on
   the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
   value) in replies, events, errors and every file next to the ledger,

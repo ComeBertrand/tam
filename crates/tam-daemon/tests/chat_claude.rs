@@ -1,5 +1,8 @@
-//! A chat's Claude agent, through a daemon: made from an existing session,
-//! it resumes it, with tam's hooks but no start note and no task access;
+//! A chat's Claude agent, through a daemon: made from an existing session
+//! of its repository (with the title Claude gave it; another repository's
+//! is refused, one deleted since is refused at the start), it resumes it,
+//! with tam's hooks but no start note and no task access; its title is
+//! read from the transcript its hooks report;
 //! the user's prompts are its turns (a tam message or a background
 //! notification is none); `[notify]` names it by its name and id; messages
 //! reach it through its inbox hook; a client answers its permission
@@ -127,7 +130,8 @@ fn hook_event(agent: &str, event: &str, extra: Value) -> Request {
 
 async fn start_daemon(sock: &Path, ledger: &Path) {
     let daemon = Daemon::new(sock.to_path_buf(), ledger.to_path_buf())
-        .reconcile_every(Duration::from_millis(200));
+        .reconcile_every(Duration::from_millis(200))
+        .chat_sessions_every(Duration::from_millis(100));
     tokio::spawn(async move {
         let _ = daemon.run().await;
     });
@@ -239,12 +243,6 @@ async fn a_chats_claude_agent() {
     }
     let claude_dir = root.join("claude");
     std::env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
-    let transcript = claude_dir
-        .join("projects")
-        .join("-src-api")
-        .join(format!("{SESSION}.jsonl"));
-    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-    std::fs::write(&transcript, "{}\n").unwrap();
     let bin = root.join("bin");
     let args = root.join("args");
     fake_claude(&bin, &args);
@@ -260,6 +258,18 @@ async fn a_chats_claude_agent() {
     std::fs::create_dir_all(&api).unwrap();
     git(&api, &["init", "-q"]);
     git(&api, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    // Claude's transcript of a session, in the repository's project (named
+    // from its resolved path, as Claude names it), with the title Claude
+    // gave it.
+    let resolved = api.canonicalize().unwrap();
+    let transcript_of = |session: &str| {
+        let file = tam_daemon::sessions::session_file(&claude_dir, &resolved, session).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let title = json!({"type": "ai-title", "aiTitle": "Debug the API", "sessionId": session});
+        std::fs::write(&file, format!("{title}\n")).unwrap();
+        file
+    };
+    let transcript = transcript_of(SESSION);
 
     let sock = root.join("tam.sock");
     let ledger = root.join("ledger.jsonl");
@@ -277,6 +287,8 @@ async fn a_chats_claude_agent() {
         })
         .await;
     assert_eq!(chat.session.as_deref(), Some(SESSION));
+    assert_eq!(chat.title.as_deref(), Some("Debug the API"));
+    assert_eq!(chat.label(), "debug");
     let id = chat.id.clone();
     match conn.request(&run(&id, &env)).await {
         Response::Running {
@@ -303,11 +315,30 @@ async fn a_chats_claude_agent() {
     assert!(settings["hooks"]["SessionStart"].is_array(), "{settings}");
     assert!(settings.get("permissions").is_none(), "{settings}");
 
-    // No start note.
+    // No start note. Its hooks say where its transcript is (here, in a
+    // Claude directory of the agent's own): its title is read there.
+    let own = root.join("agent-claude").join(format!("{SESSION}.jsonl"));
+    std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+    let seen = "Debug the API, as its agent writes it";
+    let title = json!({"type": "ai-title", "aiTitle": seen, "sessionId": SESSION});
+    std::fs::write(&own, format!("{title}\n")).unwrap();
     let resp = conn
-        .hook(&id, "SessionStart", json!({ "source": "resume" }))
+        .hook(
+            &id,
+            "SessionStart",
+            json!({ "source": "resume", "transcript_path": own }),
+        )
         .await;
     assert!(matches!(resp, Response::Ok), "{resp:?}");
+    let titled = events
+        .event(|e| match e {
+            Event::ChatUpdated { chat } if chat.id == id && chat.title.as_deref() == Some(seen) => {
+                Some(chat.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(titled.label(), "debug");
 
     // The user's prompt is a turn; clients are told.
     assert_eq!(turns_recorded(&ledger), 0);
@@ -450,7 +481,17 @@ async fn a_chats_claude_agent() {
         Response::Chats { chats } => chats,
         other => panic!("expected Chats, got {other:?}"),
     };
-    assert_eq!(after, before);
+    // Its title, with no agent to report a transcript, is its session's
+    // in the repository's project again.
+    assert_eq!(before[0].title.as_deref(), Some(seen));
+    assert_eq!(after[0].title.as_deref(), Some("Debug the API"));
+    let without_titles = |chats: Vec<ChatInfo>| {
+        chats
+            .into_iter()
+            .map(|c| ChatInfo { title: None, ..c })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(without_titles(after.clone()), without_titles(before));
     assert_eq!(after[0].last_turn_at, turned.last_turn_at);
     std::fs::remove_file(args.join(&id)).unwrap();
     match conn.request(&run(&id, &env)).await {
@@ -492,14 +533,30 @@ async fn a_chats_claude_agent() {
         .await;
     assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
 
-    // A session with no transcript is refused when the agent starts.
-    let missing = conn
-        .chat(&Request::CreateChat {
+    // A session that is not one of the repository's is refused at once.
+    match conn
+        .request(&Request::CreateChat {
             dir: api.clone(),
             name: None,
             session: Some("no-such-session".into()),
         })
+        .await
+    {
+        Response::Error { message } => assert!(message.contains("no session"), "{message}"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    // One whose transcript Claude deleted since is refused when the agent
+    // starts.
+    let gone = "5e1d7a2c-0b9f-4d3e-8a6b-1c2d3e4f5a6b";
+    let file = transcript_of(gone);
+    let missing = conn
+        .chat(&Request::CreateChat {
+            dir: api.clone(),
+            name: None,
+            session: Some(gone.into()),
+        })
         .await;
+    std::fs::remove_file(file).unwrap();
     match conn.request(&run(&missing.id, &env)).await {
         Response::Error { message } => {
             assert!(message.contains("can no longer be resumed"), "{message}");

@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde::Serialize;
-use tam_proto::{AgentInfo, MemberInfo, MemberOutcome, MemberState, TaskInfo};
+use tam_proto::{AgentInfo, ChatInfo, MemberInfo, MemberOutcome, MemberState, TaskInfo};
 
 use crate::cli::{Commands, Until};
-use crate::client::Client;
+use crate::client::{Client, Target};
 use crate::schema::{self, ErrorInfo, SCHEMA_VERSION};
 
 /// Why a command failed, as scripts tell it: its exit status and, with
@@ -95,7 +95,7 @@ pub fn kind_of(err: &anyhow::Error) -> ErrorKind {
 }
 
 impl ErrorInfo {
-    fn new(err: &anyhow::Error) -> Self {
+    pub fn new(err: &anyhow::Error) -> Self {
         Self {
             kind: kind_of(err).as_str(),
             message: format!("{err:#}"),
@@ -116,7 +116,11 @@ pub fn json_output(command: &Commands) -> bool {
         | Commands::Result { json, .. }
         | Commands::Brief { json, .. }
         | Commands::Merge { json, .. }
-        | Commands::Split { json, .. } => *json,
+        | Commands::Split { json, .. }
+        | Commands::Chat { json, .. }
+        | Commands::Close { json, .. }
+        | Commands::Rename { json, .. }
+        | Commands::Keep { json, .. } => *json,
         _ => false,
     }
 }
@@ -144,7 +148,7 @@ pub fn fail(err: &anyhow::Error, json: bool) -> i32 {
 
 /// End a command that printed its JSON document (with `error`): its
 /// failure is only to exit with.
-fn finish(error: Option<anyhow::Error>, json: bool) -> Result<()> {
+pub fn finish(error: Option<anyhow::Error>, json: bool) -> Result<()> {
     match error {
         None => Ok(()),
         Some(err) if json => Err(CliError {
@@ -213,7 +217,7 @@ pub async fn start_detached(
     if json {
         print_json(&schema::Receipt {
             schema_version: SCHEMA_VERSION,
-            task: task.name.clone(),
+            of: schema::Subject::Task(task.name.clone()),
             members: started,
             error: failure.as_ref().map(ErrorInfo::new),
         })?;
@@ -236,7 +240,12 @@ pub async fn start_detached(
 }
 
 /// `tam ps --json` (see `schema::Ps`).
-pub async fn ps(client: &mut Client, infos: Vec<TaskInfo>, agents: &[AgentInfo]) -> Result<()> {
+pub async fn ps(
+    client: &mut Client,
+    infos: Vec<TaskInfo>,
+    chats: Vec<ChatInfo>,
+    agents: &[AgentInfo],
+) -> Result<()> {
     let mut tasks = Vec::with_capacity(infos.len());
     for info in infos {
         // The runs tell the members' last exit and session. A task dropped
@@ -248,24 +257,56 @@ pub async fn ps(client: &mut Client, infos: Vec<TaskInfo>, agents: &[AgentInfo])
         };
         tasks.push((info, runs));
     }
-    print_json(&schema::Ps::new(tasks, agents))
+    let mut with_runs = Vec::with_capacity(chats.len());
+    for chat in chats {
+        // A chat closed meanwhile has none.
+        let runs = match client.get_chat(&chat.id).await {
+            Ok((_, runs)) => runs,
+            Err(e) if kind_of(&e) == ErrorKind::Daemon => return Err(e),
+            Err(_) => Vec::new(),
+        };
+        with_runs.push((chat, runs));
+    }
+    print_json(&schema::Ps::new(tasks, with_runs, agents))
 }
 
-/// The members a command acts on: all of a task's, the one named as
-/// TASK/MEMBER or by id, or the one whose worktree holds the current
-/// directory.
-async fn task_members(
-    client: &mut Client,
-    name: Option<&str>,
-) -> Result<(TaskInfo, Vec<MemberInfo>)> {
+/// The agents a command acts on: those of a task's members, or a chat's.
+enum Agents {
+    Task(TaskInfo, Vec<MemberInfo>),
+    Chat(ChatInfo),
+}
+
+impl Agents {
+    /// The member (or chat) ids, as the daemon takes them.
+    fn ids(&self) -> Vec<String> {
+        match self {
+            Self::Task(_, members) => members.iter().map(|m| m.id.clone()).collect(),
+            Self::Chat(chat) => vec![chat.id.clone()],
+        }
+    }
+
+    fn outcomes(&self, outcomes: &[MemberOutcome], error: Option<ErrorInfo>) -> schema::Outcomes {
+        match self {
+            Self::Task(task, _) => schema::Outcomes::new(task, outcomes, error),
+            Self::Chat(chat) => schema::Outcomes::chat(chat, outcomes, error),
+        }
+    }
+}
+
+/// The agents a command acts on: all of a task's members, the one named as
+/// TASK/MEMBER or by id, a chat (by id, or by a name no task has), or the
+/// member whose worktree holds the current directory.
+async fn agents_of(client: &mut Client, name: Option<&str>) -> Result<Agents> {
     if let Some(name) = name {
         if let Ok((task, _)) = client.get_task(name).await {
             let members = task.members.clone();
-            return Ok((task, members));
+            return Ok(Agents::Task(task, members));
         }
     }
-    let (task, member, _) = crate::resolve_member(client, name).await?;
-    Ok((task, vec![member]))
+    Ok(match crate::resolve_target(client, name).await? {
+        Target::Member(task, member) => Agents::Task(task, vec![member]),
+        Target::Chat(chat, _) => Agents::Chat(chat),
+    })
 }
 
 fn member_state(until: Until) -> MemberState {
@@ -289,13 +330,13 @@ pub async fn wait(
     json: bool,
 ) -> Result<()> {
     let mut client = Client::connect().await?;
-    let (task, members) = task_members(&mut client, name.as_deref()).await?;
+    let agents = agents_of(&mut client, name.as_deref()).await?;
     let until: Vec<MemberState> = if until.is_empty() {
         MemberState::SETTLED.to_vec()
     } else {
         until.into_iter().map(member_state).collect()
     };
-    let ids = members.into_iter().map(|m| m.id).collect();
+    let ids = agents.ids();
     let timeout_secs = timeout.map(|t| t.as_secs());
     let (outcomes, timed_out) = client.wait_agents(ids, until.clone(), timeout_secs).await?;
 
@@ -327,7 +368,7 @@ pub async fn wait(
     };
     if json {
         let info = error.as_ref().map(ErrorInfo::new);
-        print_json(&schema::Outcomes::new(&task, &outcomes, info))?;
+        print_json(&agents.outcomes(&outcomes, info))?;
     } else {
         for o in &outcomes {
             println!("{}", state_line(o));
@@ -339,9 +380,8 @@ pub async fn wait(
 /// `tam result`: print the responses that ended the agents' last turns.
 pub async fn result(name: Option<String>, json: bool) -> Result<()> {
     let mut client = Client::connect().await?;
-    let (task, members) = task_members(&mut client, name.as_deref()).await?;
-    let ids = members.into_iter().map(|m| m.id).collect();
-    let outcomes = client.outcomes(ids).await?;
+    let agents = agents_of(&mut client, name.as_deref()).await?;
+    let outcomes = client.outcomes(agents.ids()).await?;
 
     let missing: Vec<String> = outcomes
         .iter()
@@ -351,7 +391,7 @@ pub async fn result(name: Option<String>, json: bool) -> Result<()> {
     let error = (!missing.is_empty()).then(|| error(ErrorKind::NoResult, missing.join("; ")));
     if json {
         let info = error.as_ref().map(ErrorInfo::new);
-        print_json(&schema::Outcomes::new(&task, &outcomes, info))?;
+        print_json(&agents.outcomes(&outcomes, info))?;
     } else {
         // Several members: each response under its member's name.
         let several = outcomes.len() > 1;

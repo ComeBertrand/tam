@@ -61,18 +61,22 @@ pub enum Commands {
         brief: Option<String>,
     },
 
-    /// Start an agent in a task, resuming its current session
+    /// Start an agent in a task (or a chat), resuming its current session
     ///
-    /// The current session is the last one the agent had a turn in.
+    /// The current session is the last one the agent had a turn in. A chat
+    /// always resumes its own: --new-session and --session are for tasks.
     Run {
-        /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
+        /// Task name, TASK/MEMBER, or a chat's id or name (resolved from
+        /// current directory if omitted)
         name: Option<String>,
 
-        /// Start a new session (it becomes current once you use it)
+        /// Start a new session (it becomes current once you use it; not for
+        /// a chat)
         #[arg(long, conflicts_with = "session")]
         new_session: bool,
 
-        /// Resume this agent session instead of the current one
+        /// Resume this agent session instead of the current one (not for a
+        /// chat: tam chat --session makes another chat)
         #[arg(long, value_name = "ID")]
         session: Option<String>,
 
@@ -101,15 +105,18 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Stop the agents of a task (or of one member: TASK/MEMBER)
+    /// Stop the agents of a task (or of one member: TASK/MEMBER), or a
+    /// chat's agent (the chat stays: tam run resumes it)
     Stop {
-        /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
+        /// Task name, TASK/MEMBER, or a chat's id or name (resolved from
+        /// current directory if omitted)
         name: Option<String>,
     },
 
     /// Attach to a running agent
     Attach {
-        /// Task name, or TASK/MEMBER (resolved from current directory if omitted)
+        /// Task name, TASK/MEMBER, or a chat's id or name (resolved from
+        /// current directory if omitted)
         name: Option<String>,
     },
 
@@ -155,7 +162,7 @@ pub enum Commands {
         name: String,
     },
 
-    /// List tasks with computed status
+    /// List chats and tasks with computed status
     Ps {
         /// Output as JSON
         #[arg(long)]
@@ -225,15 +232,16 @@ pub enum Commands {
         event: Option<String>,
     },
 
-    /// Send a message to the agent of a task member
+    /// Send a message to the agent of a task member (or of a chat)
     ///
     /// The agent gets it right away: when idle it wakes up, when busy it
     /// reads it at its next step. A member with no running agent gets it
     /// when its next agent starts. Sent from an agent tam started, it comes
-    /// from that agent's member; else from the user.
+    /// from that agent's member (or chat); else from the user.
     Msg {
         /// Recipient: task name, TASK/MEMBER or member id; from an agent,
-        /// also the short name of another member of its task (see tam peers)
+        /// also the short name of another member of its task (see tam
+        /// peers); then a chat's id or name
         target: String,
 
         /// Message text (read from stdin when omitted)
@@ -253,9 +261,10 @@ pub enum Commands {
         from: Option<String>,
     },
 
-    /// Show a task's history: its agent runs and messages
+    /// Show a task's (or a chat's) history: its agent runs and messages
     History {
-        /// Task name (resolved from current directory if omitted)
+        /// Task name, or a chat's id or name (resolved from current
+        /// directory if omitted)
         task: Option<String>,
 
         /// Output as JSON
@@ -295,7 +304,8 @@ pub enum Commands {
         from: Option<String>,
     },
 
-    /// Wait until the agents of a task (or of one member) stop working
+    /// Wait until the agents of a task (or of one member, or a chat's) stop
+    /// working
     ///
     /// Done once each agent is in one of the --until states (default: any
     /// but working; ready also takes idle, the state of agents without
@@ -303,8 +313,8 @@ pub enum Commands {
     /// unless --until takes exit or error. Exit status: 0 done, 1 gave up,
     /// 3 no such task or member, 4 timed out, 5 daemon unreachable.
     Wait {
-        /// Task name (all its members), TASK/MEMBER or member id (resolved
-        /// from current directory if omitted)
+        /// Task name (all its members), TASK/MEMBER, member id, or a chat's
+        /// id or name (resolved from current directory if omitted)
         name: Option<String>,
 
         /// States to wait for, comma-separated
@@ -321,7 +331,8 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Print the last response of a task's agents (or of one member's)
+    /// Print the last response of a task's agents (or of one member's, or
+    /// a chat's)
     ///
     /// The text that ended the agent's last turn, in full, kept once the
     /// agent exits. There is none while a turn runs, before the first one
@@ -329,8 +340,8 @@ pub enum Commands {
     /// none (only Claude reports them). Exit status: 0 printed, 1 no
     /// response, 3 no such task or member, 5 daemon unreachable.
     Result {
-        /// Task name (all its members), TASK/MEMBER or member id (resolved
-        /// from current directory if omitted)
+        /// Task name (all its members), TASK/MEMBER, member id, or a chat's
+        /// id or name (resolved from current directory if omitted)
         name: Option<String>,
 
         /// Output as JSON (see README, Scripting)
@@ -397,6 +408,93 @@ pub enum Commands {
         /// Name of the new task (default: the member's branch, unless a task
         /// has that name)
         name: Option<String>,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Start a chat: a Claude session on a repository's main checkout, then
+    /// attach
+    ///
+    /// A chat owns nothing on disk (no worktree, no branch); several can run
+    /// on one repository. The commands that take a task take a chat too
+    /// (attach, stop, run, msg, wait, result, history), by its id or its
+    /// name: a task of that name comes first. tam ps lists chats.
+    Chat {
+        /// Repository: a path to it (or to any directory in it), or its name
+        /// as tam ls shows it (default: the current one, from a worktree its
+        /// main checkout)
+        repo: Option<String>,
+
+        /// Name the chat (unique among chats, and no task's name; default:
+        /// shown by its Claude title, else its id)
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Resume this existing Claude session of the repository instead of
+        /// starting a new one
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+
+        /// Keep the chat: never closed for want of turns
+        #[arg(long)]
+        keep: bool,
+
+        /// Start the agent on this prompt
+        #[arg(short, long, value_name = "TEXT")]
+        prompt: Option<String>,
+
+        /// Don't attach to the agent (never attaches without a terminal)
+        #[arg(short, long)]
+        detach: bool,
+
+        /// Print a JSON receipt instead of attaching (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Close a chat: stop its agent and forget the chat
+    ///
+    /// Asks first, on the terminal. Nothing on disk changes: Claude keeps
+    /// the session, and tam chat REPO --session ID makes the chat again
+    /// (tam close prints it). Exit status: 0 closed, 1 not confirmed or
+    /// refused, 3 no such chat, 5 daemon unreachable.
+    Close {
+        /// The chat's id or name
+        chat: String,
+
+        /// Close without asking (needed without a terminal)
+        #[arg(short, long)]
+        yes: bool,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Name a chat, or take its name away
+    Rename {
+        /// The chat's id or name
+        chat: String,
+
+        /// Its new name, unique among chats and no task's name (none: the
+        /// chat is shown by its Claude title, else its id, again)
+        name: Option<String>,
+
+        /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Keep a chat: never closed for want of turns
+    Keep {
+        /// The chat's id or name
+        chat: String,
+
+        /// Stop keeping it
+        #[arg(long)]
+        off: bool,
 
         /// Output as JSON (see README, Scripting)
         #[arg(long)]

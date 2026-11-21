@@ -6,9 +6,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tam_proto::{Event, MessageInfo, Request, Response, RunInfo, ServerMessage, TaskInfo};
+use tam_proto::{
+    ChatInfo, Event, MessageInfo, Request, Response, RunInfo, ServerMessage, TaskInfo,
+};
 
-use crate::client::Client;
+use crate::client::{Client, Target};
+use crate::script::{self, ErrorKind};
 
 /// How long `tam msg` waits to see the message delivered before reporting
 /// it as on its way.
@@ -123,22 +126,39 @@ async fn delivered_soon(client: &mut Client, id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `tam history`: a task's agent runs and messages, oldest first.
+/// `tam history`: the agent runs and messages of a task (or of a chat),
+/// oldest first.
 pub async fn history(task: Option<String>, json: bool) -> Result<()> {
     let mut client = Client::connect().await?;
-    let name = match task {
-        Some(name) => name,
+    let of = match task {
+        Some(name) => match client.get_task(&name).await {
+            Ok((task, runs)) => History::Task(task, runs),
+            Err(e) if script::kind_of(&e) == ErrorKind::Daemon => return Err(e),
+            // A member's task, or a chat.
+            Err(_) => match client.resolve_target(&name).await? {
+                Target::Member(task, ..) => {
+                    let (task, runs) = client.get_task(&task.name).await?;
+                    History::Task(task, runs)
+                }
+                Target::Chat(chat, runs) => History::Chat(chat, runs),
+            },
+        },
         None => {
             let cwd = std::fs::canonicalize(".")?;
-            client
+            let name = client
                 .resolve_member(None, Some(&cwd))
                 .await
                 .map_err(|_| anyhow!("no task in current directory"))?
                 .0
-                .name
+                .name;
+            let (task, runs) = client.get_task(&name).await?;
+            History::Task(task, runs)
         }
     };
-    let (task, runs) = client.get_task(&name).await?;
+    let (key, name, runs) = match &of {
+        History::Task(task, runs) => ("task", task.name.clone(), runs),
+        History::Chat(chat, runs) => ("chat", chat.id.clone(), runs),
+    };
     let messages = match client
         .send(Request::ListMessages {
             task: Some(name.clone()),
@@ -151,16 +171,32 @@ pub async fn history(task: Option<String>, json: bool) -> Result<()> {
 
     if json {
         let out = serde_json::json!({
-            "task": task.name,
+            key: name,
             "runs": runs,
             "messages": messages,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
-    let lines = history_lines(&task, &runs, &messages);
+    let label = |id: &str| match &of {
+        History::Task(task, _) => match task.member(id) {
+            Some(m) => task.member_label(m),
+            None => id.to_string(),
+        },
+        History::Chat(chat, _) if chat.id == id => chat.label(),
+        History::Chat(..) => id.to_string(),
+    };
+    let lines = history_lines(&label, runs, &messages);
     if lines.is_empty() {
-        println!("No runs or messages in task '{}'.", task.name);
+        match &of {
+            History::Task(task, _) => println!("No runs or messages in task '{}'.", task.name),
+            History::Chat(chat, _) => {
+                println!(
+                    "No runs or messages in chat {}.",
+                    crate::chat::describe(chat)
+                )
+            }
+        }
     }
     for (at, line) in lines {
         println!("{:>5}  {line}", crate::format_age(Some(at)));
@@ -168,17 +204,20 @@ pub async fn history(task: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whose history `tam history` shows, with its runs.
+enum History {
+    Task(TaskInfo, Vec<RunInfo>),
+    Chat(ChatInfo, Vec<RunInfo>),
+}
+
 /// One line per run start, run end and message, with its timestamp, in
-/// time order.
+/// time order. `label` names a run's member (or chat).
 fn history_lines(
-    task: &TaskInfo,
+    label: &dyn Fn(&str) -> String,
     runs: &[RunInfo],
     messages: &[MessageInfo],
 ) -> Vec<(u64, String)> {
-    let member = |id: &str| match task.member(id) {
-        Some(m) => task.member_label(m),
-        None => id.to_string(),
-    };
+    let member = label;
     let mut lines = Vec::new();
     for run in runs {
         let session = run
@@ -312,7 +351,12 @@ mod tests {
             sent_at: 20,
             delivered_at: Some(21),
         }];
-        let lines = history_lines(&task(), &runs, &messages);
+        let task = task();
+        let label = |id: &str| {
+            task.member(id)
+                .map_or(id.to_string(), |m| task.member_label(m))
+        };
+        let lines = history_lines(&label, &runs, &messages);
         let lines: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
         assert_eq!(
             lines,

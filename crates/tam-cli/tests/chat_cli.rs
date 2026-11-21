@@ -4,9 +4,10 @@
 //! attach` and `tam run` without a name find nothing, and `tam peers` says
 //! it is not in a task.
 //!
-//! The chat is made with a request (its commands come later); the real
-//! `tam` binary runs against an in-process daemon, with temporary XDG
-//! directories and HOME: it can never reach a real daemon.
+//! The chat is made with a request, its agent a plain program (`tam chat`
+//! and the chat commands are `chat_commands.rs`'s); the real `tam` binary
+//! runs against an in-process daemon, with temporary XDG directories and
+//! HOME: it can never reach a real daemon.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

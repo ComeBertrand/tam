@@ -273,8 +273,12 @@ async fn a_task_driven_without_a_terminal() {
     let out = output(tam(root, &repo, &["ps", "--json"])).await;
     ok(&out);
     let ps = json(&out);
-    assert_eq!(keys(&ps), BTreeSet::from(["schema_version", "tasks"]));
+    assert_eq!(
+        keys(&ps),
+        BTreeSet::from(["schema_version", "tasks", "chats"])
+    );
     assert_eq!(ps["schema_version"], 1);
+    assert_eq!(ps["chats"], serde_json::json!([]));
     let task = &ps["tasks"][0];
     assert_eq!(
         keys(task),

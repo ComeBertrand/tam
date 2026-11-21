@@ -731,14 +731,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<String>,
     },
-    /// What the agents of task members are doing now, with the responses
-    /// that ended their last turns. Replies `Outcomes`, in the order asked.
+    /// What the agents of task members (or chats) are doing now, with the
+    /// responses that ended their last turns. Replies `Outcomes`, in the
+    /// order asked.
     GetOutcomes {
         /// What `ResolveMember` takes as a target, each: a member id, a task
-        /// name (its only member) or `<task>/<member>`.
+        /// name (its only member) or `<task>/<member>`; then a chat's id or
+        /// name (as `ResolveTarget`).
         members: Vec<String>,
     },
-    /// Wait until the agents of task members settle: each one's state is
+    /// Wait until the agents of task members (or chats) settle: each one's state is
     /// one of `until` (see `MemberState::satisfies`). Gives up as soon as
     /// an agent exits or its turn fails (`exit`, `error`) when `until` does
     /// not take that state: it would not move on without someone acting.
@@ -888,6 +890,16 @@ pub enum Request {
         /// A repository's main checkout (not a linked worktree).
         dir: PathBuf,
     },
+    /// Find the task member or chat a user named, as `SendMessage` finds
+    /// its recipient: what `ResolveMember` takes, then a chat's id, then a
+    /// chat's name. A target naming a task (or `<task>/…` of one) never
+    /// reaches a chat. Replies `Member` or `Chat`.
+    ResolveTarget {
+        target: String,
+        /// The caller's agent id (`$TAM_AGENT_ID`), as for `ResolveMember`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
 }
 
 /// What the agent of a task member is doing: its state, or `Exit` when no
@@ -965,10 +977,12 @@ pub struct AgentResponse {
 /// it is doing, and the response that ended its last turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberOutcome {
-    /// Member id.
+    /// Member id (a chat's id, for a chat).
     pub member: String,
+    /// The member's task; empty for a chat.
     pub task: String,
-    /// How to name the member (see `TaskInfo::member_label`).
+    /// How to name the member (see `TaskInfo::member_label`); a chat's
+    /// label (`ChatInfo::label`).
     pub label: String,
     pub state: MemberState,
     /// The running agent, else the agent of the member's last run; `None`
@@ -2673,6 +2687,20 @@ mod tests {
             (
                 Request::CloseChat { chat: "x".into() },
                 r#"{"type":"close_chat","chat":"x"}"#,
+            ),
+            (
+                Request::ResolveTarget {
+                    target: "debug".into(),
+                    from: None,
+                },
+                r#"{"type":"resolve_target","target":"debug"}"#,
+            ),
+            (
+                Request::ResolveTarget {
+                    target: "api".into(),
+                    from: Some("m-1".into()),
+                },
+                r#"{"type":"resolve_target","target":"api","from":"m-1"}"#,
             ),
         ] {
             assert_eq!(serde_json::to_string(&request).unwrap(), json);

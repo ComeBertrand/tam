@@ -52,6 +52,8 @@ tam
 
 **Member** — a task's worktree, with at most one agent session. A task can hold several members, one per repository, for work spanning e.g. a backend and a frontend: `tam new feat -r api -r web` creates both worktrees, on branch `feat`, and starts an agent in each. Members have a stable id, which is also their agent's id (`$TAM_AGENT_ID`), and a short name within the task: the repository name. Name one as `TASK/MEMBER`; a bare task name means its only member.
 
+**Chat** — a Claude session on a repository's main checkout, started from tam: `tam chat` in a repository. It owns nothing on disk (no worktree, no branch), and several can run on one repository at once: for debugging, a deployment, a discussion that may end in a task. A chat has an id (`c-1a2b3c4d`, also its agent's `$TAM_AGENT_ID`) and, if you give it one, a name; else tam shows it by the title of its Claude session.
+
 **Status is always derived**, never stored. TAM checks the daemon (is an agent running?), the filesystem (does the worktree exist?), git (does the branch exist?), and activity timestamps (is the task stale?) every time you look.
 
 | Status | Meaning |
@@ -76,6 +78,7 @@ tam
 - **Desktop notifications** — configurable alerts when agents need input or hit permission prompts
 - **Messages** — `tam msg` sends a message to a running session without attaching, from you or from another agent, and can wait for the reply
 - **Peers** — an agent knows the other members of its task (their names, repositories and worktrees) and reaches them with `tam msg`; `tam peers` shows what their agents are doing
+- **Chats** — `tam chat` starts a Claude session on a repository's main checkout, listed by `tam ps` and reached by `tam attach`, `tam msg`, `tam wait`… like a task, then closed when done
 - **Merge and split** — `tam merge` makes tasks started separately one task, so their running agents become peers; `tam split` moves a member back out. Nothing stops or moves on disk
 - **Custom TUI commands** — bind keys to shell commands (open editor, run tests, etc.)
 
@@ -129,11 +132,40 @@ The daemon checks every task's worktree against git (`git worktree list`) when i
 
 `tam merge` and `tam split` change which task a member belongs to, and nothing else: worktrees, branches, sessions, run history, messages and running agents stay as they are. Started as two tasks, a backend and a frontend become one with `tam merge backend frontend`: the members of `frontend` join `backend` after its own, and `frontend` is gone. A member keeps its short name (its repository) unless the task has one by that name already; it is then `<repo>-<branch>`. Names through a task merged away (`frontend`, `frontend/web`) no longer resolve; member ids still do. `tam split backend/web` is the inverse: the member goes to a new task named after its branch, or NAME when a task has that name already. The only member of a task cannot be split out of it. Neither runs while one of the tasks is being dropped. Running agents of the members involved learn of it at their next prompt or tool call: what changed, then their task and peers as they are now (an idle agent is not woken for it). Other agents are not told; `tam peers` shows their peers. The merged task keeps its brief (see Brief), and a task split off starts with the local `brief.md`; the directories of the tasks merged away stay in `~/.local/share/tam/tasks/`.
 
+### Chats
+
+```
+tam chat [REPO]                Start a chat on the repository (default: the current one) and attach
+tam chat -n NAME               ... named NAME (default: shown by its Claude title, else its id)
+tam chat --session ID          ... resuming an existing Claude session instead of a new one
+tam chat --keep                ... kept: never closed for want of turns
+tam chat -p TEXT -d            On a prompt, without attaching (--json: print a receipt)
+
+tam close CHAT                 Stop the chat's agent and forget the chat (asks first; -y: don't)
+tam rename CHAT [NAME]         Name the chat, or take its name away
+tam keep CHAT [--off]          Keep the chat, or stop keeping it
+
+tam attach CHAT                Attach to the chat's agent
+tam stop CHAT                  Stop its agent (the chat stays)
+tam run CHAT                   Start its agent again, in its session
+tam msg CHAT TEXT              Message it; tam wait, tam result, tam history take a chat too
+
+CHAT is a chat's id, or its name.
+```
+
+A chat runs on the main checkout of its repository: REPO is a path to the repository (or to any directory in it, a worktree too), or its project name as `tam ls` shows it. Several chats can share a repository. `tam ps` lists the chats above the tasks, with their ids; a chat's status is its agent's, else `idle`, and CLOSES says when autoclean closes it (`in 3d`, rounded up; `due`; `kept`; or `-` when autoclean is off).
+
+A name means a task before it means a chat. `tam attach`, `tam stop`, `tam run`, `tam msg`, `tam wait`, `tam result` and `tam history` look for a task first (its name, `TASK/MEMBER`, a member id, from an agent a peer's short name), then for a chat's id, then for a chat's name. A chat cannot be named like an existing task (nor `TASK/…`); a task made later with a chat's name takes it, and the chat is still reached by its id. `tam close`, `tam rename` and `tam keep` take only chats. Without a name, the current directory names a task's worktree, never a chat.
+
+`tam run CHAT` always resumes the chat's own session: a chat is that session, so `--new-session` and `--session` are refused for it (`tam chat --session ID` makes another chat). Once Claude has deleted the session's transcript, `tam run CHAT` says to close the chat and start another. The task commands (`drop`, `repair`, `brief`, `split`, `merge`) say when a name is a chat's. `tam chat --session ID` takes a session Claude ran in that repository's main checkout, that no open chat holds. A chat whose agent cannot start is closed again at once. `tam close` asks before closing (pass `-y` without a terminal); nothing on disk changes, Claude keeps the session, and `tam close` prints the `tam chat --session` command that makes the chat again. Every hint tam prints names a chat by its id, which always resolves.
+
+From inside a chat, its agent uses `tam` as any shell does: `tam new` starts a task from it, `tam msg` reaches a task's member, and the reply comes back to the chat.
+
 ### Observing
 
 ```
-tam ps                         Task table with computed status, a row per member
-                               of a task with several
+tam ps                         Chats, then the task table with computed status,
+                               a row per member of a task with several
 tam ps --json                  Machine-readable output
 
 tam ls                         Discover projects and worktrees
@@ -182,27 +214,29 @@ tam run NAME -p TEXT -d --json Start the agent on a prompt, print a receipt
 tam wait NAME                  Wait until the task's agents stop working; print their states
 tam wait NAME -u ready -t 30m  ... until they wait for input, for at most 30 minutes
 tam result NAME                Print the last response of the task's agents
-tam ps --json                  Every task, as JSON
+tam ps --json                  Every task and chat, as JSON
+tam chat -d --json             Start a chat, print a receipt
+tam close CHAT -y --json       Close a chat; print it as it was (rename, keep: as it is)
 tam merge INTO FROM --json     Merge tasks; print who moved where
 tam split TASK/MEMBER --json   Split a member out; print who moved where
 ```
 
-`tam new` and `tam run` attach only when stdin and stdout are terminals: otherwise they start the agent and say so. `tam wait` returns once each agent is in one of the `--until` states, comma-separated: `working`, `blocked`, `ready`, `idle`, `question`, `error`, `exit` (no agent runs). The default is any state but `working`. `ready` (`input`, its former name, still works) takes in `idle`, since agents without hooks never report `ready`. It gives up at once when an agent exits or its turn fails, unless `--until` takes `exit` or `error`. `tam result` prints the response that ended the agent's last turn, in full; it is still there once the agent exited, or the daemon restarted. There is none while a turn runs, before the first turn of a run ends, after a failed or interrupted turn, and for agents other than Claude. For `wait` and `result`, NAME is a task (all its members), TASK/MEMBER or a member id. Both report what they find: right after `tam msg`, an agent that has not picked the message up yet is still `ready`, with its previous response. `tam msg --wait` waits for the reply instead, and `response_at` tells when a response came.
+`tam new` and `tam run` attach only when stdin and stdout are terminals: otherwise they start the agent and say so. `tam wait` returns once each agent is in one of the `--until` states, comma-separated: `working`, `blocked`, `ready`, `idle`, `question`, `error`, `exit` (no agent runs). The default is any state but `working`. `ready` (`input`, its former name, still works) takes in `idle`, since agents without hooks never report `ready`. It gives up at once when an agent exits or its turn fails, unless `--until` takes `exit` or `error`. `tam result` prints the response that ended the agent's last turn, in full; it is still there once the agent exited, or the daemon restarted. There is none while a turn runs, before the first turn of a run ends, after a failed or interrupted turn, and for agents other than Claude. For `wait` and `result`, NAME is a task (all its members), TASK/MEMBER, a member id, or a chat. Both report what they find: right after `tam msg`, an agent that has not picked the message up yet is still `ready`, with its previous response. `tam msg --wait` waits for the reply instead, and `response_at` tells when a response came.
 
 Claude asks whether to trust a folder it does not know yet, and runs no hook until it is answered: a detached agent in a new worktree waits there (`tam wait` sees `ready` after 10s, and `tam result` has nothing). Attach once to answer it.
 
 | Exit status | Meaning | `error.kind` |
 |---|---|---|
 | 0 | Done | |
-| 1 | Failed; `tam wait` gave up; `tam result` has no response; a merge or split refused | `failed`, `unreachable`, `no_result` |
+| 1 | Failed; `tam wait` gave up; `tam result` has no response; a merge or split refused; `tam close` not confirmed | `failed`, `unreachable`, `no_result` |
 | 2 | Invalid arguments (reported as text by the argument parser) | |
-| 3 | No such task or member, or a task name where one member is needed | `not_found` |
+| 3 | No such task, member or chat, or a task name where one member is needed | `not_found` |
 | 4 | `tam wait` timed out | `timeout` |
 | 5 | The daemon cannot be reached, or broke off | `daemon` |
 
 With `--json`, stdout holds one JSON document and nothing else, also when the command fails: its `error` is then `{"kind": …, "message": …}`, next to what could still be reported (a command with nothing to report prints only `schema_version` and `error`). Every document has `"schema_version": 1`, raised only when a key is removed, renamed or retyped: new keys may come. Every key is always present, `null` when it has no value.
 
-`tam ps --json`, tasks most urgent first:
+`tam ps --json`, tasks most urgent first, then chats (most urgent first, else in creation order):
 
 ```json
 {
@@ -248,6 +282,40 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
         }
       ]
     }
+  ],
+  "chats": [
+    {
+      "id": "c-1a2b3c4d",
+      "name": "login-bug",
+      "label": "login-bug",
+      "title": "Flaky login test",
+      "last_prompt": "why is CI red?",
+      "repo": "app",
+      "dir": "/home/me/src/app",
+      "status": "ready",
+      "keep": false,
+      "closes_at": 1763659200,
+      "created_at": 1763390000,
+      "last_turn_at": 1763400000,
+      "run_count": 1,
+      "agent": "claude",
+      "state": "ready",
+      "pid": 4243,
+      "viewers": 0,
+      "context_percent": 12,
+      "session_id": "3e9b7c21-…",
+      "pending": null,
+      "turn_error": null,
+      "denied": null,
+      "last_message": "The login test is flaky: …",
+      "last_run": {
+        "provider": "claude",
+        "session_id": null,
+        "started_at": 1763390000,
+        "ended_at": null,
+        "exit_code": null
+      }
+    }
   ]
 }
 ```
@@ -256,9 +324,10 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
 - `pending` (while `blocked` or `question`) is `{"tool", "summary"}`, `turn_error` (while `error`) `{"kind", "message"}`, `denied` (the last tool call auto mode refused in this turn) `{"tool", "summary", "reason"}`.
 - `session_id` is the running agent's session, else the last run's. `last_message` is the start of the agent's last response: `tam result` has all of it. A run's `exit_code` is -1 when it was stopped.
 - `health` is what the daemon saw in git: `{"state": "ok", "branch"}`, `{"state": "gone", "cannot_repair"}` or `{"state": "broken", "problem"}`; `null` until checked.
+- A chat's `id` is how to name it to tam; `label` is how tam shows it (its `name`, else its `title`, else its id) and may not be a name tam takes back. `title` (the user's `/rename`, else Claude's title) and `last_prompt` come from Claude's files of the session it is in. `status` is its agent's (`run`, `ready`, `block`, `question`, `error`), else `idle`. `last_turn_at` is when the user last prompted its agent; `closes_at` when autoclean closes it (`null` when kept, or autoclean is off); `session_id` the running agent's session, else the one it resumes next. The keys from `agent` on are those of a task member.
 - Before version 1, `tam ps --json` printed the `tasks` array alone, with the keys up to `last_activity` (tasks) and `health` (members).
 
-`tam new --json` and `tam run --json`: the task's members (`new`) or the one started (`run`). `agent` is `null` when none started, `resumed_session` is `null` for a new session.
+`tam new --json` and `tam run --json`: the task's members (`new`) or the one started (`run`). `agent` is `null` when none started, `resumed_session` is `null` for a new session. For a chat (`tam chat --json`, `tam run CHAT --json`, and `tam wait`/`tam result` of a chat), the document has `chat` (its id) where a task's has `task`, and the chat as the one entry of `members`: `name` is `null` when unnamed, and there is no `branch`.
 
 ```json
 {
@@ -314,6 +383,25 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
     }
   ],
   "error": null
+}
+```
+
+`tam close --json`, `tam rename --json` and `tam keep --json`: the chat as it is now, or as it was for `close` (`open` is then `false`): `session_id` makes it again with `tam chat REPO --session ID`.
+
+```json
+{
+  "schema_version": 1,
+  "chat": "c-1a2b3c4d",
+  "name": "login-bug",
+  "label": "login-bug",
+  "repo": "app",
+  "dir": "/home/me/src/app",
+  "keep": false,
+  "session_id": "3e9b7c21-…",
+  "created_at": 1763390000,
+  "last_turn_at": 1763400000,
+  "run_count": 1,
+  "open": false
 }
 ```
 

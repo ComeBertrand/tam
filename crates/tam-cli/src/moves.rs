@@ -13,7 +13,11 @@ pub async fn merge(into: &str, from: &[String], json: bool) -> Result<()> {
     let mut client = Client::connect().await?;
     // An unknown task exits 3, as elsewhere; the daemon checks again.
     for name in std::iter::once(into).chain(from.iter().map(String::as_str)) {
-        client.get_task(name).await?;
+        if let Err(e) = client.get_task(name).await {
+            return Err(crate::chat::not_a_task(&mut client, name)
+                .await
+                .unwrap_or(e));
+        }
     }
     let moved = client.merge_tasks(into, from).await?;
     let agents = client.list_agents().await.unwrap_or_default();

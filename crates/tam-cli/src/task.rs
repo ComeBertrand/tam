@@ -79,6 +79,18 @@ impl TaskStatus {
     }
 }
 
+/// The status of a running agent in this state.
+pub fn agent_status(state: AgentState) -> TaskStatus {
+    match state {
+        AgentState::Working => TaskStatus::Run,
+        AgentState::Ready => TaskStatus::Ready,
+        AgentState::Blocked => TaskStatus::Block,
+        AgentState::Idle => TaskStatus::Idle,
+        AgentState::Question => TaskStatus::Question,
+        AgentState::Error => TaskStatus::Error,
+    }
+}
+
 /// A member of a task: one worktree, with its running agent if any.
 #[derive(Debug, Clone)]
 pub struct Member {
@@ -108,14 +120,7 @@ impl Member {
     /// its worktree in place (unknown health counts as in place).
     fn status(&self, stale: bool) -> TaskStatus {
         if let Some(ref info) = self.agent_info {
-            return match info.state {
-                AgentState::Working => TaskStatus::Run,
-                AgentState::Ready => TaskStatus::Ready,
-                AgentState::Blocked => TaskStatus::Block,
-                AgentState::Idle => TaskStatus::Idle,
-                AgentState::Question => TaskStatus::Question,
-                AgentState::Error => TaskStatus::Error,
-            };
+            return agent_status(info.state);
         }
         if self.is_unhealthy() {
             return TaskStatus::Gone;

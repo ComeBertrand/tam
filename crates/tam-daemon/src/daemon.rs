@@ -1035,6 +1035,9 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         }
         Request::CloseChat { chat } => handle_close_chat(state, &chat).await,
         Request::ChatHistory { dir } => handle_chat_history(state, dir).await,
+        Request::ResolveTarget { target, from } => {
+            handle_resolve_target(state, &target, from.as_deref()).await
+        }
     }
 }
 
@@ -2506,7 +2509,8 @@ fn write_pty(fd: &OwnedFd, mut data: &[u8]) -> bool {
 const WAIT_RECHECK: Duration = Duration::from_secs(1);
 
 impl DaemonState {
-    /// The ids of the members `targets` name (see `Ledger::resolve`).
+    /// The ids of the members (or chats) `targets` name (see
+    /// `Ledger::resolve_recipient`: a chat after everything else).
     fn resolve_members(&self, targets: &[String]) -> Result<Vec<String>, String> {
         if targets.is_empty() {
             return Err("no task member given".into());
@@ -2515,19 +2519,24 @@ impl DaemonState {
             .iter()
             .map(|t| {
                 self.ledger
-                    .resolve(t)
-                    .map(|(_, m)| m.id)
+                    .resolve_recipient(None, t)
+                    .map(|owner| owner.id().to_string())
                     .map_err(|e| format!("{e:#}"))
             })
             .collect()
     }
 
-    /// What a member's agent is doing, and its last response; `None` once
-    /// the member is gone. Reap exited agents first: until then they look
-    /// alive.
+    /// What a member's (or chat's) agent is doing, and its last response;
+    /// `None` once the member is gone. Reap exited agents first: until then
+    /// they look alive.
     fn outcome(&self, member: &str) -> Option<MemberOutcome> {
-        let (task, info) = self.ledger.member(member)?;
-        let label = task.member_label(&info);
+        let (task, label) = match self.ledger.owner(member)? {
+            Owner::Member(task, info) => {
+                let label = task.member_label(&info);
+                (task.name, label)
+            }
+            Owner::Chat(chat) => (String::new(), chat.label()),
+        };
         let last_run = self.ledger.runs_of(member).pop();
         let outcome = match self.agents.get(member) {
             Some(agent) => {
@@ -2535,7 +2544,7 @@ impl DaemonState {
                 let detail = *running.detail;
                 MemberOutcome {
                     member: member.to_string(),
-                    task: task.name,
+                    task,
                     label,
                     state: running.state.into(),
                     provider: Some(running.provider),
@@ -2550,7 +2559,7 @@ impl DaemonState {
             }
             None => MemberOutcome {
                 member: member.to_string(),
-                task: task.name,
+                task,
                 label,
                 state: MemberState::Exit,
                 provider: last_run.as_ref().map(|r| r.provider.clone()),
@@ -3630,5 +3639,35 @@ async fn clean_chats(state: &Arc<Mutex<DaemonState>>, source: &mut autoclean::So
             }
         })
         .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Names typed at the command line (#66)
+// ---------------------------------------------------------------------------
+
+/// Find the member or chat `target` names (`Request::ResolveTarget`): the
+/// rule `SendMessage` applies to its recipient, so a name means the same
+/// thing to every command.
+async fn handle_resolve_target(
+    state: &Arc<Mutex<DaemonState>>,
+    target: &str,
+    from: Option<&str>,
+) -> Response {
+    let state = state.lock().await;
+    let caller = state.sender_member(from);
+    match state.ledger.resolve_recipient(caller.as_deref(), target) {
+        Ok(Owner::Member(task, member)) => Response::Member {
+            runs: state.ledger.runs_of(&member.id),
+            task,
+            member: Box::new(member),
+        },
+        Ok(Owner::Chat(chat)) => Response::Chat {
+            runs: state.ledger.runs_of(&chat.id),
+            chat: Box::new(chat),
+        },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }

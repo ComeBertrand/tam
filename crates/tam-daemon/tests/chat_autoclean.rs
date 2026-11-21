@@ -155,18 +155,11 @@ fn now() -> u64 {
 
 const DAY: u64 = 86_400;
 
-/// Write tam's config where tam reads it: `$XDG_CONFIG_HOME`, or on macOS
-/// `~/Library/Application Support`.
+/// Write tam's config where tam reads it: `$XDG_CONFIG_HOME/tam`.
 fn write_config(root: &Path, text: &str) {
-    let macos = root
-        .join("home")
-        .join("Library")
-        .join("Application Support");
-    for dir in [root.join("config"), macos] {
-        let dir = dir.join("tam");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), text).unwrap();
-    }
+    let dir = root.join("config").join("tam");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), text).unwrap();
 }
 
 /// The ledger lines of chats made, turned and kept at these times.

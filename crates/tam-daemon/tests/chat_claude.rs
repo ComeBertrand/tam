@@ -225,22 +225,15 @@ async fn a_chats_claude_agent() {
     std::env::set_var("HOME", root.join("home"));
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     // A notify command writing what it was given, in the config written
-    // where tam reads it: `$XDG_CONFIG_HOME`, or on macOS `~/Library/
-    // Application Support`.
+    // where tam reads it: `$XDG_CONFIG_HOME/tam`.
     let notified = root.join("notified");
     let config = format!(
         "[notify]\ncommand = \"echo {{task}} {{id}} {{kind}} >> '{}'\"\non_states = [\"ready\"]\n",
         notified.display()
     );
-    let macos = root
-        .join("home")
-        .join("Library")
-        .join("Application Support");
-    for dir in [root.join("config"), macos] {
-        let dir = dir.join("tam");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), &config).unwrap();
-    }
+    let dir = root.join("config").join("tam");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), &config).unwrap();
     let claude_dir = root.join("claude");
     std::env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
     let bin = root.join("bin");

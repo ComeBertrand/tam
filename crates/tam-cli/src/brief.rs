@@ -64,15 +64,12 @@ pub struct Expanded {
     pub prompt: Option<String>,
 }
 
-/// The brief patterns of `config.toml` (`$XDG_CONFIG_HOME/tam`).
+/// The brief patterns of tam's config
+/// ([`tam_worktree::config::config_path`]).
 pub fn load_patterns() -> Result<Vec<Pattern>> {
-    let path = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .join("tam")
-        .join("config.toml");
-    if !path.exists() {
+    let Some(path) = tam_worktree::config::config_path().filter(|path| path.exists()) else {
         return Ok(Vec::new());
-    }
+    };
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     parse_patterns(&content).with_context(|| format!("in {}", path.display()))

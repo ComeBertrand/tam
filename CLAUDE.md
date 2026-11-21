@@ -10,7 +10,8 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 - `tam-proto`    — wire protocol types (daemon <-> client)
 - `tam-daemon`   — daemon: PTY management, agent screens, agent lifecycle, state detection, task ledger, task drop,
   worktree reconciliation (member health, repair, adopt), chats
-- `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init
+- `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init,
+  where tam's config and data live (`xdg`, `config::config_path`)
 - `tam-cli`      — binary `tam`: CLI, TUI, bridges worktrees and agents
 
 Dependency graph: `tam-worktree` is standalone. `tam-daemon` depends on `tam-proto`
@@ -41,7 +42,9 @@ adopt). `tam-cli` depends on all three.
   task shows the most urgent. Unknown health (`None`) is not gone. Staleness
   is time-based (30 days without activity), not git-merge-based.
 - **Daemon owns the ledger** — append-only JSONL at
-  `$XDG_DATA_HOME/tam/ledger.jsonl` (`tam-daemon/src/ledger.rs`). Records events
+  `$XDG_DATA_HOME/tam/ledger.jsonl`, else `~/.local/share/tam/ledger.jsonl`, on
+  macOS too (`tam-daemon/src/ledger.rs`: `default_path`, from
+  `tam_worktree::xdg::data_home`; see Config). Records events
   (TaskCreated, MemberAdded, AgentRunStarted keyed by member id, etc.), never
   states. The daemon is the only writer (flock on `ledger.jsonl.lock`), records
   agent runs itself (Spawn with `member`: the daemon supplies the agent id and
@@ -267,7 +270,14 @@ adopt). `tam-cli` depends on all three.
   (short path: Unix socket limit), `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and
   `TAM_AGENT_ID`/`TAM_SOCKET` unset. From inside a Claude session also unset the
   `CLAUDE*` variables, or nested Claude sessions write no transcript.
-- **Config** — `$XDG_CONFIG_HOME/tam/config.toml` (global), `.tam.toml` (per-repo init).
+- **Config** — `$XDG_CONFIG_HOME/tam/config.toml`, else `~/.config/tam/config.toml`
+  (global), `.tam.toml` (per-repo init). The same on every platform (#73):
+  `tam_worktree::config::config_path` is the one place that says where, for
+  every loader (`tam_worktree::config`, `tam-cli`'s `config` and `brief`,
+  `tam-daemon`'s `notify` and `autoclean`). Never `dirs::config_dir()` or
+  `dirs::data_local_dir()`: `~/Library/Application Support` on macOS.
+  `tam_worktree::xdg` ignores an empty or relative `XDG_*` value, as the
+  specification says. Tests write the config once, under `$XDG_CONFIG_HOME`.
 - **The pane** — always shown (`App::peek`, `ui::render_pane`): the screen
   of the focused member's agent (or the selected chat's), on the whole pane, and nothing said twice
   (`a` answers a request without attaching). `enter` gives the pane the
@@ -788,6 +798,10 @@ cargo test
   or creating against a live daemon (the dashboard always starts Claude) is
   not covered by a test: run the dev dashboard by hand in a sandbox (see
   Testing hooks by hand) with a fake `claude` on its `PATH`.
+- The daemon's `xdg.rs`: the worktree config, the notify and autoclean
+  settings and the ledger's path follow `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`, else `~/.config` and
+  `~/.local/share`, an empty or relative value ignored, a config in
+  `~/Library/Application Support` never read (it tells on macOS CI only).
 - `agent_env.rs`, in both crates: the daemon's runs an agent found only on
   the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
   value) in replies, events, errors and every file next to the ledger,

@@ -33,12 +33,11 @@ struct NotifySection {
     on_states: Option<Vec<String>>,
 }
 
-/// Load notify config from the standard config path.
+/// Load notify config from tam's config file
+/// ([`tam_worktree::config::config_path`]).
 /// Returns None if no [notify] section or no command configured.
 pub fn load_notify_config() -> Option<NotifyConfig> {
-    let config_dir = dirs::config_dir()?;
-
-    let config_path = config_dir.join("tam").join("config.toml");
+    let config_path = tam_worktree::config::config_path()?;
 
     if !config_path.exists() {
         return None;

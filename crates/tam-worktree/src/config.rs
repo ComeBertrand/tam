@@ -106,16 +106,19 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     })
 }
 
-/// Load config from `$XDG_CONFIG_HOME/tam/config.toml`.
-pub fn load_config() -> Result<Config> {
-    let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let tam_config = config_dir.join("tam").join("config.toml");
+/// tam's config file: `$XDG_CONFIG_HOME/tam/config.toml`, else
+/// `~/.config/tam/config.toml`, on every platform ([`crate::xdg`]). Every
+/// part of tam that reads its config finds it here. `None`: no home
+/// directory, so no config.
+pub fn config_path() -> Option<PathBuf> {
+    Some(crate::xdg::config_home()?.join("tam").join("config.toml"))
+}
 
-    if tam_config.exists() {
-        let content = std::fs::read_to_string(&tam_config)?;
-        parse_config(&content)
-    } else {
-        Ok(Config::default())
+/// Load config from [`config_path`].
+pub fn load_config() -> Result<Config> {
+    match config_path().filter(|path| path.exists()) {
+        Some(path) => parse_config(&std::fs::read_to_string(&path)?),
+        None => Ok(Config::default()),
     }
 }
 

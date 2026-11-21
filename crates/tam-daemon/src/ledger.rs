@@ -11,10 +11,10 @@
 //! the ledger is read, never stored.
 //!
 //! On open the ledger is read, malformed lines are reported and set aside in
-//! `<ledger>.rejected`, and the file is compacted: events of dropped tasks (and
-//! events naming no live task or member) are removed, keeping only the history
-//! of the active tasks. Task state is never stored — it is folded from the
-//! events.
+//! `<ledger>.rejected`, and the file is compacted: events of dropped tasks and
+//! closed chats (and events naming no live task, member or chat) are removed,
+//! keeping only the history of the active tasks and open chats. State is never
+//! stored — it is folded from the events.
 //!
 //! Ledgers written before tasks had members are migrated on open (see
 //! [`LegacyEvent`]): the old file is kept as `<ledger>.pre-members` and the
@@ -23,6 +23,12 @@
 //! Next to the folded tasks, the ledger keeps what reconciliation observed of
 //! the members' worktrees (their health, their repository): in memory only,
 //! never written, like any other derived state.
+//!
+//! Chats are the other kind of object: a Claude session on a repository's
+//! main checkout, owning nothing on disk. A chat has a stable id (`c-…`) of
+//! its own and keeps what a member keeps of its agent ([`History`]: runs,
+//! sessions, messages), recorded with the same events, keyed by its id.
+//! Closing a chat forgets it, with its history.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -34,10 +40,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tam_proto::{
-    AgentResponse, MemberHealth, MemberInfo, MessageInfo, NewMember, RunInfo, TaskInfo,
+    AgentResponse, ChatInfo, Event, MemberHealth, MemberInfo, MessageInfo, NewMember, RunInfo,
+    TaskInfo,
 };
 
 /// A single event recorded in the ledger.
+///
+/// The agent events (`AgentRun…`, `AgentSession…`) and the message events
+/// name a task member or a chat in their `member` (`to`, `from`) field: the
+/// id of what the agent runs for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LedgerEvent {
@@ -144,6 +155,42 @@ pub enum LedgerEvent {
         task: String,
         timestamp: u64,
     },
+    /// A chat on the repository whose main checkout is `dir`.
+    ChatCreated {
+        /// Stable chat id (`c-…`), its agent's id.
+        chat: String,
+        dir: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// The Claude session it was made from, resumed by its first agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        timestamp: u64,
+    },
+    /// The chat's name changed (`None`: unnamed). Only the latest is kept.
+    ChatRenamed {
+        chat: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        timestamp: u64,
+    },
+    /// The chat is kept (never closed for want of turns), or no longer.
+    /// Only the latest is kept.
+    ChatKept {
+        chat: String,
+        keep: bool,
+        timestamp: u64,
+    },
+    /// The user prompted the chat's agent. Only the latest is kept.
+    ChatTurn {
+        chat: String,
+        timestamp: u64,
+    },
+    /// The chat was closed: forgotten, with its history.
+    ChatClosed {
+        chat: String,
+        timestamp: u64,
+    },
 }
 
 /// Ledger lines written before tasks had members (tam <= 0.3.6): a task had
@@ -225,14 +272,46 @@ struct MemberRecord {
     repo_root: Option<PathBuf>,
     branch: String,
     dir: PathBuf,
+    history: History,
+}
+
+/// What a task member or a chat keeps of its agent, and its own events.
+#[derive(Debug, Clone, Default)]
+struct History {
     runs: Vec<RunInfo>,
     /// The response that ended the last turn of the latest run, once the
     /// run is over (see `Ledger::last_response`).
     response: Option<AgentResponse>,
-    /// Member events, kept for compaction, tagged with their order.
+    /// Its events, kept for compaction, tagged with their order.
     events: Vec<(usize, LedgerEvent)>,
-    /// Messages to this member, in the order they were sent.
+    /// Messages to it, in the order they were sent.
     messages: Vec<MessageRecord>,
+}
+
+impl History {
+    /// Keep `event` as the only one of its kind (the latest wins).
+    fn replace(&mut self, seq: usize, event: LedgerEvent) {
+        let kind = std::mem::discriminant(&event);
+        self.events
+            .retain(|(_, e)| std::mem::discriminant(e) != kind);
+        self.events.push((seq, event));
+    }
+}
+
+/// An open chat folded from its events.
+#[derive(Debug, Clone)]
+struct ChatRecord {
+    id: String,
+    dir: PathBuf,
+    name: Option<String>,
+    /// The session it was made from.
+    session: Option<String>,
+    created_at: u64,
+    keep: bool,
+    last_turn_at: Option<u64>,
+    /// Order of its `ChatCreated`: chats are listed in creation order.
+    order: usize,
+    history: History,
 }
 
 /// A message folded from its events (kept by its recipient).
@@ -249,11 +328,12 @@ struct MessageRecord {
     seq: usize,
 }
 
-/// Active tasks and members.
+/// Active tasks and members, and open chats.
 #[derive(Debug, Default)]
 struct State {
     tasks: BTreeMap<String, TaskRecord>,
     members: HashMap<String, MemberRecord>,
+    chats: HashMap<String, ChatRecord>,
     /// What reconciliation last observed of the members' worktrees, by member
     /// id. In memory only.
     observed: HashMap<String, Observed>,
@@ -415,7 +495,7 @@ impl Ledger {
         let mut runs: Vec<RunInfo> = self
             .member_ids(name)
             .iter()
-            .flat_map(|id| self.member_runs(id))
+            .flat_map(|id| self.runs_of(id))
             .collect();
         runs.sort_by_key(|r| r.started_at);
         runs
@@ -442,36 +522,28 @@ impl Ledger {
         self.state.members.get(id).map(|m| m.task.as_str())
     }
 
-    /// Runs of a member, oldest first.
-    pub fn member_runs(&self, id: &str) -> Vec<RunInfo> {
+    /// Runs of a member or a chat, oldest first.
+    pub fn runs_of(&self, id: &str) -> Vec<RunInfo> {
         self.state
-            .members
-            .get(id)
-            .map(|m| m.runs.clone())
+            .history(id)
+            .map(|h| h.runs.clone())
             .unwrap_or_default()
     }
 
-    /// Whether the member has a run with no end recorded.
+    /// Whether the member (or chat) has a run with no end recorded.
     pub fn has_open_run(&self, member: &str) -> bool {
         self.state
-            .members
-            .get(member)
-            .and_then(|m| m.runs.last())
+            .history(member)
+            .and_then(|h| h.runs.last())
             .is_some_and(|r| r.ended_at.is_none())
     }
 
-    /// The member's current session for `provider`: the session of its
-    /// latest run of that agent that has one. A run's session is the one it
-    /// resumed, or the last one its agent reported having a turn in.
+    /// The member's (or chat's) current session for `provider`: the session
+    /// of its latest run of that agent that has one. A run's session is the
+    /// one it resumed, or the last one its agent reported having a turn in.
+    /// A chat without one has the session it was made from.
     pub fn current_session(&self, member: &str, provider: &str) -> Option<String> {
-        self.state
-            .members
-            .get(member)?
-            .runs
-            .iter()
-            .rev()
-            .filter(|r| r.provider == provider)
-            .find_map(|r| r.session_id.clone())
+        self.state.current_session(member, provider)
     }
 
     /// Find one member from what a user typed: a task name (its only
@@ -509,6 +581,9 @@ impl Ledger {
         }
         if let Some(found) = self.member(target) {
             return Ok(found);
+        }
+        if self.state.chats.contains_key(target) {
+            bail!("'{}' is a chat, not a task member", target);
         }
         bail!("task '{}' not found", target)
     }
@@ -588,15 +663,16 @@ impl Ledger {
         Ok(events)
     }
 
-    /// Record the start of a member's agent run. Closes a still-open
-    /// previous run first, since a member runs one agent at a time.
+    /// Record the start of the agent run of a member (or a chat). Closes a
+    /// still-open previous run first, since a member runs one agent at a
+    /// time. Returns the member or chat, updated.
     pub fn run_started(
         &mut self,
         member: &str,
         provider: &str,
         session_id: Option<String>,
-    ) -> Result<TaskInfo> {
-        let task = self.require_member(member)?;
+    ) -> Result<Owner> {
+        self.require_owner(member)?;
         self.run_ended(member, -1)?;
         self.append(LedgerEvent::AgentRunStarted {
             member: member.into(),
@@ -604,7 +680,7 @@ impl Ledger {
             session_id,
             timestamp: now(),
         })?;
-        Ok(self.task(&task).expect("member's task exists"))
+        Ok(self.owner(member).expect("checked above"))
     }
 
     /// Record a session the agent of the member's open run had a turn in:
@@ -613,9 +689,8 @@ impl Ledger {
     pub fn session_reported(&mut self, member: &str, session_id: &str) -> Result<bool> {
         let Some(run) = self
             .state
-            .members
-            .get(member)
-            .and_then(|m| m.runs.last())
+            .history(member)
+            .and_then(|h| h.runs.last())
             .filter(|r| r.ended_at.is_none())
         else {
             return Ok(false);
@@ -637,9 +712,9 @@ impl Ledger {
         Ok(true)
     }
 
-    /// Record the end of the member's open run. Returns the updated task, or
-    /// `None` when there was no open run (nothing recorded).
-    pub fn run_ended(&mut self, member: &str, exit_code: i32) -> Result<Option<TaskInfo>> {
+    /// Record the end of the member's (or chat's) open run. Returns it,
+    /// updated, or `None` when there was no open run (nothing recorded).
+    pub fn run_ended(&mut self, member: &str, exit_code: i32) -> Result<Option<Owner>> {
         self.run_ended_with(member, exit_code, None)
     }
 
@@ -650,7 +725,7 @@ impl Ledger {
         member: &str,
         exit_code: i32,
         response: Option<AgentResponse>,
-    ) -> Result<Option<TaskInfo>> {
+    ) -> Result<Option<Owner>> {
         if !self.has_open_run(member) {
             return Ok(None);
         }
@@ -660,16 +735,16 @@ impl Ledger {
             timestamp: now(),
             response,
         })?;
-        Ok(self.member_task(member).and_then(|t| self.task(t)))
+        Ok(self.owner(member))
     }
 
     /// The response that ended the last turn of the member's latest run,
     /// once that run is over (while it runs, its agent has it). `None` when
     /// it ended before a turn did, or mid-turn.
     pub fn last_response(&self, member: &str) -> Option<AgentResponse> {
-        let record = self.state.members.get(member)?;
-        let ended = record.runs.last().is_some_and(|r| r.ended_at.is_some());
-        record.response.clone().filter(|_| ended)
+        let history = self.state.history(member)?;
+        let ended = history.runs.last().is_some_and(|r| r.ended_at.is_some());
+        history.response.clone().filter(|_| ended)
     }
 
     /// Forget a task and its members. Their open runs, if any, are ended
@@ -706,6 +781,14 @@ impl Ledger {
         }
     }
 
+    /// Errors unless `id` is a member's or a chat's.
+    fn require_owner(&self, id: &str) -> Result<()> {
+        if self.state.history(id).is_none() {
+            bail!("task member or chat '{}' not found", id);
+        }
+        Ok(())
+    }
+
     fn append(&mut self, event: LedgerEvent) -> Result<()> {
         self.append_all(vec![event])
     }
@@ -734,8 +817,17 @@ impl Ledger {
         Some(task.member_label(&member))
     }
 
-    /// Record a message to member `to`, from member `from` (`None`: the
-    /// user).
+    /// How messages name a member (its label) or a chat (its id: it always
+    /// resolves back to the chat, which a name may not).
+    pub fn message_label(&self, id: &str) -> Option<String> {
+        match self.member_label(id) {
+            Some(label) => Some(label),
+            None => self.state.chats.contains_key(id).then(|| id.to_string()),
+        }
+    }
+
+    /// Record a message to member (or chat) `to`, from member (or chat)
+    /// `from` (`None`: the user).
     pub fn send_message(
         &mut self,
         from: Option<&str>,
@@ -744,7 +836,7 @@ impl Ledger {
         hop: u32,
         reply_to: Option<&str>,
     ) -> Result<MessageInfo> {
-        self.require_member(to)?;
+        self.require_owner(to)?;
         let id = new_message_id(|id| self.message_record(id).is_some());
         self.append(LedgerEvent::MessageSent {
             id: id.clone(),
@@ -778,12 +870,13 @@ impl Ledger {
         Some(self.message_info(to, record))
     }
 
-    /// Messages to a member that its agent has not got yet, oldest first.
+    /// Messages to a member (or chat) that its agent has not got yet,
+    /// oldest first.
     pub fn pending_messages(&self, member: &str) -> Vec<MessageInfo> {
-        let Some(record) = self.state.members.get(member) else {
+        let Some(history) = self.state.history(member) else {
             return Vec::new();
         };
-        record
+        history
             .messages
             .iter()
             .filter(|m| m.delivered_at.is_none())
@@ -791,32 +884,40 @@ impl Ledger {
             .collect()
     }
 
-    /// Messages to or from the members of `task` (of every task: `None`),
-    /// oldest first.
+    /// Messages to or from the members of `task` (of every task and chat:
+    /// `None`), oldest first.
     pub fn messages(&self, task: Option<&str>) -> Vec<MessageInfo> {
         let members = task.map(|t| self.member_ids(t));
-        let involved = |id: &str| members.as_ref().is_none_or(|ms| ms.iter().any(|m| m == id));
+        self.messages_where(|id| members.as_ref().is_none_or(|ms| ms.iter().any(|m| m == id)))
+    }
+
+    /// Messages to or from a chat, oldest first.
+    pub fn chat_messages(&self, chat: &str) -> Vec<MessageInfo> {
+        self.messages_where(|id| id == chat)
+    }
+
+    /// Messages to or from a member or chat `involved` takes, oldest first.
+    fn messages_where(&self, involved: impl Fn(&str) -> bool) -> Vec<MessageInfo> {
         let mut found: Vec<(usize, MessageInfo)> = self
             .state
-            .members
-            .values()
-            .flat_map(|r| r.messages.iter().map(move |m| (r.id.as_str(), m)))
-            .filter(|(to, m)| involved(to) || m.from.as_deref().is_some_and(involved))
+            .histories()
+            .flat_map(|(to, h)| h.messages.iter().map(move |m| (to, m)))
+            .filter(|(to, m)| involved(to) || m.from.as_deref().is_some_and(&involved))
             .map(|(to, m)| (m.seq, self.message_info(to, m)))
             .collect();
         found.sort_by_key(|(seq, _)| *seq);
         found.into_iter().map(|(_, m)| m).collect()
     }
 
-    /// The latest message from member `from` to member `to`, sent at or after
-    /// `since`, that no message from `to` answers yet.
+    /// The latest message from member `from` to member `to` (either may be
+    /// a chat), sent at or after `since`, that no message from `to` answers
+    /// yet.
     pub fn unanswered_message(&self, from: &str, to: &str, since: u64) -> Option<String> {
-        let sent = &self.state.members.get(to)?.messages;
+        let sent = &self.state.history(to)?.messages;
         let answers = self
             .state
-            .members
-            .get(from)
-            .map(|r| r.messages.as_slice())
+            .history(from)
+            .map(|h| h.messages.as_slice())
             .unwrap_or_default();
         sent.iter()
             .rev()
@@ -831,16 +932,13 @@ impl Ledger {
 
     /// A message and its recipient.
     fn message_record(&self, id: &str) -> Option<(&str, &MessageRecord)> {
-        self.state.members.values().find_map(|r| {
-            r.messages
-                .iter()
-                .find(|m| m.id == id)
-                .map(|m| (r.id.as_str(), m))
-        })
+        self.state
+            .histories()
+            .find_map(|(to, h)| h.messages.iter().find(|m| m.id == id).map(|m| (to, m)))
     }
 
     fn message_info(&self, to: &str, m: &MessageRecord) -> MessageInfo {
-        let label = |id: &str| self.member_label(id).unwrap_or_else(|| id.to_string());
+        let label = |id: &str| self.message_label(id).unwrap_or_else(|| id.to_string());
         MessageInfo {
             id: m.id.clone(),
             from: m.from.clone(),
@@ -902,14 +1000,16 @@ impl State {
                     repo_root: repo_root.clone(),
                     branch: branch.clone(),
                     dir: dir.clone(),
-                    runs: Vec::new(),
-                    response: None,
-                    events: Vec::new(),
-                    messages: Vec::new(),
+                    history: History::default(),
                 };
                 let id = member.id.clone();
                 self.members.insert(id.clone(), member);
-                self.members.get_mut(&id).unwrap().events.push((seq, event));
+                self.members
+                    .get_mut(&id)
+                    .unwrap()
+                    .history
+                    .events
+                    .push((seq, event));
             }
             LedgerEvent::TaskDropped { task, .. } => {
                 let task = task.clone();
@@ -923,7 +1023,7 @@ impl State {
             LedgerEvent::AgentRunStarted { member, .. }
             | LedgerEvent::AgentSessionIdentified { member, .. }
             | LedgerEvent::AgentRunEnded { member, .. } => {
-                let Some(record) = self.members.get_mut(member) else {
+                let Some(record) = self.history_mut(member) else {
                     return; // event for an unknown or dropped member
                 };
                 match &event {
@@ -968,7 +1068,7 @@ impl State {
             LedgerEvent::AgentSessionChanged {
                 member, session_id, ..
             } => {
-                let Some(record) = self.members.get_mut(member) else {
+                let Some(record) = self.history_mut(member) else {
                     return; // event for an unknown or dropped member
                 };
                 if let Some(run) = record.runs.last_mut() {
@@ -985,7 +1085,7 @@ impl State {
                 reply_to,
                 timestamp,
             } => {
-                let Some(record) = self.members.get_mut(to) else {
+                let Some(record) = self.history_mut(to) else {
                     return; // to an unknown or dropped member
                 };
                 if record.messages.iter().any(|m| m.id == *id) {
@@ -1004,7 +1104,7 @@ impl State {
                 record.events.push((seq, event));
             }
             LedgerEvent::MessageDelivered { id, to, timestamp } => {
-                let Some(record) = self.members.get_mut(to) else {
+                let Some(record) = self.history_mut(to) else {
                     return;
                 };
                 let Some(message) = record.messages.iter_mut().find(|m| m.id == *id) else {
@@ -1039,6 +1139,116 @@ impl State {
                 let (member, task) = (member.clone(), task.clone());
                 self.move_member(seq, &member, &task, event);
             }
+            LedgerEvent::ChatCreated {
+                chat,
+                dir,
+                name,
+                session,
+                timestamp,
+            } => {
+                if self.chats.contains_key(chat) || self.members.contains_key(chat) {
+                    return; // ids are unique: a second one is bogus
+                }
+                let record = ChatRecord {
+                    id: chat.clone(),
+                    dir: dir.clone(),
+                    name: name.clone(),
+                    session: session.clone(),
+                    created_at: *timestamp,
+                    keep: false,
+                    last_turn_at: None,
+                    order: seq,
+                    history: History::default(),
+                };
+                let id = record.id.clone();
+                self.chats.insert(id.clone(), record);
+                self.chats
+                    .get_mut(&id)
+                    .unwrap()
+                    .history
+                    .events
+                    .push((seq, event));
+            }
+            LedgerEvent::ChatRenamed { chat, name, .. } => {
+                let Some(record) = self.chats.get_mut(chat) else {
+                    return; // an unknown or closed chat
+                };
+                record.name = name.clone();
+                record.history.replace(seq, event);
+            }
+            LedgerEvent::ChatKept { chat, keep, .. } => {
+                let Some(record) = self.chats.get_mut(chat) else {
+                    return;
+                };
+                record.keep = *keep;
+                record.history.replace(seq, event);
+            }
+            LedgerEvent::ChatTurn { chat, timestamp } => {
+                let Some(record) = self.chats.get_mut(chat) else {
+                    return;
+                };
+                record.last_turn_at = Some(*timestamp);
+                record.history.replace(seq, event);
+            }
+            LedgerEvent::ChatClosed { chat, .. } => {
+                // Kept nowhere: compaction drops the chat's events with it.
+                self.chats.remove(chat);
+            }
+        }
+    }
+
+    /// The history of a member or a chat.
+    fn history(&self, id: &str) -> Option<&History> {
+        match self.members.get(id) {
+            Some(member) => Some(&member.history),
+            None => self.chats.get(id).map(|c| &c.history),
+        }
+    }
+
+    fn history_mut(&mut self, id: &str) -> Option<&mut History> {
+        let State { members, chats, .. } = self;
+        match members.get_mut(id) {
+            Some(member) => Some(&mut member.history),
+            None => chats.get_mut(id).map(|c| &mut c.history),
+        }
+    }
+
+    /// Every member's and chat's history, with its id.
+    fn histories(&self) -> impl Iterator<Item = (&str, &History)> {
+        self.members
+            .values()
+            .map(|m| (m.id.as_str(), &m.history))
+            .chain(self.chats.values().map(|c| (c.id.as_str(), &c.history)))
+    }
+
+    /// See [`Ledger::current_session`].
+    fn current_session(&self, id: &str, provider: &str) -> Option<String> {
+        let recorded = self
+            .history(id)?
+            .runs
+            .iter()
+            .rev()
+            .filter(|r| r.provider == provider)
+            .find_map(|r| r.session_id.clone());
+        recorded.or_else(|| self.chats.get(id)?.session.clone())
+    }
+
+    /// The chat's summary.
+    fn chat_info(&self, chat: &ChatRecord) -> ChatInfo {
+        ChatInfo {
+            id: chat.id.clone(),
+            name: chat.name.clone(),
+            repo: chat
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| chat.dir.display().to_string()),
+            dir: chat.dir.clone(),
+            created_at: chat.created_at,
+            keep: chat.keep,
+            session: self.current_session(&chat.id, CLAUDE),
+            last_turn_at: chat.last_turn_at,
+            run_count: chat.history.runs.len(),
         }
     }
 
@@ -1062,7 +1272,7 @@ impl State {
         let names = member_names(&members);
         let mut run_count = 0;
         let mut last_activity = task.created_at;
-        for run in members.iter().flat_map(|m| &m.runs) {
+        for run in members.iter().flat_map(|m| &m.history.runs) {
             run_count += 1;
             last_activity = last_activity.max(run.ended_at.unwrap_or(run.started_at));
         }
@@ -1087,19 +1297,20 @@ impl State {
         }
     }
 
-    /// Number of events kept by the active tasks and members.
+    /// Number of events kept by the active tasks, members and chats.
     fn kept(&self) -> usize {
         self.tasks.values().map(|t| t.events.len()).sum::<usize>()
-            + self.members.values().map(|m| m.events.len()).sum::<usize>()
+            + self.histories().map(|(_, h)| h.events.len()).sum::<usize>()
     }
 
-    /// Events of the active tasks and members, in their original order.
+    /// Events of the active tasks, members and chats, in their original
+    /// order.
     fn events(&self) -> Vec<&(usize, LedgerEvent)> {
         let mut events: Vec<&(usize, LedgerEvent)> = self
             .tasks
             .values()
             .flat_map(|t| t.events.iter())
-            .chain(self.members.values().flat_map(|m| m.events.iter()))
+            .chain(self.histories().flat_map(|(_, h)| h.events.iter()))
             .collect();
         events.sort_by_key(|(seq, _)| *seq);
         events
@@ -1222,6 +1433,228 @@ impl Ledger {
             Ok((_, found)) if found.id == member.id => member.name.clone(),
             _ => task.member_label(member),
         }
+    }
+}
+
+/// What an agent runs for: a task member (with its task), or a chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    Member(TaskInfo, MemberInfo),
+    Chat(ChatInfo),
+}
+
+impl Owner {
+    /// The member's or chat's id, its agent's id.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Member(_, member) => &member.id,
+            Self::Chat(chat) => &chat.id,
+        }
+    }
+
+    /// How to name it to the user: the member's label, the chat's.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Member(task, member) => task.member_label(member),
+            Self::Chat(chat) => chat.label(),
+        }
+    }
+
+    /// Where its agent runs: the member's worktree, the chat's checkout.
+    pub fn dir(&self) -> &Path {
+        match self {
+            Self::Member(_, member) => &member.dir,
+            Self::Chat(chat) => &chat.dir,
+        }
+    }
+
+    /// The event telling clients it changed.
+    pub fn updated(self) -> Event {
+        match self {
+            Self::Member(task, _) => Event::TaskUpdated { task },
+            Self::Chat(chat) => Event::ChatUpdated { chat },
+        }
+    }
+}
+
+/// The agent a chat runs (and whose sessions it is made from).
+const CLAUDE: &str = "claude";
+
+/// Chats: Claude sessions on a repository's main checkout. Their agents'
+/// runs, sessions and messages are recorded as a member's are, by id.
+impl Ledger {
+    /// Open chats, in creation order.
+    pub fn chats(&self) -> Vec<ChatInfo> {
+        let mut chats: Vec<&ChatRecord> = self.state.chats.values().collect();
+        chats.sort_by_key(|c| c.order);
+        chats.into_iter().map(|c| self.state.chat_info(c)).collect()
+    }
+
+    pub fn chat(&self, id: &str) -> Option<ChatInfo> {
+        self.state.chats.get(id).map(|c| self.state.chat_info(c))
+    }
+
+    pub fn is_chat(&self, id: &str) -> bool {
+        self.state.chats.contains_key(id)
+    }
+
+    /// The member (with its task) or chat with this id.
+    pub fn owner(&self, id: &str) -> Option<Owner> {
+        match self.member(id) {
+            Some((task, member)) => Some(Owner::Member(task, member)),
+            None => self.chat(id).map(Owner::Chat),
+        }
+    }
+
+    /// Find a chat from what a user typed: its id, or its name.
+    pub fn resolve_chat(&self, target: &str) -> Result<ChatInfo> {
+        if let Some(chat) = self.chat(target) {
+            return Ok(chat);
+        }
+        match self.chat_named(target) {
+            Some(id) => Ok(self.chat(&id).expect("found by name")),
+            None => bail!("chat '{}' not found", target),
+        }
+    }
+
+    /// Id of the chat named `name`.
+    fn chat_named(&self, name: &str) -> Option<String> {
+        self.state
+            .chats
+            .values()
+            .find(|c| c.name.as_deref() == Some(name))
+            .map(|c| c.id.clone())
+    }
+
+    /// The recipient of a message from member (or chat) `caller`: what
+    /// [`Ledger::resolve_from`] takes, else a chat's id or name. A target
+    /// naming a task (or `<task>/…` of one) is never a chat's: no name that
+    /// named something changes meaning.
+    pub fn resolve_recipient(&self, caller: Option<&str>, target: &str) -> Result<Owner> {
+        let found = self.resolve_from(caller, target);
+        let names_task = self.task(target).is_some()
+            || target
+                .rsplit_once('/')
+                .is_some_and(|(task, _)| self.task(task).is_some());
+        match found {
+            Ok((task, member)) => Ok(Owner::Member(task, member)),
+            Err(e) if names_task => Err(e),
+            Err(e) => self.resolve_chat(target).map(Owner::Chat).map_err(|_| e),
+        }
+    }
+
+    /// Record a new chat on the repository whose main checkout is `dir`,
+    /// named `name`, made from Claude session `session` (`None`: its agent
+    /// starts a new one). Refused for a name another chat has, and for a
+    /// session another chat holds.
+    pub fn create_chat(
+        &mut self,
+        dir: &Path,
+        name: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<ChatInfo> {
+        let name = name.map(|n| self.check_chat_name(None, n)).transpose()?;
+        if let Some(session) = session {
+            if session.trim().is_empty() {
+                bail!("a session id cannot be empty");
+            }
+            if let Some(holder) = self
+                .chats()
+                .into_iter()
+                .find(|c| c.session.as_deref() == Some(session))
+            {
+                bail!(
+                    "session {} is the session of chat '{}' already",
+                    session,
+                    holder.label()
+                );
+            }
+        }
+        let id = new_chat_id(|id| self.state.chats.contains_key(id));
+        self.append(LedgerEvent::ChatCreated {
+            chat: id.clone(),
+            dir: dir.to_path_buf(),
+            name,
+            session: session.map(str::to_string),
+            timestamp: now(),
+        })?;
+        Ok(self.chat(&id).expect("chat just created"))
+    }
+
+    /// Name a chat (`None`: unnamed). Returns whether its name changed.
+    pub fn rename_chat(&mut self, id: &str, name: Option<&str>) -> Result<bool> {
+        let chat = self.require_chat(id)?;
+        let name = name
+            .map(|n| self.check_chat_name(Some(id), n))
+            .transpose()?;
+        if chat.name == name {
+            return Ok(false);
+        }
+        self.append(LedgerEvent::ChatRenamed {
+            chat: id.into(),
+            name,
+            timestamp: now(),
+        })?;
+        Ok(true)
+    }
+
+    /// Keep a chat, or stop keeping it. Returns whether that changed.
+    pub fn keep_chat(&mut self, id: &str, keep: bool) -> Result<bool> {
+        if self.require_chat(id)?.keep == keep {
+            return Ok(false);
+        }
+        self.append(LedgerEvent::ChatKept {
+            chat: id.into(),
+            keep,
+            timestamp: now(),
+        })?;
+        Ok(true)
+    }
+
+    /// Record that the user prompted the chat's agent now.
+    pub fn chat_turn(&mut self, id: &str) -> Result<()> {
+        self.require_chat(id)?;
+        self.append(LedgerEvent::ChatTurn {
+            chat: id.into(),
+            timestamp: now(),
+        })
+    }
+
+    /// Forget a chat, ending its open run first. Its messages to others
+    /// stay with them; those to it go with it.
+    pub fn close_chat(&mut self, id: &str) -> Result<()> {
+        self.require_chat(id)?;
+        self.run_ended(id, -1)?;
+        self.append(LedgerEvent::ChatClosed {
+            chat: id.into(),
+            timestamp: now(),
+        })
+    }
+
+    fn require_chat(&self, id: &str) -> Result<ChatInfo> {
+        match self.chat(id) {
+            Some(chat) => Ok(chat),
+            None => bail!("chat '{}' not found", id),
+        }
+    }
+
+    /// `name` as a chat's name (`chat`'s, when renaming): trimmed, unique
+    /// among chats, and not one that reads as another chat's id.
+    fn check_chat_name(&self, chat: Option<&str>, name: &str) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("a chat's name cannot be empty");
+        }
+        if name.chars().any(char::is_control) {
+            bail!("a chat's name cannot hold control characters");
+        }
+        if is_chat_id(name) {
+            bail!("'{}' reads as a chat id: give the chat another name", name);
+        }
+        if let Some(other) = self.chat_named(name).filter(|o| Some(o.as_str()) != chat) {
+            bail!("chat {} is named '{}' already", other, name);
+        }
+        Ok(name.to_string())
     }
 }
 
@@ -1349,17 +1782,16 @@ impl State {
             return;
         };
         let from = std::mem::replace(&mut record.task, task.to_string());
-        record
-            .events
-            .retain(|(_, e)| !matches!(e, LedgerEvent::MemberMoved { .. }));
+        let events = &mut record.history.events;
+        events.retain(|(_, e)| !matches!(e, LedgerEvent::MemberMoved { .. }));
         let mut added = None;
-        for (at, e) in &mut record.events {
+        for (at, e) in events.iter_mut() {
             if let LedgerEvent::MemberAdded { task: joined, .. } = e {
                 *joined = task.to_string();
                 added = Some(*at);
             }
         }
-        record.events.push((seq, event));
+        events.push((seq, event));
         if let Some(old) = self.tasks.get_mut(&from) {
             old.members.retain(|m| m != member);
         }
@@ -1403,6 +1835,22 @@ fn new_member_id(taken: impl Fn(&str) -> bool) -> String {
             return id;
         }
     }
+}
+
+/// A fresh chat id (`c-` and 8 hex digits) for which `taken` is false.
+fn new_chat_id(taken: impl Fn(&str) -> bool) -> String {
+    loop {
+        let id = format!("c-{:08x}", random_u32());
+        if !taken(&id) {
+            return id;
+        }
+    }
+}
+
+/// Whether `s` has the shape of a chat id.
+fn is_chat_id(s: &str) -> bool {
+    s.strip_prefix("c-")
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A fresh message id (`msg-` and 8 hex digits) for which `taken` is false.
@@ -1803,10 +2251,7 @@ mod tests {
             repo_root: None,
             branch: "main".into(),
             dir: "/1".into(),
-            runs: vec![],
-            response: None,
-            events: vec![],
-            messages: vec![],
+            history: History::default(),
         };
         let two = MemberRecord {
             id: "m-2".into(),
@@ -1949,7 +2394,9 @@ mod tests {
         let mut ledger = open(&tmp);
         let m = create(&mut ledger, "feat", "/a");
 
-        let info = ledger.run_started(&m, "claude", None).unwrap();
+        let Owner::Member(info, _) = ledger.run_started(&m, "claude", None).unwrap() else {
+            panic!("a member's run");
+        };
         assert_eq!(info.run_count, 1);
         assert!(ledger.has_open_run(&m));
 
@@ -1968,7 +2415,7 @@ mod tests {
         assert_eq!(runs[0].session_id.as_deref(), Some("s1"));
         assert_eq!(runs[0].exit_code, Some(0));
         assert!(runs[0].ended_at.is_some());
-        assert_eq!(ledger.member_runs(&m), runs);
+        assert_eq!(ledger.runs_of(&m), runs);
     }
 
     #[test]
@@ -1986,11 +2433,13 @@ mod tests {
             .unwrap();
         let (api, web) = (&task.members[0].id, &task.members[1].id);
         ledger.run_started(api, "claude", None).unwrap();
-        let info = ledger.run_started(web, "codex", None).unwrap();
+        let Owner::Member(info, _) = ledger.run_started(web, "codex", None).unwrap() else {
+            panic!("a member's run");
+        };
         // Starting one member's run does not close the other's.
         assert!(ledger.has_open_run(api) && ledger.has_open_run(web));
         assert_eq!(info.run_count, 2);
-        assert_eq!(ledger.member_runs(web)[0].provider, "codex");
+        assert_eq!(ledger.runs_of(web)[0].provider, "codex");
         assert_eq!(ledger.runs("multi").len(), 2);
 
         ledger.drop_task("multi", false).unwrap();
@@ -2239,7 +2688,7 @@ mod tests {
         assert_eq!(m.branch, "feat");
         assert_eq!(m.dir, Path::new("/w/myapp--feat"));
         assert!(m.repo_root.is_none());
-        let runs = ledger.member_runs(&m.id);
+        let runs = ledger.runs_of(&m.id);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].session_id.as_deref(), Some("s1"));
         assert_eq!(runs[0].exit_code, Some(-1));
@@ -2555,7 +3004,7 @@ mod tests {
         // No open run: nothing to record.
         assert!(!ledger.session_reported(&m, "s3").unwrap());
 
-        let runs = ledger.member_runs(&m);
+        let runs = ledger.runs_of(&m);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].session_id.as_deref(), Some("s2"));
 
@@ -2771,7 +3220,7 @@ mod tests {
         // Read back as a current event, not mistaken for a legacy one.
         let ledger = open(&tmp);
         assert_eq!(ledger.last_response(&member), Some(response.clone()));
-        assert_eq!(ledger.member_runs(&member)[0].exit_code, Some(0));
+        assert_eq!(ledger.runs_of(&member)[0].exit_code, Some(0));
         assert_eq!(event_types(&path).last().unwrap(), "agent_run_ended");
         drop(ledger);
 
@@ -2846,7 +3295,7 @@ mod tests {
                     .members
                     .iter()
                     .map(|m| MemberFold {
-                        runs: ledger.member_runs(&m.id),
+                        runs: ledger.runs_of(&m.id),
                         open: ledger.has_open_run(&m.id),
                         session: ledger.current_session(&m.id, "claude"),
                         pending: ledger.pending_messages(&m.id),
@@ -3104,7 +3553,7 @@ mod tests {
         drop(ledger);
         let ledger = reopen_keeps(&path, &expected);
         assert_eq!(ledger.tasks().len(), 1);
-        assert_eq!(ledger.member_runs(&myapp)[1].exit_code, Some(0));
+        assert_eq!(ledger.runs_of(&myapp)[1].exit_code, Some(0));
     }
 
     #[test]
@@ -3175,5 +3624,274 @@ mod tests {
         let ledger = reopen_keeps(&path, &expected);
         assert_eq!(ledger.brief("front"), None);
         assert_eq!(ledger.brief("back").as_deref(), Some("CS-1"));
+    }
+
+    fn chat_created(chat: &str, dir: &str, session: Option<&str>, ts: u64) -> LedgerEvent {
+        LedgerEvent::ChatCreated {
+            chat: chat.into(),
+            dir: dir.into(),
+            name: None,
+            session: session.map(str::to_string),
+            timestamp: ts,
+        }
+    }
+
+    fn chat_ids(ledger: &Ledger) -> Vec<String> {
+        ledger.chats().into_iter().map(|c| c.id).collect()
+    }
+
+    #[test]
+    fn chats_keep_their_creation_order_and_state_across_reloads() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        // Ids in reverse order of creation, and the first chat changed last:
+        // neither the ids nor the latest events give the order.
+        let (c, b, a) = ("c-0000000c", "c-0000000b", "c-0000000a");
+        write_lines(
+            &path,
+            &[
+                chat_created(c, "/src/api", None, 10),
+                chat_created(b, "/src/api", Some("s-b"), 11),
+                chat_created(a, "/src/web", None, 12),
+            ],
+            &[],
+        );
+        {
+            let mut ledger = Ledger::open(&path).unwrap().0;
+            assert_eq!(chat_ids(&ledger), [c, b, a]);
+            ledger.rename_chat(c, Some("debug")).unwrap();
+            ledger.rename_chat(c, Some("deploy")).unwrap();
+            ledger.keep_chat(c, true).unwrap();
+            ledger.chat_turn(c).unwrap();
+            ledger.chat_turn(c).unwrap();
+            ledger.run_started(c, "claude", None).unwrap();
+            assert!(ledger.session_reported(c, "s-c").unwrap());
+            ledger.run_ended(c, 0).unwrap();
+        }
+        let (ledger, report) = Ledger::open(&path).unwrap();
+        // Only the latest rename and turn are kept.
+        assert_eq!(report.compacted, 2);
+        assert_eq!(chat_ids(&ledger), [c, b, a]);
+        let chat = ledger.chat(c).unwrap();
+        assert_eq!(chat.name.as_deref(), Some("deploy"));
+        assert_eq!(chat.label(), "deploy");
+        assert!(chat.keep);
+        assert!(chat.last_turn_at.is_some());
+        assert_eq!(chat.session.as_deref(), Some("s-c"));
+        assert_eq!(chat.run_count, 1);
+        assert_eq!(chat.repo, "api");
+        assert_eq!(chat.dir, Path::new("/src/api"));
+        assert_eq!(chat.created_at, 10);
+        let runs = ledger.runs_of(c);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].member, c);
+        assert_eq!(runs[0].exit_code, Some(0));
+        // Made from a session, never run: that session is its current one.
+        let made = ledger.chat(b).unwrap();
+        assert_eq!(made.session.as_deref(), Some("s-b"));
+        assert_eq!(made.label(), b);
+        assert!(!made.keep && made.last_turn_at.is_none());
+        // Chats are no tasks.
+        assert!(ledger.tasks().is_empty());
+        drop(ledger);
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(ledger.1.compacted, 0);
+        assert_eq!(chat_ids(&ledger.0), [c, b, a]);
+    }
+
+    #[test]
+    fn chat_names_are_unique_and_sessions_held_once() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = open(&tmp);
+        let dir = Path::new("/src/api");
+        let one = ledger.create_chat(dir, Some("  debug "), None).unwrap();
+        assert!(
+            one.id.starts_with("c-") && is_chat_id(&one.id),
+            "{}",
+            one.id
+        );
+        assert_eq!(one.name.as_deref(), Some("debug"));
+        // Several chats on one repository.
+        let two = ledger.create_chat(dir, None, Some("s-1")).unwrap();
+        assert_ne!(one.id, two.id);
+        for (name, why) in [
+            ("debug", "named 'debug' already"),
+            (" ", "cannot be empty"),
+            ("a\nb", "control characters"),
+            ("c-12345678", "reads as a chat id"),
+        ] {
+            let err = ledger.create_chat(dir, Some(name), None).unwrap_err();
+            assert!(err.to_string().contains(why), "{name:?}: {err}");
+            let err = ledger.rename_chat(&two.id, Some(name)).unwrap_err();
+            assert!(err.to_string().contains(why), "{name:?}: {err}");
+        }
+        // Its own name again: nothing to record.
+        assert!(!ledger.rename_chat(&one.id, Some("debug")).unwrap());
+        assert!(ledger.rename_chat(&one.id, None).unwrap());
+        assert_eq!(ledger.chat(&one.id).unwrap().name, None);
+        assert!(!ledger.keep_chat(&one.id, false).unwrap());
+        assert!(ledger.keep_chat(&one.id, true).unwrap());
+        // A session another chat holds.
+        let err = ledger.create_chat(dir, None, Some("s-1")).unwrap_err();
+        assert!(err.to_string().contains("already"), "{err}");
+        assert!(ledger.create_chat(dir, None, Some(" ")).is_err());
+        // Closed, it holds nothing: the chat can be made again from it.
+        ledger.close_chat(&two.id).unwrap();
+        let again = ledger.create_chat(dir, None, Some("s-1")).unwrap();
+        assert_eq!(again.session.as_deref(), Some("s-1"));
+        assert_ne!(again.id, two.id);
+        assert!(ledger.chat(&two.id).is_none());
+        for missing in [two.id.as_str(), "nope"] {
+            assert!(ledger.rename_chat(missing, Some("x")).is_err());
+            assert!(ledger.keep_chat(missing, true).is_err());
+            assert!(ledger.chat_turn(missing).is_err());
+            assert!(ledger.close_chat(missing).is_err());
+        }
+        // Found by id or name.
+        ledger.rename_chat(&again.id, Some("deploy")).unwrap();
+        assert_eq!(ledger.resolve_chat("deploy").unwrap().id, again.id);
+        assert_eq!(ledger.resolve_chat(&again.id).unwrap().id, again.id);
+        assert!(ledger.resolve_chat("debug").is_err());
+    }
+
+    #[test]
+    fn a_chat_runs_and_messages_as_a_member_does() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = open(&tmp);
+        let m = create(&mut ledger, "feat", "/w/app--feat");
+        let chat = ledger
+            .create_chat(Path::new("/src/app"), Some("debug"), Some("s-0"))
+            .unwrap();
+        let c = chat.id.as_str();
+        assert_eq!(ledger.current_session(c, "claude").as_deref(), Some("s-0"));
+
+        // Runs, sessions: recorded against the chat id.
+        let Owner::Chat(info) = ledger.run_started(c, "claude", Some("s-0".into())).unwrap() else {
+            panic!("a chat's run");
+        };
+        assert_eq!(info.run_count, 1);
+        assert!(ledger.has_open_run(c));
+        assert!(ledger.session_reported(c, "s-1").unwrap());
+        assert_eq!(ledger.current_session(c, "claude").as_deref(), Some("s-1"));
+        assert_eq!(ledger.chat(c).unwrap().session.as_deref(), Some("s-1"));
+        assert!(matches!(ledger.owner(c), Some(Owner::Chat(_))));
+        assert!(matches!(ledger.owner(&m), Some(Owner::Member(..))));
+        assert!(ledger.member(c).is_none() && ledger.member_task(c).is_none());
+        // The task's runs are its members' only.
+        assert!(ledger.runs("feat").is_empty());
+
+        // A chat is no task member: `resolve` says so.
+        let err = ledger.resolve(c).unwrap_err();
+        assert!(err.to_string().contains("is a chat"), "{err}");
+        // Recipients: a chat by id or name, never by a task's name.
+        let to = |caller: Option<&str>, target: &str| {
+            ledger
+                .resolve_recipient(caller, target)
+                .map(|o| o.id().to_string())
+        };
+        assert_eq!(to(None, c).unwrap(), c);
+        assert_eq!(to(Some(&m), "debug").unwrap(), c);
+        assert_eq!(to(Some(c), "feat").unwrap(), m);
+        assert!(to(None, "nope").is_err());
+
+        // Messages both ways, labelled by the chat's id.
+        let asked = ledger
+            .send_message(Some(c), &m, "status?", 1, None)
+            .unwrap();
+        assert_eq!(asked.from_label, c);
+        assert_eq!(asked.to_label, "feat");
+        assert_eq!(ledger.unanswered_message(c, &m, 0), Some(asked.id.clone()));
+        let reply = ledger
+            .send_message(Some(&m), c, "done", 2, Some(&asked.id))
+            .unwrap();
+        assert_eq!(reply.to, c);
+        assert_eq!(reply.to_label, c);
+        assert_eq!(ledger.unanswered_message(c, &m, 0), None);
+        assert_eq!(ledger.pending_messages(c).len(), 1);
+        let user = ledger.send_message(None, c, "hi", 0, None).unwrap();
+        assert!(ledger.message_delivered(&user.id).unwrap().is_some());
+        let ids = |ms: Vec<MessageInfo>| ms.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(ledger.chat_messages(c)),
+            [asked.id.clone(), reply.id.clone(), user.id.clone()]
+        );
+        assert_eq!(
+            ids(ledger.messages(Some("feat"))),
+            [asked.id.clone(), reply.id.clone()]
+        );
+        assert_eq!(ledger.messages(None).len(), 3);
+
+        // Closing ends its run and forgets it with what was sent to it; what
+        // it sent stays with its recipient, under its id.
+        ledger.close_chat(c).unwrap();
+        assert!(ledger.chat(c).is_none() && ledger.owner(c).is_none());
+        assert!(ledger.runs_of(c).is_empty());
+        assert!(ledger.run_started(c, "claude", None).is_err());
+        assert!(ledger.send_message(None, c, "hi", 0, None).is_err());
+        let left = ledger.messages(None);
+        assert_eq!(ids(left.clone()), std::slice::from_ref(&asked.id));
+        assert_eq!(left[0].from_label, c);
+        drop(ledger);
+        let ledger = open(&tmp);
+        assert!(ledger.chats().is_empty());
+        assert_eq!(ids(ledger.messages(None)), [asked.id]);
+        assert!(!event_types(&tmp.path().join("ledger.jsonl"))
+            .iter()
+            .any(|t| t.starts_with("chat_") || t == "agent_run_started"));
+    }
+
+    #[test]
+    fn a_chat_named_like_a_task_never_takes_its_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut ledger = open(&tmp);
+        let task = ledger
+            .create_task(
+                "feat",
+                &[
+                    new_member("api", "feat", "/w/1"),
+                    new_member("web", "feat", "/w/2"),
+                ],
+            )
+            .unwrap();
+        ledger
+            .create_chat(Path::new("/src/api"), Some("feat"), None)
+            .unwrap();
+        ledger
+            .create_chat(Path::new("/src/api"), Some("feat/api"), None)
+            .unwrap();
+        // The task has several members: an error, as before chats.
+        let err = ledger.resolve_recipient(None, "feat").unwrap_err();
+        assert!(err.to_string().contains("several members"), "{err}");
+        let found = ledger.resolve_recipient(None, "feat/api").unwrap();
+        assert_eq!(found.id(), task.members[0].id);
+    }
+
+    #[test]
+    fn a_ledger_without_chats_loads_unchanged() {
+        // As tam 0.4.1 wrote it: nothing to migrate or compact.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let lines = [
+            r#"{"type":"task_created","name":"feat","timestamp":1}"#,
+            r#"{"type":"member_added","task":"feat","member":"m-00000001","repo":"app","repo_root":"/src/app","branch":"feat","dir":"/w/app--feat","timestamp":1}"#,
+            r#"{"type":"agent_run_started","member":"m-00000001","provider":"claude","timestamp":2}"#,
+            r#"{"type":"agent_session_identified","member":"m-00000001","session_id":"s-1","timestamp":3}"#,
+            r#"{"type":"message_sent","id":"msg-00000001","to":"m-00000001","text":"hi","hop":0,"timestamp":4}"#,
+            r#"{"type":"agent_run_ended","member":"m-00000001","exit_code":0,"timestamp":5}"#,
+        ];
+        write_lines(&path, &[], &lines);
+        let before = fs::read_to_string(&path).unwrap();
+        let (ledger, report) = Ledger::open(&path).unwrap();
+        assert!(report.malformed.is_empty());
+        assert_eq!((report.compacted, report.migrated), (0, 0));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(ledger.tasks().len(), 1);
+        assert_eq!(ledger.runs_of("m-00000001").len(), 1);
+        assert_eq!(
+            ledger.current_session("m-00000001", "claude").as_deref(),
+            Some("s-1")
+        );
+        assert_eq!(ledger.pending_messages("m-00000001").len(), 1);
+        assert!(ledger.chats().is_empty());
     }
 }

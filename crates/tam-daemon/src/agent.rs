@@ -52,10 +52,10 @@ pub struct Agent {
     reported_since: SystemTime,
     /// Cached context usage percentage, updated periodically.
     context_percent: Option<u8>,
-    /// Id of the task member this agent runs for, if any (its runs are
-    /// recorded in the ledger). The member's task is looked up when needed:
-    /// it can change.
-    member: Option<String>,
+    /// Id of the task member or chat this agent runs for, if any (its runs
+    /// are recorded in the ledger): the agent's own id. A member's task is
+    /// looked up when needed: it can change.
+    owner: Option<String>,
     /// What the agent's hooks reported (session, pending action, …).
     hook_data: HookData,
     _reader_handle: JoinHandle<()>,
@@ -240,7 +240,7 @@ impl Agent {
             reported_state: AgentState::Working,
             reported_since: SystemTime::now(),
             context_percent: None,
-            member: None,
+            owner: None,
             hook_data: HookData::default(),
             _reader_handle: reader_handle,
             readable: Vec::new(),
@@ -293,13 +293,14 @@ impl Agent {
         let _ = self.kill();
     }
 
-    /// Bind the agent to a task member.
-    pub fn set_member(&mut self, member: Option<String>) {
-        self.member = member;
+    /// Bind the agent to a task member or a chat.
+    pub fn set_owner(&mut self, owner: Option<String>) {
+        self.owner = owner;
     }
 
-    pub fn member(&self) -> Option<&str> {
-        self.member.as_deref()
+    /// The task member or chat the agent runs for.
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
     }
 
     /// Record the other members' worktrees the agent can read.
@@ -396,7 +397,7 @@ impl Agent {
     }
 
     /// Build an AgentInfo snapshot for reporting to clients. Its `task` is
-    /// left for the caller, who knows the member's task.
+    /// left for the caller, who knows the member's task (a chat has none).
     pub fn info(&self, id: &str) -> AgentInfo {
         let state = self.current_state();
         // A change not reported yet (e.g. by the hook being handled) is now.

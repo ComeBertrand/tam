@@ -9,7 +9,7 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 
 - `tam-proto`    — wire protocol types (daemon <-> client)
 - `tam-daemon`   — daemon: PTY management, agent screens, agent lifecycle, state detection, task ledger, task drop,
-  worktree reconciliation (member health, repair, adopt)
+  worktree reconciliation (member health, repair, adopt), chats
 - `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init
 - `tam-cli`      — binary `tam`: CLI, TUI, bridges worktrees and agents
 
@@ -25,11 +25,13 @@ adopt). `tam-cli` depends on all three.
   (`m-xxxxxxxx`) independent of task and branch names: it is the member's
   agent id in the daemon and `$TAM_AGENT_ID`. Short names (repo name, else
   `<repo>-<branch>`, assigned in join order, never containing `/`) are derived
-  when the ledger is folded, not stored. Agents store only their member id;
+  when the ledger is folded, not stored. Agents store only their member id
+  (`Agent::owner`, or a chat's id);
   `AgentInfo.task` is looked up when asked, so moving a member to another task
   (merge, split) is one ledger event. Names typed by users (task, `task/member`,
   member id, or the cwd) are resolved by the daemon: `Ledger::resolve` /
-  `member_at`, request `ResolveMember`.
+  `member_at`, request `ResolveMember`. Chats are the other kind of object
+  (see Chats).
 - **`ready`** — the state of an agent waiting for a prompt (`AgentState::Ready`,
   `TaskStatus::Ready`) was `input`: that name is still read on the wire, in
   `[notify] on_states` and by `tam wait -u`, never written.
@@ -510,6 +512,54 @@ adopt). `tam-cli` depends on all three.
   on, so the note says which peers it can read) until its next start. A drop
   of one member checks under its claim that the member is still in the task it
   claimed.
+- **Chats (#63, tracking #70)** — a Claude session on a repository's main
+  checkout, started from tam: it owns nothing on disk (no worktree, no
+  branch), several run on one repository at once. Its own kind of object,
+  not a task with a flag. Ledger: `ChatCreated { chat, dir, name, session }`,
+  `ChatRenamed`, `ChatKept`, `ChatTurn`, `ChatClosed`; the id (`c-xxxxxxxx`) is
+  its agent's id and `$TAM_AGENT_ID`. Its agent's runs, sessions and messages
+  are the member events with the chat id in `member`/`to`/`from`:
+  `ledger::History` (runs, response, messages, events) is shared by
+  `MemberRecord` and `ChatRecord`, `State::history(id)` finds either, so
+  `run_started`, `session_reported`, `current_session`, `send_message`… take
+  either id; `run_started`/`run_ended` return an `Owner` (`Member(task,
+  member)` or `Chat`) whose `updated()` is `TaskUpdated` or `ChatUpdated`.
+  Compaction drops a closed chat's events, keeps only the latest rename, keep
+  and turn. Listed in creation order (`ChatRecord::order`). Requests (handlers
+  at the end of `daemon.rs`): `CreateChat { dir, name, session }` records only
+  (`worktrees::check_main_checkout`, the same check as `check_new`; the dir
+  resolved; a session another chat holds is refused, its existence is checked
+  at the first start); `RunAgent { member: <chat id> }` starts its agent in
+  the checkout, `Current` being the latest session it had a turn in, else the
+  one it was made from (`ChatInfo::session`); `ListChats`, `GetChat`,
+  `RenameChat`, `KeepChat`, `CloseChat` (agent taken out, `ChatClosed`, then
+  killed and waited for outside the lock; replies the chat as it was, with
+  its session, to make it again; never touches the checkout, its branch or
+  Claude's transcript). Chat targets: an id or a name (`resolve_chat`; names
+  unique among chats, trimmed, never id-shaped). Events `ChatCreated`,
+  `ChatUpdated`, `ChatClosed`. `ChatInfo::label()`: the name, else the id
+  (#64 puts the title between). Last turn (#65): `ChatTurn` at a
+  `UserPromptSubmit` the user typed, neither a tam message being delivered
+  nor a `<task-notification>` (`handle_inbox_hook`), `ChatInfo::last_turn_at`.
+  What does not apply: worktree creation, reconciliation and health, repair,
+  adopt, drop, brief and task directory, `TaskAccess` (`member_access` is
+  members only), merge and split, the start note (`session_note` is members
+  only). Answers (`a`), screen, keys, attach and the inbox go by agent id:
+  unchanged. Messages: `SendMessage.to` takes a chat's id or name after every
+  other kind of target (`Ledger::resolve_recipient`: a target naming a task
+  never reaches a chat); messages label a chat by its id (`message_label`:
+  reply hints must resolve back); `ListMessages` takes a chat. A chat's
+  agent is a caller like any shell: `sender_member` is the chat,
+  `ResolveMember { from: <chat> }` resolves as from no task. `resolve` says
+  a chat id is no task member, and the cwd never names a chat (`member_at`
+  stays members only): `tam run`/`attach` with no name in a main checkout
+  find no task, `tam peers` says "not in a task". Notify: `{task}` is a chat's
+  label, `{id}` its id; custom commands (#67) are to give the same, `{dir}`
+  being the main checkout. A session given to `CreateChat` is not checked
+  against that repository's own history (the first start only checks that a
+  transcript exists in some project): #64's, with the history. Context use
+  never guesses a chat's transcript (several sessions share its directory):
+  the hooks' only. The dashboard ignores chat events for now (#67).
 
 ## Build & check
 
@@ -539,9 +589,18 @@ cargo test
   `noninteractive.rs`:
   new/wait/result/ps --json with no terminal and a fake `claude`;
   `exit_status.rs`: exit statuses and a closed stdout; `brief.rs`: `tam new
-  --brief` with a pattern, `tam brief`, a written brief kept on drop). The
+  --brief` with a pattern, `tam brief`, a written brief kept on drop;
+  `chat_cli.rs`: `tam msg` from a chat's agent and the reply back, `tam
+  result` from it, `tam attach`/`run`/`peers` in a main checkout). The
   daemon's `tests/brief.rs` checks the settings a fake `claude` gets and
-  the start note.
+  the start note. Chats: the daemon's `chats.rs` (sleep agents on real
+  repositories: create, list order, rename, keep, close and its events,
+  refusals, two chats at once, a restart, close leaving a dirty checkout as
+  it was, messages with a member) and `chat_claude.rs` (one test, a fake
+  `claude` on the `PATH` sent with `RunAgent`, `CLAUDE_CONFIG_DIR` set:
+  resume from a session, no start note or task access, which prompts are
+  turns, inbox delivery, an answer, a restart, close keeping the transcript
+  and making the chat again).
 - `agent_env.rs`, in both crates: the daemon's runs an agent found only on
   the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
   value) in replies, events, errors and every file next to the ledger,

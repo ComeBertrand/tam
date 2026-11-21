@@ -1580,6 +1580,10 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
             );
             app.note_message(message);
         }
+        // The dashboard does not show chats yet.
+        tam_proto::Event::ChatCreated { .. }
+        | tam_proto::Event::ChatUpdated { .. }
+        | tam_proto::Event::ChatClosed { .. } => {}
     }
 }
 

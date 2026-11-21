@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::agent::Agent;
 use crate::answer::{self, Delivery};
 use crate::inbox::{self, Handover, Inbox, ReplyOutcome};
-use crate::ledger::Ledger;
+use crate::ledger::{Ledger, Owner};
 use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
 use crate::worktrees::{self, Checked, Observation, Recorded, Removal};
@@ -249,11 +249,16 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
         for (id, old, new) in changes {
             info!(id = %id, old = %old, new = %new, "state changed");
             if let (Some(cfg), Some(info)) = (&notify_config, state.agent_info(&id)) {
+                // A member's task, a chat's label.
+                let name = match state.ledger.chat(&id) {
+                    Some(chat) => chat.label(),
+                    None => info.task.clone().unwrap_or_else(|| id.clone()),
+                };
                 notify::fire_if_matching(
                     cfg,
                     &Notification {
                         id: &id,
-                        task: info.task.as_deref().unwrap_or(&id),
+                        task: &name,
                         old,
                         new,
                         detail: &info.detail,
@@ -286,11 +291,14 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
         if context_counter >= 10 {
             context_counter = 0;
 
-            // Phase 1: collect metadata under lock (cheap)
+            // Phase 1: collect metadata under lock (cheap). Several chats
+            // share a directory: without the transcript their hooks report,
+            // the guess (the newest one there) may be another chat's.
             let jobs: Vec<_> = state
                 .agents
                 .iter()
                 .map(|(id, agent)| agent.context_refresh_job(id))
+                .filter(|job| job.transcript.is_some() || !state.ledger.is_chat(&job.id))
                 .collect();
 
             let event_tx = state.event_tx.clone();
@@ -332,12 +340,12 @@ impl DaemonState {
         let _ = self.event_tx.send(event);
     }
 
-    /// An agent's info, with the task of its member.
+    /// An agent's info, with the task of its member (none for a chat's).
     fn agent_info(&self, id: &str) -> Option<AgentInfo> {
         let agent = self.agents.get(id)?;
         let mut info = agent.info(id);
         info.task = agent
-            .member()
+            .owner()
             .and_then(|m| self.ledger.member_task(m))
             .map(str::to_string);
         Some(info)
@@ -360,25 +368,25 @@ impl DaemonState {
     }
 
     /// An agent was removed from the table: emit `AgentExited` and record the
-    /// end of its member's run.
+    /// end of its member's (or chat's) run.
     fn agent_gone(&mut self, id: &str, agent: &Agent, exit_code: i32) {
         self.broadcast(Event::AgentExited {
             id: id.to_string(),
             exit_code,
         });
-        self.inbox.agent_gone(id, agent.member());
+        self.inbox.agent_gone(id, agent.owner());
         self.asks.release(id);
-        if let Some(member) = agent.member() {
+        if let Some(member) = agent.owner() {
             self.peer_changes.remove(member);
         }
-        let Some(member) = agent.member() else {
+        let Some(member) = agent.owner() else {
             return;
         };
         match self
             .ledger
             .run_ended_with(member, exit_code, agent.response().cloned())
         {
-            Ok(Some(info)) => self.broadcast(Event::TaskUpdated { task: info }),
+            Ok(Some(owner)) => self.broadcast(owner.updated()),
             Ok(None) => {}
             Err(e) => error!(member = %member, "failed to record run end: {e:#}"),
         }
@@ -391,7 +399,7 @@ impl DaemonState {
         let ids: Vec<String> = self
             .agents
             .iter()
-            .filter(|(_, a)| a.member().is_some_and(|m| members.iter().any(|id| id == m)))
+            .filter(|(_, a)| a.owner().is_some_and(|m| members.iter().any(|id| id == m)))
             .map(|(id, _)| id.clone())
             .collect();
         ids.into_iter()
@@ -809,7 +817,7 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             };
             match found {
                 Ok((task, member)) => {
-                    let runs = state.ledger.member_runs(&member.id);
+                    let runs = state.ledger.runs_of(&member.id);
                     Response::Member {
                         task,
                         member: Box::new(member),
@@ -902,9 +910,17 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::ListMessages { task } => {
             let state = state.lock().await;
             match task {
-                Some(task) if state.ledger.task(&task).is_none() => Response::Error {
-                    message: format!("task '{}' not found", task),
-                },
+                // Not a task: a chat's.
+                Some(name) if state.ledger.task(&name).is_none() => {
+                    match state.ledger.resolve_chat(&name) {
+                        Ok(chat) => Response::Messages {
+                            messages: state.ledger.chat_messages(&chat.id),
+                        },
+                        Err(_) => Response::Error {
+                            message: format!("task or chat '{}' not found", name),
+                        },
+                    }
+                }
                 task => Response::Messages {
                     messages: state.ledger.messages(task.as_deref()),
                 },
@@ -933,6 +949,34 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
             message: "wait_answer should be handled by connection handler".into(),
         },
         Request::Answer { agent, ask, answer } => handle_answer(state, &agent, &ask, answer).await,
+        Request::CreateChat { dir, name, session } => {
+            handle_create_chat(state, dir, name, session).await
+        }
+        Request::ListChats => Response::Chats {
+            chats: state.lock().await.ledger.chats(),
+        },
+        Request::GetChat { chat } => {
+            let state = state.lock().await;
+            match state.ledger.resolve_chat(&chat) {
+                Ok(chat) => Response::Chat {
+                    runs: state.ledger.runs_of(&chat.id),
+                    chat: Box::new(chat),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
+        Request::RenameChat { chat, name } => {
+            handle_change_chat(state, &chat, |ledger, id| {
+                ledger.rename_chat(id, name.as_deref())
+            })
+            .await
+        }
+        Request::KeepChat { chat, keep } => {
+            handle_change_chat(state, &chat, |ledger, id| ledger.keep_chat(id, keep)).await
+        }
+        Request::CloseChat { chat } => handle_close_chat(state, &chat).await,
     }
 }
 
@@ -961,40 +1005,43 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         launch,
     } = spec;
 
-    // A member's agent runs in its worktree, under the member id.
+    // A member's agent runs in its worktree, under the member id; a chat's
+    // in its repository's main checkout, under the chat id.
     let (id, dir) = match &member {
         Some(member) => {
-            let Some((task, info)) = state.ledger.member(member) else {
+            let Some(owner) = state.ledger.owner(member) else {
                 return Response::Error {
-                    message: format!("member '{}' not found", member),
+                    message: format!("task member or chat '{}' not found", member),
                 };
             };
             if id.as_ref().is_some_and(|id| id != member) {
                 return Response::Error {
-                    message: format!("the agent of member '{}' runs under its id", member),
+                    message: format!("the agent of '{}' runs under its id", member),
                 };
             }
-            if !dir.as_os_str().is_empty() && dir != info.dir {
+            if !dir.as_os_str().is_empty() && dir != owner.dir() {
                 return Response::Error {
                     message: format!(
-                        "member '{}' runs in {}, not {}",
+                        "'{}' runs in {}, not {}",
                         member,
-                        info.dir.display(),
+                        owner.dir().display(),
                         dir.display()
                     ),
                 };
             }
-            if state.dropping.contains(&task.name) {
-                return Response::Error {
-                    message: format!("task '{}' is being dropped", task.name),
-                };
+            if let Owner::Member(task, _) = &owner {
+                if state.dropping.contains(&task.name) {
+                    return Response::Error {
+                        message: format!("task '{}' is being dropped", task.name),
+                    };
+                }
             }
             if state.agents.contains_key(member) {
                 return Response::Error {
-                    message: format!("'{}' already has a running agent", task.member_label(&info)),
+                    message: format!("'{}' already has a running agent", owner.label()),
                 };
             }
-            (Some(member.clone()), info.dir)
+            (Some(member.clone()), owner.dir().to_path_buf())
         }
         None => (id, dir),
     };
@@ -1040,7 +1087,7 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
     ) {
         Ok(mut agent) => {
             info!(id = %id, provider = %provider, dir = %dir.display(), "spawned agent");
-            agent.set_member(member.clone());
+            agent.set_owner(member.clone());
             agent.set_readable(readable);
             state.agents.insert(id.clone(), agent);
             let info = state.agent_info(&id).expect("agent just inserted");
@@ -1050,7 +1097,7 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
             });
             if let Some(member) = member {
                 match state.ledger.run_started(&member, &provider, resume_session) {
-                    Ok(info) => state.broadcast(Event::TaskUpdated { task: info }),
+                    Ok(owner) => state.broadcast(owner.updated()),
                     Err(e) => error!(member = %member, "failed to record run start: {e:#}"),
                 }
             }
@@ -1072,7 +1119,7 @@ struct RunSpec {
     launch: crate::agent::Launch,
 }
 
-/// Start a member's agent, in the member's current session unless told
+/// Start a member's (or a chat's) agent, in its current session unless told
 /// otherwise.
 async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Response {
     let RunSpec {
@@ -1084,14 +1131,15 @@ async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Res
         launch,
     } = spec;
 
-    let (label, provider, current) = {
+    let (label, chat, provider, current) = {
         let state = state.lock().await;
-        let Some((task, info)) = state.ledger.member(&member) else {
+        let Some(owner) = state.ledger.owner(&member) else {
             return Response::Error {
-                message: format!("member '{}' not found", member),
+                message: format!("task member or chat '{}' not found", member),
             };
         };
-        let label = task.member_label(&info);
+        let label = owner.label();
+        let chat = matches!(owner, Owner::Chat(_));
         // Before looking for the session: it would not be resumed anyway.
         if state.agents.contains_key(&member) {
             return Response::Error {
@@ -1101,7 +1149,7 @@ async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Res
         // Claude, whatever the member's earlier runs were.
         let provider = provider.unwrap_or_else(|| "claude".into());
         let current = state.ledger.current_session(&member, &provider);
-        (label, provider, current)
+        (label, chat, provider, current)
     };
 
     let agent = provider::resolve(&provider);
@@ -1121,11 +1169,16 @@ async fn handle_run_agent(state: &Arc<Mutex<DaemonState>>, spec: RunSpec) -> Res
             Some(id) if agent.reports_sessions() => {
                 // Outside the lock: it reads the provider's files.
                 if !agent.session_exists(&id) {
+                    let hint = if chat {
+                        ""
+                    } else {
+                        " (R in the TUI, tam run --new-session)"
+                    };
                     return Response::Error {
                         message: format!(
                             "the {} session of '{}' ({}) can no longer be resumed: start a \
-                             new one (R in the TUI, tam run --new-session)",
-                            provider, label, id
+                             new one{}",
+                            provider, label, id, hint
                         ),
                     };
                 }
@@ -1245,7 +1298,7 @@ async fn handle_hook_event(
 
     let changed = agent.info(agent_id).detail != before;
     let session = agent
-        .member()
+        .owner()
         .zip(agent.resumable_session())
         .map(|(member, session)| (member.to_string(), session.to_string()));
     if changed {
@@ -1267,7 +1320,7 @@ async fn handle_hook_event(
     // task is now, and its peers.
     if event == "SessionStart" {
         let note = state.agents.get(agent_id).and_then(|agent| {
-            crate::peers::session_note(&state.ledger, agent.member()?, agent.readable())
+            crate::peers::session_note(&state.ledger, agent.owner()?, agent.readable())
         });
         if let Some(context) = note {
             return Response::HookContext { context };
@@ -1592,10 +1645,10 @@ async fn stop_and_remove_member(
 }
 
 impl DaemonState {
-    /// Take a member's agent out of the table, telling clients and recording
-    /// the end of its run. The caller kills it.
+    /// Take a member's (or chat's) agent out of the table, telling clients
+    /// and recording the end of its run. The caller kills it.
     fn take_member_agent(&mut self, member: &str) -> Option<Agent> {
-        // A member's agent runs under the member id.
+        // A member's agent runs under the member id, a chat's under its id.
         let agent = self.agents.remove(member)?;
         self.agent_gone(member, &agent, -1);
         Some(agent)
@@ -1806,7 +1859,7 @@ async fn handle_repair_member(
     state.record_health(observed.into_iter().map(|o| (member.id.clone(), o)));
     match state.ledger.member(&member.id) {
         Some((task, member)) => Response::Member {
-            runs: state.ledger.member_runs(&member.id),
+            runs: state.ledger.runs_of(&member.id),
             task,
             member: Box::new(member),
         },
@@ -2016,13 +2069,13 @@ impl DaemonState {
 // ---------------------------------------------------------------------------
 
 impl DaemonState {
-    /// The member a caller's agent id stands for: the member its agent runs
-    /// for, or the member with that id. `None`: the user.
+    /// The member (or chat) a caller's agent id stands for: the one its
+    /// agent runs for, or the one with that id. `None`: the user.
     fn sender_member(&self, agent_id: Option<&str>) -> Option<String> {
         let id = agent_id?;
         match self.agents.get(id) {
-            Some(agent) => agent.member().map(str::to_string),
-            None => self.ledger.member(id).map(|(_, m)| m.id),
+            Some(agent) => agent.owner().map(str::to_string),
+            None => self.ledger.owner(id).map(|o| o.id().to_string()),
         }
     }
 
@@ -2127,16 +2180,19 @@ fn send_message(
         ));
     }
     let sender = state.sender_member(from);
-    let (task, recipient) = state
+    let recipient = state
         .ledger
-        .resolve_from(sender.as_deref(), to)
+        .resolve_recipient(sender.as_deref(), to)
         .map_err(|e| format!("{e:#}"))?;
-    if state.dropping.contains(&task.name) {
-        return Err(format!("task '{}' is being dropped", task.name));
+    if let Owner::Member(task, _) = &recipient {
+        if state.dropping.contains(&task.name) {
+            return Err(format!("task '{}' is being dropped", task.name));
+        }
     }
+    let recipient = recipient.id().to_string();
     let (hop, reply_to) = match sender.as_deref() {
         None => (0, None),
-        Some(sender) if sender == recipient.id => {
+        Some(sender) if sender == recipient => {
             return Err("cannot send a message to yourself".into())
         }
         Some(sender) => {
@@ -2144,7 +2200,7 @@ fn send_message(
             if hop > inbox::MAX_HOPS {
                 let label = state
                     .ledger
-                    .member_label(sender)
+                    .message_label(sender)
                     .unwrap_or_else(|| sender.to_string());
                 return Err(format!(
                     "loop guard: this would be message {hop} of an exchange between agents (at most {}); it starts over once the user prompts '{label}'",
@@ -2153,9 +2209,7 @@ fn send_message(
             }
             state.inbox.check_rate(sender)?;
             let since = crate::ledger::now().saturating_sub(inbox::REPLY_WINDOW_SECS);
-            let answered = state
-                .ledger
-                .unanswered_message(&recipient.id, sender, since);
+            let answered = state.ledger.unanswered_message(&recipient, sender, since);
             (hop, answered)
         }
     };
@@ -2163,7 +2217,7 @@ fn send_message(
         .ledger
         .send_message(
             sender.as_deref(),
-            &recipient.id,
+            &recipient,
             text,
             hop,
             reply_to.as_deref(),
@@ -2186,7 +2240,7 @@ fn send_message(
             return Ok(state.ledger.message(&message.id).unwrap_or(message));
         }
     }
-    state.hand_over_messages(&recipient.id);
+    state.hand_over_messages(&recipient);
     Ok(message)
 }
 
@@ -2228,10 +2282,10 @@ fn reply_response(outcome: ReplyOutcome) -> Response {
     }
 }
 
-/// What the hooks of a member's agent tell about its messages: the prompt
-/// that shows them to the model (delivered), a prompt the user typed (its
-/// agent-to-agent exchanges start over), the end of a turn (the reply to
-/// the messages it got).
+/// What the hooks of a member's (or chat's) agent tell about its messages:
+/// the prompt that shows them to the model (delivered), a prompt the user
+/// typed (its agent-to-agent exchanges start over; a chat's last turn), the
+/// end of a turn (the reply to the messages it got).
 async fn handle_inbox_hook(
     state: &Arc<Mutex<DaemonState>>,
     agent_id: &str,
@@ -2242,7 +2296,7 @@ async fn handle_inbox_hook(
     let Some(member) = state
         .agents
         .get(agent_id)
-        .and_then(Agent::member)
+        .and_then(Agent::owner)
         .map(str::to_string)
     else {
         return;
@@ -2264,6 +2318,9 @@ async fn handle_inbox_hook(
                 }
             } else if inbox::is_user_prompt(prompt) {
                 state.inbox.reset_chain(&member);
+                if state.ledger.is_chat(&member) {
+                    state.chat_turn(&member);
+                }
             }
         }
         "Stop" => {
@@ -2286,7 +2343,7 @@ async fn handle_inbox_hook(
             .to_string();
             let label = state
                 .ledger
-                .member_label(&member)
+                .message_label(&member)
                 .unwrap_or_else(|| member.clone());
             for id in state.inbox.turn_ended(&member) {
                 state.inbox.replied(
@@ -2315,10 +2372,13 @@ async fn handle_wait_inbox(
         match state
             .agents
             .get(agent_id)
-            .map(|a| a.member().map(str::to_string))
+            .map(|a| a.owner().map(str::to_string))
         {
             None => Err(format!("agent '{}' not found", agent_id)),
-            Some(None) => Err(format!("agent '{}' runs for no task member", agent_id)),
+            Some(None) => Err(format!(
+                "agent '{}' runs for no task member or chat",
+                agent_id
+            )),
             Some(Some(member)) => {
                 let (token, rx) = state.inbox.register_waiter(agent_id);
                 state.hand_over_messages(&member);
@@ -2404,7 +2464,7 @@ impl DaemonState {
     fn outcome(&self, member: &str) -> Option<MemberOutcome> {
         let (task, info) = self.ledger.member(member)?;
         let label = task.member_label(&info);
-        let last_run = self.ledger.member_runs(member).pop();
+        let last_run = self.ledger.runs_of(member).pop();
         let outcome = match self.agents.get(member) {
             Some(agent) => {
                 let running = agent.info(member);
@@ -2687,7 +2747,7 @@ impl DaemonState {
         let ids: Vec<&String> = self
             .agents
             .iter()
-            .filter(|(_, a)| a.member().is_some_and(|m| members.iter().any(|id| id == m)))
+            .filter(|(_, a)| a.owner().is_some_and(|m| members.iter().any(|id| id == m)))
             .map(|(id, _)| id)
             .collect();
         for id in ids {
@@ -2708,7 +2768,7 @@ impl DaemonState {
             let hooked = self
                 .agents
                 .values()
-                .any(|a| a.member() == Some(member.as_str()) && a.inbox_hook());
+                .any(|a| a.owner() == Some(member.as_str()) && a.inbox_hook());
             if !hooked {
                 continue;
             }
@@ -2732,7 +2792,7 @@ impl DaemonState {
         event: &str,
         payload: Option<&serde_json::Value>,
     ) -> Option<String> {
-        let member = self.agents.get(agent_id)?.member()?.to_string();
+        let member = self.agents.get(agent_id)?.owner()?.to_string();
         let subagent = payload
             .and_then(|p| p.get("agent_id"))
             .and_then(serde_json::Value::as_str)
@@ -3076,4 +3136,140 @@ async fn handle_answer(
                 .into(),
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chats: Claude sessions on a repository's main checkout (see the ledger).
+// Their agents start with `RunAgent` and are handled as members' are, under
+// the chat id: hooks, screen, typing, messages, answers.
+// ---------------------------------------------------------------------------
+
+impl DaemonState {
+    /// Record that the user prompted the agent of chat `id`, telling clients.
+    fn chat_turn(&mut self, id: &str) {
+        match self.ledger.chat_turn(id) {
+            Ok(()) => {
+                if let Some(chat) = self.ledger.chat(id) {
+                    self.broadcast(Event::ChatUpdated { chat });
+                }
+            }
+            Err(e) => error!(chat = %id, "failed to record a turn: {e:#}"),
+        }
+    }
+}
+
+async fn handle_create_chat(
+    state: &Arc<Mutex<DaemonState>>,
+    dir: PathBuf,
+    name: Option<String>,
+    session: Option<String>,
+) -> Response {
+    // Git runs before the lock.
+    let checked = run_git(move || {
+        if !dir.is_absolute() {
+            anyhow::bail!("{}: not an absolute path", dir.display());
+        }
+        worktrees::check_main_checkout(&dir)?;
+        Ok(worktree::resolve_path(&dir))
+    })
+    .await;
+    let dir = match checked {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    let mut state = state.lock().await;
+    match state
+        .ledger
+        .create_chat(&dir, name.as_deref(), session.as_deref())
+    {
+        Ok(chat) => {
+            info!(chat = %chat.id, dir = %chat.dir.display(), session = ?chat.session, "chat created");
+            state.broadcast(Event::ChatCreated { chat: chat.clone() });
+            Response::Chat {
+                chat: Box::new(chat),
+                runs: Vec::new(),
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
+}
+
+/// Apply `change` (which says whether anything changed) to the chat
+/// `target` names; reply the chat, and tell clients when it changed.
+async fn handle_change_chat(
+    state: &Arc<Mutex<DaemonState>>,
+    target: &str,
+    change: impl FnOnce(&mut Ledger, &str) -> Result<bool>,
+) -> Response {
+    let mut state = state.lock().await;
+    let id = match state.ledger.resolve_chat(target) {
+        Ok(chat) => chat.id,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    match change(&mut state.ledger, &id) {
+        Ok(changed) => {
+            let chat = state.ledger.chat(&id).expect("the chat is still open");
+            if changed {
+                info!(chat = %id, name = ?chat.name, keep = chat.keep, "chat changed");
+                state.broadcast(Event::ChatUpdated { chat: chat.clone() });
+            }
+            Response::Chat {
+                runs: state.ledger.runs_of(&id),
+                chat: Box::new(chat),
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
+}
+
+/// Close a chat: stop its agent, forget the chat. Nothing on disk is
+/// touched (its directory, branch, Claude's transcript). Replies the chat
+/// as it was, once its agent is gone.
+async fn handle_close_chat(state: &Arc<Mutex<DaemonState>>, target: &str) -> Response {
+    let (agent, response) = {
+        let mut state = state.lock().await;
+        let id = match state.ledger.resolve_chat(target) {
+            Ok(chat) => chat.id,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("{e:#}"),
+                }
+            }
+        };
+        // The end of its run is recorded with it.
+        let agent = state.take_member_agent(&id);
+        let chat = state.ledger.chat(&id).expect("the chat is still open");
+        let runs = state.ledger.runs_of(&id);
+        let response = match state.ledger.close_chat(&id) {
+            Ok(()) => {
+                info!(chat = %id, "chat closed");
+                state.broadcast(Event::ChatClosed { id });
+                Response::Chat {
+                    chat: Box::new(chat),
+                    runs,
+                }
+            }
+            Err(e) => Response::Error {
+                message: format!("its agent is stopped, but the chat is kept: {e:#}"),
+            },
+        };
+        (agent, response)
+    };
+    if let Some(agent) = agent {
+        // Gone before the reply: the session can be taken up again at once.
+        let _ = tokio::task::spawn_blocking(move || agent.kill_and_drop()).await;
+    }
+    response
 }

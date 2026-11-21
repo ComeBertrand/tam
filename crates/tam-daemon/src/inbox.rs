@@ -1,5 +1,6 @@
-//! Messages between task members (and from the user): what the daemon keeps
-//! in memory to deliver them. Messages themselves live in the ledger.
+//! Messages between task members and chats (and from the user): what the
+//! daemon keeps in memory to deliver them, by recipient id (a member's or a
+//! chat's: its agent's). Messages themselves live in the ledger.
 //!
 //! Delivery:
 //! - The agent's inbox hook runs `tam inbox-wait` in the

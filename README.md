@@ -445,7 +445,7 @@ The notify command runs with `sh -c` on state changes, except while you are atta
 
 | Placeholder | Value |
 |---|---|
-| `{task}`, `{id}` | Task name, agent id (the member id) |
+| `{task}`, `{id}` | Task name, agent id (the member id); for a chat, its name (else its id) and its id |
 | `{state}` (alias `{status}`), `{old_state}` | New and previous agent state |
 | `{kind}` | `question`, `permission`, `done` or `error` |
 | `{message}` | The question or permission asked, the agent's last response, or the error |

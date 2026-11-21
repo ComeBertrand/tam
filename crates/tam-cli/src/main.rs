@@ -24,6 +24,7 @@ macro_rules! eprintln {
 }
 
 mod brief;
+mod chat;
 mod cli;
 mod client;
 mod config;
@@ -120,7 +121,32 @@ async fn run(cli: Cli) -> Result<()> {
             json,
         } => {
             let mut client = client::Client::connect().await?;
-            let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
+            let (task, member) = match resolve_target(&mut client, name.as_deref()).await? {
+                client::Target::Member(task, member) => (task, member),
+                client::Target::Chat(chat, _) => {
+                    // A chat is its session: another one is another chat.
+                    if new_session || session.is_some() {
+                        return Err(script::error(
+                            script::ErrorKind::Failed,
+                            format!(
+                                "chat {} resumes its own session: --new-session and --session \
+                                 are for tasks (tam chat REPO --session ID makes another chat)",
+                                chat::describe(&chat)
+                            ),
+                        ));
+                    }
+                    let start = Start {
+                        session: SessionChoice::Current,
+                        prompt: prompt_option.or(prompt),
+                        args,
+                    };
+                    return if script::attaching(detach || json) {
+                        chat::run_and_attach(&mut client, &chat, start).await
+                    } else {
+                        chat::start_detached(&mut client, &chat, start, json).await
+                    };
+                }
+            };
 
             // The daemon resumes the member's current session by default.
             let session = match session {
@@ -151,10 +177,12 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let (label, task, members) = match task {
                 Some(task) => (task.name.clone(), task.clone(), task.members),
-                None => {
-                    let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
-                    (task.member_label(&member), task, vec![member])
-                }
+                None => match resolve_target(&mut client, name.as_deref()).await? {
+                    client::Target::Member(task, member) => {
+                        (task.member_label(&member), task, vec![member])
+                    }
+                    client::Target::Chat(chat, _) => return stop_chat(&mut client, &chat).await,
+                },
             };
 
             let running = client.list_agents().await?;
@@ -186,17 +214,21 @@ async fn run(cli: Cli) -> Result<()> {
 
         Commands::Attach { name } => {
             let mut client = client::Client::connect().await?;
-            let (task, member, _) = resolve_member(&mut client, name.as_deref()).await?;
-            let label = task.member_label(&member);
-            if !client
-                .list_agents()
-                .await?
-                .iter()
-                .any(|a| a.id == member.id)
-            {
-                anyhow::bail!("no agent running in task '{}'", label);
+            let (id, label, what) = match resolve_target(&mut client, name.as_deref()).await? {
+                client::Target::Member(task, member) => {
+                    let label = task.member_label(&member);
+                    let what = format!("task '{label}'");
+                    (member.id, label, what)
+                }
+                client::Target::Chat(chat, _) => {
+                    let what = format!("chat {}", chat::describe(&chat));
+                    (chat.id.clone(), chat.label(), what)
+                }
+            };
+            if !client.list_agents().await?.iter().any(|a| a.id == id) {
+                anyhow::bail!("no agent running in {what}");
             }
-            client.attach(&member.id, &label).await?;
+            client.attach(&id, &label).await?;
         }
 
         Commands::Drop {
@@ -208,7 +240,12 @@ async fn run(cli: Cli) -> Result<()> {
             // A task, or one member of a task (TASK/MEMBER).
             let what = match client.get_task(&name).await {
                 Ok(_) => format!("Task '{name}'"),
-                Err(_) => format!("'{name}'"),
+                Err(_) => {
+                    if let Some(e) = chat::not_a_task(&mut client, &name).await {
+                        return Err(e);
+                    }
+                    format!("'{name}'")
+                }
             };
             let mut outcome = client.drop_task(&name, force, branch).await?;
             if let client::DropOutcome::Refused { worktrees } = &outcome {
@@ -316,9 +353,10 @@ async fn run(cli: Cli) -> Result<()> {
             let mut client = client::Client::connect().await?;
             // Fresh worktree health from the daemon.
             let infos = client.reconcile().await?;
+            let chats = client.list_chats().await?;
             let agents = client.list_agents().await.unwrap_or_default();
             if json {
-                return script::ps(&mut client, infos, &agents).await;
+                return script::ps(&mut client, infos, chats, &agents).await;
             }
 
             let mut tasks: Vec<task::Task> = infos
@@ -328,6 +366,19 @@ async fn run(cli: Cli) -> Result<()> {
 
             tasks.sort_by_key(|t| (t.status().sort_priority(), t.name.clone()));
 
+            // Chats first, most urgent first, else in creation order.
+            let mut chats: Vec<chat::Chat> = chats
+                .into_iter()
+                .map(|info| chat::Chat::new(info, &agents))
+                .collect();
+            chats.sort_by_key(|c| c.status().sort_priority());
+            let chat_lines = ps::chat_lines(&chats);
+            if !chat_lines.is_empty() {
+                for line in chat_lines {
+                    println!("{line}");
+                }
+                println!();
+            }
             for line in ps::lines(&tasks) {
                 println!("{line}");
             }
@@ -493,6 +544,29 @@ async fn run(cli: Cli) -> Result<()> {
         } => brief::brief(name, set, local, json, from).await?,
 
         Commands::Merge { into, from, json } => moves::merge(&into, &from, json).await?,
+        Commands::Chat {
+            repo,
+            name,
+            session,
+            keep,
+            prompt,
+            detach,
+            json,
+        } => {
+            chat::start(chat::NewChat {
+                repo,
+                name,
+                session,
+                keep,
+                prompt,
+                detach,
+                json,
+            })
+            .await?
+        }
+        Commands::Close { chat, yes, json } => chat::close(&chat, yes, json).await?,
+        Commands::Rename { chat, name, json } => chat::rename(&chat, name.as_deref(), json).await?,
+        Commands::Keep { chat, off, json } => chat::keep(&chat, off, json).await?,
         Commands::Split { member, name, json } => {
             moves::split(&member, name.as_deref(), json).await?
         }
@@ -555,6 +629,40 @@ async fn resolve_member(
                     _ => script::error(script::ErrorKind::NotFound, "no task in current directory"),
                 })
         }
+    }
+}
+
+/// Find the member or chat a command acts on: named (what `resolve_member`
+/// takes, then a chat's id or name), else the member whose worktree contains
+/// the current directory (never a chat).
+async fn resolve_target(client: &mut client::Client, name: Option<&str>) -> Result<client::Target> {
+    match name {
+        Some(name) => client.resolve_target(name).await,
+        None => {
+            let (task, member, _) = resolve_member(client, None).await?;
+            Ok(client::Target::Member(task, member))
+        }
+    }
+}
+
+/// `tam stop CHAT`: stop the chat's agent; the chat stays.
+async fn stop_chat(client: &mut client::Client, chat: &tam_proto::ChatInfo) -> Result<()> {
+    if !client.list_agents().await?.iter().any(|a| a.id == chat.id) {
+        eprintln!("Error: no agent running in chat {}", chat::describe(chat));
+        std::process::exit(1);
+    }
+    match client
+        .send(tam_proto::Request::Kill {
+            id: chat.id.clone(),
+        })
+        .await?
+    {
+        tam_proto::Response::Ok => {
+            println!("Stopped the agent of chat {}", chat::describe(chat));
+            Ok(())
+        }
+        tam_proto::Response::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response to Kill: {other:?}"),
     }
 }
 

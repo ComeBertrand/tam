@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use tam_proto::{
-    AgentInfo, MemberInfo, MemberOutcome, MemberState, NewMember, Request, Response, RunInfo,
-    ScreenInfo, ServerMessage, SessionChoice, TaskInfo, WorktreeReport,
+    AgentInfo, ChatInfo, MemberInfo, MemberOutcome, MemberState, NewMember, Request, Response,
+    RunInfo, ScreenInfo, ServerMessage, SessionChoice, TaskInfo, WorktreeReport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
@@ -607,12 +607,137 @@ fn moved(request: &str, response: Response) -> Result<Moved> {
     }
 }
 
+/// What a name typed at the command line names (`Client::resolve_target`).
+pub enum Target {
+    /// A task member, with its task.
+    Member(TaskInfo, MemberInfo),
+    /// A chat, with its runs.
+    Chat(ChatInfo, Vec<RunInfo>),
+}
+
+/// Chats (#66): finding them by name, and their requests.
+impl Client {
+    /// Find the task member or chat `target` names, as `tam msg` finds its
+    /// recipient: a task name, `<task>/<member>`, a member id, from an agent
+    /// tam started a peer's short name; then a chat's id, then its name.
+    pub async fn resolve_target(&mut self, target: &str) -> Result<Target> {
+        let request = Request::ResolveTarget {
+            target: target.into(),
+            from: std::env::var("TAM_AGENT_ID")
+                .ok()
+                .filter(|id| !id.is_empty()),
+        };
+        match self.send(request).await? {
+            Response::Member { task, member, .. } => Ok(Target::Member(task, *member)),
+            Response::Chat { chat, runs } => Ok(Target::Chat(*chat, runs)),
+            other => Err(not_found("ResolveTarget", other)),
+        }
+    }
+
+    /// All chats, in creation order.
+    pub async fn list_chats(&mut self) -> Result<Vec<ChatInfo>> {
+        match self.send(Request::ListChats).await? {
+            Response::Chats { chats } => Ok(chats),
+            other => Err(unexpected("ListChats", other)),
+        }
+    }
+
+    /// A chat (by id or name) and its runs. Errors if there is none.
+    pub async fn get_chat(&mut self, chat: &str) -> Result<(ChatInfo, Vec<RunInfo>)> {
+        let request = Request::GetChat { chat: chat.into() };
+        chat_reply("GetChat", self.send(request).await?).map_err(|e| match e {
+            ChatError::Refused(message) => script::error(ErrorKind::NotFound, message),
+            ChatError::Other(e) => e,
+        })
+    }
+
+    /// Make a chat on the repository whose main checkout is `dir`.
+    pub async fn create_chat(
+        &mut self,
+        dir: &Path,
+        name: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<ChatInfo> {
+        let request = Request::CreateChat {
+            dir: dir.to_path_buf(),
+            name: name.map(str::to_string),
+            session: session.map(str::to_string),
+        };
+        Ok(chat_reply("CreateChat", self.send(request).await?)?.0)
+    }
+
+    /// Name a chat (`None`: unnamed).
+    pub async fn rename_chat(&mut self, chat: &str, name: Option<&str>) -> Result<ChatInfo> {
+        let request = Request::RenameChat {
+            chat: chat.into(),
+            name: name.map(str::to_string),
+        };
+        Ok(chat_reply("RenameChat", self.send(request).await?)?.0)
+    }
+
+    /// Keep a chat, or stop keeping it.
+    pub async fn keep_chat(&mut self, chat: &str, keep: bool) -> Result<ChatInfo> {
+        let request = Request::KeepChat {
+            chat: chat.into(),
+            keep,
+        };
+        Ok(chat_reply("KeepChat", self.send(request).await?)?.0)
+    }
+
+    /// Close a chat (its agent stopped and waited for). Returns it as it
+    /// was, its session to make it again.
+    pub async fn close_chat(&mut self, chat: &str) -> Result<(ChatInfo, Vec<RunInfo>)> {
+        let request = Request::CloseChat { chat: chat.into() };
+        Ok(chat_reply("CloseChat", self.send(request).await?)?)
+    }
+}
+
+/// Why a chat request failed: the daemon refused it, or something else.
+enum ChatError {
+    Refused(String),
+    Other(anyhow::Error),
+}
+
+impl From<ChatError> for anyhow::Error {
+    fn from(e: ChatError) -> Self {
+        match e {
+            ChatError::Refused(message) => anyhow::anyhow!("{message}"),
+            ChatError::Other(e) => e,
+        }
+    }
+}
+
+fn chat_reply(request: &str, response: Response) -> Result<(ChatInfo, Vec<RunInfo>), ChatError> {
+    match response {
+        Response::Chat { chat, runs } => Ok((*chat, runs)),
+        Response::Error { message } if !is_unknown_request(&message) => {
+            Err(ChatError::Refused(message))
+        }
+        other => Err(ChatError::Other(unexpected(request, other))),
+    }
+}
+
+/// A daemon error as "not found" (exit status 3), unless the daemon is too
+/// old to know the request.
+fn not_found(request: &str, response: Response) -> anyhow::Error {
+    match response {
+        Response::Error { message } if !is_unknown_request(&message) => {
+            script::error(ErrorKind::NotFound, message)
+        }
+        other => unexpected(request, other),
+    }
+}
+
+fn is_unknown_request(message: &str) -> bool {
+    message.starts_with("invalid request: unknown variant")
+}
+
 /// Turn a daemon error (or an unexpected reply) into an error.
 fn unexpected(request: &str, response: Response) -> anyhow::Error {
     match response {
         // A request newer than the daemon (the protocol is unreleased: no
         // version bump for new requests).
-        Response::Error { message } if message.starts_with("invalid request: unknown variant") => {
+        Response::Error { message } if is_unknown_request(&message) => {
             anyhow::anyhow!(
                 "{message}\nThe running tam daemon is older than this tam: restart it \
                  (tam shutdown, which stops its agents)"

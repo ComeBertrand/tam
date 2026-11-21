@@ -599,7 +599,7 @@ impl Ledger {
         if let Some(found) = self.member(target) {
             return Ok(found);
         }
-        if self.state.chats.contains_key(target) {
+        if self.resolve_chat(target).is_ok() {
             bail!("'{}' is a chat, not a task member", target);
         }
         bail!("task '{}' not found", target)
@@ -1580,10 +1580,18 @@ impl Ledger {
             || target
                 .rsplit_once('/')
                 .is_some_and(|(task, _)| self.task(task).is_some());
+        // From an agent in a task, the error names that task's members.
+        let in_task = caller.is_some_and(|c| self.member(c).is_some());
         match found {
             Ok((task, member)) => Ok(Owner::Member(task, member)),
             Err(e) if names_task => Err(e),
-            Err(e) => self.resolve_chat(target).map(Owner::Chat).map_err(|_| e),
+            Err(e) => self.resolve_chat(target).map(Owner::Chat).map_err(|_| {
+                if in_task || self.member(target).is_some() {
+                    e
+                } else {
+                    anyhow::anyhow!("task or chat '{}' not found", target)
+                }
+            }),
         }
     }
 
@@ -1721,6 +1729,19 @@ impl Ledger {
         }
         if is_chat_id(name) {
             bail!("'{}' reads as a chat id: give the chat another name", name);
+        }
+        // A task's name (or `<task>/…`) names the task to every command.
+        let task = match name.rsplit_once('/') {
+            _ if self.task(name).is_some() => Some(name),
+            Some((task, _)) if self.task(task).is_some() => Some(task),
+            _ => None,
+        };
+        if let Some(task) = task {
+            bail!(
+                "'{}' would name task '{}': give the chat another name",
+                name,
+                task
+            );
         }
         if let Some(other) = self.chat_named(name).filter(|o| Some(o.as_str()) != chat) {
             bail!("chat {} is named '{}' already", other, name);
@@ -4027,6 +4048,13 @@ mod tests {
     fn a_chat_named_like_a_task_never_takes_its_name() {
         let tmp = TempDir::new().unwrap();
         let mut ledger = open(&tmp);
+        // Named before a task took the name: the task comes after.
+        let feat = ledger
+            .create_chat(Path::new("/src/api"), Some("feat"), None)
+            .unwrap();
+        ledger
+            .create_chat(Path::new("/src/api"), Some("feat/api"), None)
+            .unwrap();
         let task = ledger
             .create_task(
                 "feat",
@@ -4036,17 +4064,41 @@ mod tests {
                 ],
             )
             .unwrap();
-        ledger
-            .create_chat(Path::new("/src/api"), Some("feat"), None)
-            .unwrap();
-        ledger
-            .create_chat(Path::new("/src/api"), Some("feat/api"), None)
-            .unwrap();
         // The task has several members: an error, as before chats.
         let err = ledger.resolve_recipient(None, "feat").unwrap_err();
         assert!(err.to_string().contains("several members"), "{err}");
         let found = ledger.resolve_recipient(None, "feat/api").unwrap();
         assert_eq!(found.id(), task.members[0].id);
+        // The chat is still reached by its id.
+        assert_eq!(
+            ledger.resolve_recipient(None, &feat.id).unwrap().id(),
+            feat.id
+        );
+
+        // Once the task is there, no chat takes its name.
+        for name in ["feat", "feat/web", "feat/anything"] {
+            let err = ledger
+                .create_chat(Path::new("/src/api"), Some(name), None)
+                .unwrap_err();
+            assert!(err.to_string().contains("would name task 'feat'"), "{err}");
+            let err = ledger.rename_chat(&feat.id, Some(name)).unwrap_err();
+            assert!(err.to_string().contains("would name task 'feat'"), "{err}");
+        }
+        let other = ledger
+            .create_chat(Path::new("/src/api"), Some("feature"), None)
+            .unwrap();
+        // A chat's name is no task member's either.
+        let err = ledger.resolve("feature").unwrap_err();
+        assert!(err.to_string().contains("is a chat"), "{err}");
+        assert!(ledger.rename_chat(&other.id, Some("nope/feat")).unwrap());
+        // Named neither way: both kinds said.
+        let err = ledger.resolve_recipient(None, "nope").unwrap_err();
+        assert_eq!(err.to_string(), "task or chat 'nope' not found");
+        assert!(ledger
+            .resolve("nope/feat")
+            .unwrap_err()
+            .to_string()
+            .contains("is a chat"));
     }
 
     #[test]

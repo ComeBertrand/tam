@@ -1,8 +1,9 @@
-//! `tam ps`'s text: a row per task, and below a task with several members a
-//! row per member (its status, worktree and context), as in the
-//! dashboard's list; then what is wrong with worktrees. `tam ps --json` is
-//! `script::ps`.
+//! `tam ps`'s text: the chats first, a row each, with their ids; then a row
+//! per task, and below a task with several members a row per member (its
+//! status, worktree and context), as in the dashboard's list; then what is
+//! wrong with worktrees. `tam ps --json` is `script::ps`.
 
+use crate::chat::Chat;
 use crate::health;
 use crate::task::{Member, Task};
 use crate::{format_age, shorten_home};
@@ -49,26 +50,7 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
         }
     }
 
-    let width = |c: usize| rows.iter().map(|r| r[c].chars().count()).max();
-    let widths: Vec<usize> = (0..HEADER.len()).map(|c| width(c).unwrap_or(0)).collect();
-    let mut out: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            let cells: Vec<String> = row
-                .iter()
-                .zip(&widths)
-                .zip(RIGHT)
-                .map(|((cell, &w), right)| {
-                    if right {
-                        format!("{cell:>w$}")
-                    } else {
-                        format!("{cell:<w$}")
-                    }
-                })
-                .collect();
-            cells.join(SPACING).trim_end().to_string()
-        })
-        .collect();
+    let mut out = table(&rows, RIGHT);
 
     // What is wrong with the worktrees, and what to do about it.
     let notes: Vec<String> = tasks
@@ -86,15 +68,96 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
     out
 }
 
+/// The columns of the chats' table: a chat is shown by its label (its
+/// name, else Claude's title, else its id) and named by its id; CLOSES is
+/// when autoclean closes it.
+const CHAT_HEADER: [&str; 8] = [
+    "STATUS", "CHAT", "ID", "RUNS", "LAST", "CLOSES", "DIR", "CTX",
+];
+const CHAT_RIGHT: [bool; 8] = [false, false, false, true, true, true, false, true];
+
+/// The chats' table, in the order given; nothing without chats.
+pub fn chat_lines(chats: &[Chat]) -> Vec<String> {
+    if chats.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![CHAT_HEADER.map(String::from)];
+    for chat in chats {
+        let info = &chat.info;
+        rows.push([
+            chat.status().indicator().into(),
+            info.label(),
+            info.id.clone(),
+            info.run_count.to_string(),
+            format_age(Some(chat.last())),
+            closes(&chat.info, crate::task::now()),
+            shorten_home(&info.dir.display().to_string()),
+            context(chat.agent.as_ref()),
+        ]);
+    }
+    table(&rows, CHAT_RIGHT)
+}
+
+/// When autoclean closes the chat, from `now`: within how long, rounded
+/// up (`in 3d` from a turn just now), `due` once that time is past (it
+/// closes at the prompt with nobody attached), `kept`, or `-` when
+/// autoclean is off.
+fn closes(chat: &tam_proto::ChatInfo, now: u64) -> String {
+    match chat.closes_at {
+        _ if chat.keep => "kept".into(),
+        None => "-".into(),
+        Some(at) if at <= now => "due".into(),
+        Some(at) => {
+            let left = at - now;
+            let minutes = left.div_ceil(60);
+            let hours = left.div_ceil(3600);
+            if minutes < 60 {
+                format!("in {minutes}m")
+            } else if hours < 24 {
+                format!("in {hours}h")
+            } else {
+                format!("in {}d", left.div_ceil(86400))
+            }
+        }
+    }
+}
+
+/// Rows as lines, each column as wide as its widest cell.
+fn table<const N: usize>(rows: &[[String; N]], right: [bool; N]) -> Vec<String> {
+    let width = |c: usize| rows.iter().map(|r| r[c].chars().count()).max();
+    let widths: Vec<usize> = (0..N).map(|c| width(c).unwrap_or(0)).collect();
+    rows.iter()
+        .map(|row| {
+            let cells: Vec<String> = row
+                .iter()
+                .zip(&widths)
+                .zip(right)
+                .map(|((cell, &w), right)| {
+                    if right {
+                        format!("{cell:>w$}")
+                    } else {
+                        format!("{cell:<w$}")
+                    }
+                })
+                .collect();
+            cells.join(SPACING).trim_end().to_string()
+        })
+        .collect()
+}
+
+/// An agent's context use, `-` without one.
+fn context(agent: Option<&tam_proto::AgentInfo>) -> String {
+    agent
+        .and_then(|a| a.context_percent)
+        .map_or_else(|| "-".into(), |p| format!("{p}%"))
+}
+
 /// A member's status, worktree and context.
 fn member_cells(task: &Task, member: &Member) -> [String; 3] {
-    let agent = member.agent_info.as_ref();
     [
         task.member_status(member).indicator().into(),
         shorten_home(&member.info.dir.display().to_string()),
-        agent
-            .and_then(|a| a.context_percent)
-            .map_or_else(|| "-".into(), |p| format!("{p}%")),
+        context(member.agent_info.as_ref()),
     ]
 }
 
@@ -231,5 +294,89 @@ mod tests {
     #[test]
     fn no_tasks() {
         assert_eq!(lines(&[]), ["No tasks."]);
+        assert!(chat_lines(&[]).is_empty());
+    }
+
+    fn chat(id: &str, name: Option<&str>, agents: &[AgentInfo]) -> Chat {
+        let info = tam_proto::ChatInfo {
+            id: id.into(),
+            name: name.map(str::to_string),
+            repo: "api".into(),
+            dir: "/src/api".into(),
+            created_at: crate::task::now() - 2 * 86400,
+            keep: false,
+            session: None,
+            last_turn_at: None,
+            run_count: 1,
+            title: None,
+            last_prompt: None,
+            closes_at: None,
+        };
+        Chat::new(info, agents)
+    }
+
+    #[test]
+    fn closes_says_when_autoclean_closes_a_chat() {
+        let mut info = chat("c-0000abcd", None, &[]).info;
+        let now = 1_000_000;
+        for (at, shown) in [
+            (None, "-"),
+            (Some(now - 1), "due"),
+            (Some(now), "due"),
+            (Some(now + 30), "in 1m"),
+            (Some(now + 600), "in 10m"),
+            (Some(now + 3599), "in 1h"),
+            (Some(now + 5 * 3600), "in 5h"),
+            (Some(now + 86399), "in 1d"),
+            (Some(now + 3 * 86400), "in 3d"),
+            (Some(now + 3 * 86400 - 1), "in 3d"),
+            (Some(now + 2 * 86400 + 1), "in 3d"),
+        ] {
+            info.closes_at = at;
+            assert_eq!(closes(&info, now), shown, "{at:?}");
+        }
+        info.keep = true;
+        assert_eq!(closes(&info, now), "kept");
+    }
+
+    #[test]
+    fn a_row_per_chat_shown_by_its_label_named_by_its_id() {
+        let agents = [agent("c-0000abcd", AgentState::Ready, Some(12))];
+        let now = crate::task::now();
+        let mut named = chat("c-0000abcd", Some("login-bug"), &agents);
+        named.info.last_turn_at = Some(now - 300);
+        named.info.run_count = 2;
+        named.info.closes_at = Some(now + 2 * 86400 + 3600);
+        let mut unnamed = chat("c-1111beef", None, &agents);
+        unnamed.info.keep = true;
+        let mut titled = chat("c-2222cafe", None, &agents);
+        titled.info.title = Some("Fix the login".into());
+        let lines = chat_lines(&[named, unnamed, titled]);
+        let shown = lines.join("\n");
+        let [header, named, unnamed, titled] = &lines[..] else {
+            panic!("{shown}")
+        };
+        // Unnamed, Claude's title shows; its id still names it.
+        assert!(titled.contains("Fix the login  c-2222cafe"), "{shown}");
+        assert!(header.starts_with("STATUS   CHAT"), "{shown}");
+        assert!(named.starts_with("◆ ready  login-bug"), "{shown}");
+        assert!(
+            named.ends_with("c-0000abcd     2    5m   in 3d  /src/api  12%"),
+            "{shown}"
+        );
+        // No agent: idle. Never prompted: its age. Kept: never closed.
+        assert!(unnamed.starts_with("○ idle   c-1111beef "), "{shown}");
+        assert_eq!(column(header, "ID"), column(titled, "c-2222cafe"));
+        assert!(
+            unnamed.ends_with("1    2d    kept  /src/api    -"),
+            "{shown}"
+        );
+        // Autoclean off.
+        assert!(
+            titled.ends_with("1    2d       -  /src/api    -"),
+            "{shown}"
+        );
+        assert_eq!(column(header, "ID"), column(named, "c-0000abcd"));
+        assert_eq!(column(header, "DIR"), column(unnamed, "/src/api"));
     }
 }

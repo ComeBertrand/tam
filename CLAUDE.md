@@ -53,7 +53,7 @@ adopt). `tam-cli` depends on all three.
   borrowed ones are dropped, the old file is kept as `ledger.jsonl.pre-members`
   (never overwritten: `.pre-members.1`, …).
   Clients use task requests (CreateTask, ListTasks, GetTask, ResolveMember,
-  DropTask) and get TaskCreated/TaskUpdated/TaskDropped events after
+  ResolveTarget, DropTask) and get TaskCreated/TaskUpdated/TaskDropped events after
   `Subscribe`; `tam-cli` never touches the ledger file.
 - **Git acts where tam points it** — every git tam runs is
   `tam_worktree::git::command()` (the daemon's through `tam-worktree`,
@@ -555,10 +555,10 @@ adopt). `tam-cli` depends on all three.
   reply hints must resolve back); `ListMessages` takes a chat. A chat's
   agent is a caller like any shell: `sender_member` is the chat,
   `ResolveMember { from: <chat> }` resolves as from no task. `resolve` says
-  a chat id is no task member, and the cwd never names a chat (`member_at`
-  stays members only): `tam run`/`attach` with no name in a main checkout
-  find no task, `tam peers` says "not in a task". Notify: `{task}` is a chat's
-  label, `{id}` its id; custom commands (#67) are to give the same, `{dir}`
+  a chat (id or name) is no task member, and the cwd never names a chat
+  (`member_at` stays members only): `tam run`/`attach` with no name in a
+  main checkout find no task, `tam peers` says "not in a task". Notify:
+  `{task}` is a chat's label, `{id}` its id; custom commands (#67) are to give the same, `{dir}`
   being the main checkout. Titles and history (#64): the daemon's
   `sessions.rs` is the only reader of Claude's session files
   (`<claude dir>/projects/<project>/<session>.jsonl`; `project_name` is Claude's
@@ -582,6 +582,41 @@ adopt). `tam-cli` depends on all three.
   `chat_transcript`, never guesses it (several sessions share its
   directory). Known limit: under the daemon's `HOME`/`CLAUDE_CONFIG_DIR`.
   The dashboard ignores chat events for now (#67).
+  CLI (#66, `tam-cli/src/chat.rs`): `tam chat [REPO]` (`repos::resolve`,
+  as `new -r`: from a worktree, its main checkout) is `CreateChat`, then
+  `KeepChat` with `--keep`, then `RunAgent` (`Current`); a failure after
+  the create closes the chat again (never ran, and it would hold
+  `--session`). `tam close CHAT [-y]` (confirms on a terminal: refused,
+  exit 1, without one and without `-y`; "n" keeps it; prints the `tam chat
+  REPO --session S` that makes it again), `tam rename CHAT [NAME]`, `tam
+  keep CHAT [--off]` take chats only (`GetChat` first: 3 not found, then 1
+  refused); a task's name gets a hint. The commands that take a member
+  take a chat through `ResolveTarget` (`Client::resolve_target`,
+  `main::resolve_target`): `Ledger::resolve_recipient`, the rule of `tam
+  msg`, so a task (name, `TASK/MEMBER`, member id, a peer's short name)
+  always comes before a chat's id, then its name; `stop`, `wait`, `result`,
+  `history` try a task name first (all its members). `check_chat_name`
+  refuses a task's name and `<task>/…`; a task made later takes the name,
+  the chat stays reachable by id. `GetOutcomes`/`WaitAgents` take chats
+  (`resolve_members`, `outcome`: `MemberOutcome.task` empty). `tam run
+  CHAT` refuses `--new-session`/`--session` (the daemon would not check
+  another chat holds it); a session that can no longer be resumed gets
+  the way out (`chat::cannot_resume`: `tam close`, then `tam chat`).
+  `drop` and `merge` say a name is a chat's (`chat::not_a_task`; the
+  others through `Ledger::resolve`, which says so for a chat's id or
+  name). `tam history TASK/MEMBER` (or a member id) shows its task's.
+  Shown by `ChatInfo::label()` (name, else Claude's title, else id), named
+  by id in every hint (`chat::describe`, `tam attach c-…`): a title does
+  not resolve. `tam ps`: a chats table above the tasks (`ps::chat_lines`,
+  an ID column, its own header), status the agent's else idle, LAST the
+  last turn else creation, CLOSES `closes_at` as time left rounded up
+  (`ps::closes`: `in 3d`, `due`, `kept`, `-` off); `ps --json` a new
+  `chats` key (`schema::PsChat`: `id`, `name`, `label`, `title`,
+  `last_prompt`, `keep`, `closes_at`, …, then a member's agent keys).
+  Documents for a chat (`schema::Subject`, flattened): `chat` where a
+  task's have `task`, the chat the one entry of `members` (`name` null when
+  unnamed, no `branch`); `close`/`rename`/`keep --json` print
+  `schema::ChatDoc`. Schema version stays 1.
 - **Chat autoclean (#65)** — `tam-daemon/src/autoclean.rs`, passes at the
   end of `daemon.rs`. A chat is closed by itself after `[chat] autoclean`
   days without a turn (3 by default, fractions allowed; `0`/`false` off,
@@ -653,6 +688,16 @@ cargo test
   read again as Claude rewrites it, gone while its agent runs a new
   session, there at once after a restart); `sessions.rs` unit tests write
   fixture lines by hand (never copied from real files).
+  The CLI's `chat_commands.rs` (one test, the real `tam` with a fake
+  `claude` on its `PATH`, hooks played by the test, the process's
+  HOME/XDG/`CLAUDE_CONFIG_DIR` temporary): `tam chat -d --json`, `ps` and
+  `ps --json`, rename (refused like a task), wait, result and history on a
+  chat, `tam msg` both ways, stop and `tam run` resuming its session, a
+  response after its agent exited, a session gone, `--session`/
+  `--new-session` refused, the task commands saying it is a chat, keep, a
+  task named later winning, close refused without `-y` then done, made
+  again from its session (its file at `sessions::session_file`), a
+  session of no file refused, a missing wrapper closing the chat again.
 - Chat autoclean: the daemon's `chat_autoclean.rs` (one test: it sets
   `HOME`, `XDG_CONFIG_HOME` and `CLAUDE_CONFIG_DIR`, so `[chat] autoclean`
   is read from the test's config and no one's `[notify]` runs): pre-dated ledger lines

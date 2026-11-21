@@ -1,5 +1,6 @@
 //! The JSON documents tam prints for agents and scripts: `--json` of `ps`,
-//! `new`, `run`, `wait`, `result`, `merge` and `split`, version
+//! `new`, `run`, `wait`, `result`, `merge`, `split`, and of the chat
+//! commands (`chat`, `close`, `rename`, `keep`), version
 //! [`SCHEMA_VERSION`]. Built from
 //! the daemon's types but kept apart from them, so that the wire protocol
 //! can change without changing them. Documented in the README (Scripting):
@@ -11,10 +12,11 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 use tam_proto::{
-    AgentError, AgentInfo, DeniedTool, MemberHealth, MemberInfo, MemberOutcome, Pending, RunInfo,
-    TaskInfo,
+    AgentError, AgentInfo, ChatInfo, DeniedTool, MemberHealth, MemberInfo, MemberOutcome, Pending,
+    RunInfo, TaskInfo,
 };
 
+use crate::chat::Chat;
 use crate::task::{Member, Task};
 
 /// Version of the documents. Raised when one changes incompatibly (a key
@@ -38,11 +40,22 @@ pub struct Failure {
     pub error: ErrorInfo,
 }
 
-/// `tam ps --json`: the tasks, most urgent first.
+/// `tam ps --json`: the tasks, most urgent first; the chats, most urgent
+/// first, then in creation order.
 #[derive(Serialize)]
 pub struct Ps {
     pub schema_version: u32,
     pub tasks: Vec<PsTask>,
+    pub chats: Vec<PsChat>,
+}
+
+/// What a document is about: a task (`"task": NAME`), or a chat (`"chat":
+/// ID`, where a task's document has `task`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Subject {
+    Task(String),
+    Chat(String),
 }
 
 /// A task in `tam ps --json`. The keys before `created_at` are those of
@@ -145,7 +158,9 @@ pub struct Run {
 #[derive(Serialize)]
 pub struct Receipt {
     pub schema_version: u32,
-    pub task: String,
+    /// `task`, or `chat` for a chat's agent.
+    #[serde(flatten)]
+    pub of: Subject,
     pub members: Vec<Started>,
     /// Why an agent could not start; `null` when all did.
     pub error: Option<ErrorInfo>,
@@ -154,10 +169,13 @@ pub struct Receipt {
 #[derive(Serialize)]
 pub struct Started {
     pub id: String,
-    pub name: String,
+    /// A chat's: `null` when unnamed.
+    pub name: Option<String>,
     pub label: String,
     pub repo: String,
-    pub branch: String,
+    /// Left out for a chat (it has none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub dir: PathBuf,
     /// The agent (provider) started; `null` when none was.
     pub agent: Option<String>,
@@ -171,7 +189,9 @@ pub struct Started {
 #[derive(Serialize)]
 pub struct Outcomes {
     pub schema_version: u32,
-    pub task: String,
+    /// `task`, or `chat` for a chat's agent.
+    #[serde(flatten)]
+    pub of: Subject,
     pub members: Vec<Outcome>,
     /// Why the command failed (timed out, gave up, a response missing);
     /// `null` when it did not.
@@ -181,7 +201,8 @@ pub struct Outcomes {
 #[derive(Serialize)]
 pub struct Outcome {
     pub id: String,
-    pub name: String,
+    /// A chat's: `null` when unnamed.
+    pub name: Option<String>,
     pub label: String,
     /// `working`, `blocked`, `ready`, `idle`, `question`, `error`, or `exit`
     /// when no agent runs for the member.
@@ -201,8 +222,12 @@ pub struct Outcome {
 }
 
 impl Ps {
-    /// The tasks with their runs, and the running agents.
-    pub fn new(tasks: Vec<(TaskInfo, Vec<RunInfo>)>, agents: &[AgentInfo]) -> Self {
+    /// The tasks and chats with their runs, and the running agents.
+    pub fn new(
+        tasks: Vec<(TaskInfo, Vec<RunInfo>)>,
+        chats: Vec<(ChatInfo, Vec<RunInfo>)>,
+        agents: &[AgentInfo],
+    ) -> Self {
         let mut tasks: Vec<(u8, PsTask)> = tasks
             .into_iter()
             .map(|(info, runs)| {
@@ -227,9 +252,19 @@ impl Ps {
             })
             .collect();
         tasks.sort_by(|(a, x), (b, y)| (a, &x.name).cmp(&(b, &y.name)));
+        let mut chats: Vec<(Chat, Vec<RunInfo>)> = chats
+            .into_iter()
+            .map(|(info, runs)| (Chat::new(info, agents), runs))
+            .collect();
+        // Stable: creation order among equals.
+        chats.sort_by_key(|(chat, _)| chat.status().sort_priority());
         Self {
             schema_version: SCHEMA_VERSION,
             tasks: tasks.into_iter().map(|(_, t)| t).collect(),
+            chats: chats
+                .iter()
+                .map(|(chat, runs)| PsChat::new(chat, runs))
+                .collect(),
         }
     }
 }
@@ -314,11 +349,25 @@ impl Started {
     pub fn new(task: &TaskInfo, member: &MemberInfo) -> Self {
         Self {
             id: member.id.clone(),
-            name: member.name.clone(),
+            name: Some(member.name.clone()),
             label: task.member_label(member),
             repo: member.repo.clone(),
-            branch: member.branch.clone(),
+            branch: Some(member.branch.clone()),
             dir: member.dir.clone(),
+            agent: None,
+            resumed_session: None,
+        }
+    }
+
+    /// A chat, with no agent started (yet).
+    pub fn chat(chat: &ChatInfo) -> Self {
+        Self {
+            id: chat.id.clone(),
+            name: chat.name.clone(),
+            label: chat.label(),
+            repo: chat.repo.clone(),
+            branch: None,
+            dir: chat.dir.clone(),
             agent: None,
             resumed_session: None,
         }
@@ -327,23 +376,41 @@ impl Started {
 
 impl Outcomes {
     pub fn new(task: &TaskInfo, outcomes: &[MemberOutcome], error: Option<ErrorInfo>) -> Self {
+        let name = |o: &MemberOutcome| {
+            task.member(&o.member)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| o.label.clone())
+        };
         Self {
             schema_version: SCHEMA_VERSION,
-            task: task.name.clone(),
-            members: outcomes.iter().map(|o| Outcome::new(task, o)).collect(),
+            of: Subject::Task(task.name.clone()),
+            members: outcomes
+                .iter()
+                .map(|o| Outcome::new(Some(name(o)), o))
+                .collect(),
+            error,
+        }
+    }
+
+    /// A chat's agent: the chat is the one entry of `members`.
+    pub fn chat(chat: &ChatInfo, outcomes: &[MemberOutcome], error: Option<ErrorInfo>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            of: Subject::Chat(chat.id.clone()),
+            members: outcomes
+                .iter()
+                .map(|o| Outcome::new(chat.name.clone(), o))
+                .collect(),
             error,
         }
     }
 }
 
 impl Outcome {
-    fn new(task: &TaskInfo, o: &MemberOutcome) -> Self {
+    fn new(name: Option<String>, o: &MemberOutcome) -> Self {
         Self {
             id: o.member.clone(),
-            name: task
-                .member(&o.member)
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| o.label.clone()),
+            name,
             label: o.label.clone(),
             state: o.state.to_string(),
             agent: o.provider.clone(),
@@ -394,4 +461,131 @@ pub struct MovedMember {
     /// Whether its agent is told of the change at its next prompt or tool
     /// call (Claude agents).
     pub notified: bool,
+}
+
+/// A chat in `tam ps --json` (#66). The keys from `agent` on are those of a
+/// task member (`PsMember`).
+#[derive(Serialize)]
+pub struct PsChat {
+    /// `c-` and 8 hex digits: how to name the chat to tam.
+    pub id: String,
+    /// The name the user gave it; `null` when unnamed.
+    pub name: Option<String>,
+    /// How tam shows it (its name, else `title`, else its id): not always
+    /// a name tam takes back.
+    pub label: String,
+    /// The title of its Claude session (the user's `/rename`, else
+    /// Claude's), from Claude's files.
+    pub title: Option<String>,
+    /// The latest prompt in its Claude session, from Claude's files.
+    pub last_prompt: Option<String>,
+    pub repo: String,
+    /// The repository's main checkout, where its agent runs.
+    pub dir: PathBuf,
+    /// `run`, `ready`, `block`, `question`, `error` or `idle`.
+    pub status: String,
+    /// Kept: never closed for want of turns.
+    pub keep: bool,
+    /// Unix timestamp (seconds) from which autoclean closes it (once its
+    /// agent is not running, or at the prompt with nobody attached);
+    /// `null` when kept, or autoclean is off.
+    pub closes_at: Option<u64>,
+    pub created_at: u64,
+    /// Unix timestamp (seconds) of the latest prompt the user gave its
+    /// agent.
+    pub last_turn_at: Option<u64>,
+    pub run_count: usize,
+    pub agent: Option<String>,
+    pub state: Option<String>,
+    pub pid: Option<u32>,
+    pub viewers: Option<usize>,
+    pub context_percent: Option<u8>,
+    /// The running agent's session as its hooks report it, else the session
+    /// its agent resumes next.
+    pub session_id: Option<String>,
+    pub pending: Option<PendingView>,
+    pub turn_error: Option<TurnError>,
+    pub denied: Option<Denied>,
+    pub last_message: Option<String>,
+    pub last_run: Option<Run>,
+}
+
+impl PsChat {
+    fn new(chat: &Chat, runs: &[RunInfo]) -> Self {
+        let info = &chat.info;
+        let agent = chat.agent.as_ref();
+        let detail = agent.map(|a| a.detail.as_ref());
+        Self {
+            id: info.id.clone(),
+            name: info.name.clone(),
+            label: info.label(),
+            title: info.title.clone(),
+            last_prompt: info.last_prompt.clone(),
+            repo: info.repo.clone(),
+            dir: info.dir.clone(),
+            status: chat.status().to_string(),
+            keep: info.keep,
+            closes_at: info.closes_at,
+            created_at: info.created_at,
+            last_turn_at: info.last_turn_at,
+            run_count: info.run_count,
+            agent: agent.map(|a| a.provider.clone()),
+            state: agent.map(|a| a.state.to_string()),
+            pid: agent.and_then(|a| a.pid),
+            viewers: agent.map(|a| a.viewers),
+            context_percent: agent.and_then(|a| a.context_percent),
+            session_id: detail
+                .and_then(|d| d.session_id.clone())
+                .or_else(|| info.session.clone()),
+            pending: detail
+                .and_then(|d| d.pending.as_ref())
+                .map(PendingView::from),
+            turn_error: detail.and_then(|d| d.error.as_ref()).map(TurnError::from),
+            denied: detail.and_then(|d| d.denied.as_ref()).map(Denied::from),
+            last_message: detail.and_then(|d| d.last_message.clone()),
+            last_run: runs.last().map(Run::from),
+        }
+    }
+}
+
+/// `tam close --json`, `tam rename --json` and `tam keep --json`: the chat,
+/// as it is now (as it was, for `close`: its session makes it again).
+#[derive(Serialize)]
+pub struct ChatDoc {
+    pub schema_version: u32,
+    /// The chat's id.
+    pub chat: String,
+    /// `null` when unnamed.
+    pub name: Option<String>,
+    pub label: String,
+    pub repo: String,
+    pub dir: PathBuf,
+    pub keep: bool,
+    /// The session its agent resumes (`tam chat REPO --session ID` makes a
+    /// closed chat again); `null` before its first turn.
+    pub session_id: Option<String>,
+    pub created_at: u64,
+    pub last_turn_at: Option<u64>,
+    pub run_count: usize,
+    /// Whether the chat is still open (`false` after `tam close`).
+    pub open: bool,
+}
+
+impl ChatDoc {
+    pub fn new(chat: &ChatInfo, open: bool) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            chat: chat.id.clone(),
+            name: chat.name.clone(),
+            label: chat.label(),
+            repo: chat.repo.clone(),
+            dir: chat.dir.clone(),
+            keep: chat.keep,
+            session_id: chat.session.clone(),
+            created_at: chat.created_at,
+            last_turn_at: chat.last_turn_at,
+            run_count: chat.run_count,
+            open,
+        }
+    }
 }

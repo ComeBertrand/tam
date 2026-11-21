@@ -343,13 +343,44 @@ pub struct ChatInfo {
     /// Number of agent runs started for it.
     #[serde(default)]
     pub run_count: usize,
+    /// The title of its session in Claude: the name the user gave it there
+    /// (`/rename`), else the one Claude generated. Read from Claude's files
+    /// (the daemon reads them again every 10s), never recorded; `None`
+    /// until its session has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The latest prompt typed in its session, from Claude's files (one
+    /// line, 200 characters at most).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
 }
 
 impl ChatInfo {
-    /// How to name the chat to the user: its name, else its id.
+    /// How to name the chat to the user: its name, else its session's
+    /// title, else its id. Only the name and the id find it again.
     pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.id.clone())
+        self.name
+            .clone()
+            .or_else(|| self.title.clone())
+            .unwrap_or_else(|| self.id.clone())
     }
+}
+
+/// A Claude session of a repository's main checkout, from Claude's own
+/// files (`ChatHistory`): one a chat can be made from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// Claude's session id (`CreateChat::session`).
+    pub id: String,
+    /// The name the user gave it in Claude (`/rename`), else the title
+    /// Claude generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The latest prompt typed in it (one line, 200 characters at most).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
+    /// Unix timestamp (seconds) of its last write (its file's).
+    pub modified_at: u64,
 }
 
 /// A new task member's worktree: one the client created (`CreateTask`), or
@@ -805,9 +836,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         /// An existing Claude session of that repository for its agent to
-        /// resume, instead of a new one. Refused when a chat holds it as
-        /// its session already. Its existence is checked when the agent
-        /// starts.
+        /// resume, instead of a new one (`ChatHistory` lists them). Refused
+        /// when Claude's files have no such session run in `dir`, and when
+        /// a chat holds it as its session already. Checked again when the
+        /// agent starts (Claude deletes old sessions).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
     },
@@ -839,6 +871,15 @@ pub enum Request {
     CloseChat {
         /// The chat's id or name.
         chat: String,
+    },
+    /// The Claude sessions of the repository whose main checkout is `dir`,
+    /// newest first, but those an open chat holds (its `session`): what
+    /// `CreateChat` can make a chat from. Read from Claude's files; a
+    /// session with neither title nor prompt is left out. Replies
+    /// `Sessions`.
+    ChatHistory {
+        /// A repository's main checkout (not a linked worktree).
+        dir: PathBuf,
     },
 }
 
@@ -1116,6 +1157,10 @@ pub enum Response {
         chat: Box<ChatInfo>,
         #[serde(default)]
         runs: Vec<RunInfo>,
+    },
+    /// A repository's Claude sessions, newest first (`ChatHistory`).
+    Sessions {
+        sessions: Vec<SessionInfo>,
     },
 }
 
@@ -2495,11 +2540,13 @@ mod tests {
             session: None,
             last_turn_at: None,
             run_count: 0,
+            title: None,
+            last_prompt: None,
         }
     }
 
     #[test]
-    fn chat_info_omits_unset_fields_and_labels_by_name_else_id() {
+    fn chat_info_omits_unset_fields_and_labels_by_name_then_title_then_id() {
         let chat = sample_chat();
         assert_eq!(
             serde_json::to_string(&chat).unwrap(),
@@ -2514,6 +2561,64 @@ mod tests {
         assert_eq!(named.label(), "debug");
         let back: ChatInfo = serde_json::from_str(&serde_json::to_string(&named).unwrap()).unwrap();
         assert_eq!(back, named);
+        // Claude's title comes between the name and the id.
+        let titled = ChatInfo {
+            title: Some("Fix the pool leak".into()),
+            last_prompt: Some("and fix it".into()),
+            ..sample_chat()
+        };
+        assert_eq!(titled.label(), "Fix the pool leak");
+        let json = serde_json::to_string(&titled).unwrap();
+        assert!(
+            json.ends_with(r#""title":"Fix the pool leak","last_prompt":"and fix it"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<ChatInfo>(&json).unwrap(), titled);
+        assert_eq!(
+            ChatInfo {
+                name: Some("leak".into()),
+                ..titled
+            }
+            .label(),
+            "leak"
+        );
+    }
+
+    #[test]
+    fn chat_history_wire_format() {
+        let json = serde_json::to_string(&Request::ChatHistory {
+            dir: PathBuf::from("/src/api"),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"chat_history","dir":"/src/api"}"#);
+        let sessions = Response::Sessions {
+            sessions: vec![
+                SessionInfo {
+                    id: "s-2".into(),
+                    title: Some("Deploy".into()),
+                    last_prompt: Some("go".into()),
+                    modified_at: 200,
+                },
+                SessionInfo {
+                    id: "s-1".into(),
+                    title: None,
+                    last_prompt: None,
+                    modified_at: 100,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&sessions).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"sessions","sessions":[{"id":"s-2","title":"Deploy","last_prompt":"go","modified_at":200},{"id":"s-1","modified_at":100}]}"#
+        );
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Response(Response::Sessions { sessions: back }) => {
+                assert_eq!(back.len(), 2);
+                assert_eq!(back[0].title.as_deref(), Some("Deploy"));
+            }
+            other => panic!("{json} decoded as {other:?}"),
+        }
     }
 
     #[test]

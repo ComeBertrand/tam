@@ -28,7 +28,8 @@
 //! main checkout, owning nothing on disk. A chat has a stable id (`c-…`) of
 //! its own and keeps what a member keeps of its agent ([`History`]: runs,
 //! sessions, messages), recorded with the same events, keyed by its id.
-//! Closing a chat forgets it, with its history.
+//! Closing a chat forgets it, with its history. What Claude's files say of
+//! a chat's session (title, last prompt) is kept next to it, in memory only.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -337,6 +338,16 @@ struct State {
     /// What reconciliation last observed of the members' worktrees, by member
     /// id. In memory only.
     observed: HashMap<String, Observed>,
+    /// What Claude's files say of each open chat's session, by chat id. In
+    /// memory only.
+    chat_sessions: HashMap<String, ChatSession>,
+}
+
+/// What Claude's files say of a chat's session (see `crate::sessions`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatSession {
+    pub title: Option<String>,
+    pub last_prompt: Option<String>,
 }
 
 /// What reconciliation observed of a member's worktree.
@@ -1193,6 +1204,7 @@ impl State {
             LedgerEvent::ChatClosed { chat, .. } => {
                 // Kept nowhere: compaction drops the chat's events with it.
                 self.chats.remove(chat);
+                self.chat_sessions.remove(chat);
             }
         }
     }
@@ -1235,6 +1247,11 @@ impl State {
 
     /// The chat's summary.
     fn chat_info(&self, chat: &ChatRecord) -> ChatInfo {
+        let claude = self
+            .chat_sessions
+            .get(&chat.id)
+            .cloned()
+            .unwrap_or_default();
         ChatInfo {
             id: chat.id.clone(),
             name: chat.name.clone(),
@@ -1249,6 +1266,8 @@ impl State {
             session: self.current_session(&chat.id, CLAUDE),
             last_turn_at: chat.last_turn_at,
             run_count: chat.history.runs.len(),
+            title: claude.title,
+            last_prompt: claude.last_prompt,
         }
     }
 
@@ -1629,6 +1648,22 @@ impl Ledger {
             chat: id.into(),
             timestamp: now(),
         })
+    }
+
+    /// Record what Claude's files say of the chat's session now. Returns
+    /// the chat when that changed; `None` too for a closed chat.
+    pub fn set_chat_session(&mut self, id: &str, session: ChatSession) -> Option<ChatInfo> {
+        if !self.state.chats.contains_key(id) {
+            return None;
+        }
+        let old = self
+            .state
+            .chat_sessions
+            .insert(id.to_string(), session.clone());
+        if old.unwrap_or_default() == session {
+            return None;
+        }
+        self.chat(id)
     }
 
     fn require_chat(&self, id: &str) -> Result<ChatInfo> {
@@ -3697,6 +3732,54 @@ mod tests {
         let ledger = Ledger::open(&path).unwrap();
         assert_eq!(ledger.1.compacted, 0);
         assert_eq!(chat_ids(&ledger.0), [c, b, a]);
+    }
+
+    #[test]
+    fn what_claude_says_of_a_chat_shows_in_its_info_and_is_never_written() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        let mut ledger = open(&tmp);
+        let dir = Path::new("/src/api");
+        let chat = ledger.create_chat(dir, None, None).unwrap();
+        let id = chat.id.clone();
+        assert_eq!((chat.title, chat.last_prompt), (None, None));
+        let lines = fs::read_to_string(&path).unwrap();
+        let said = ChatSession {
+            title: Some("Fix the pool leak".into()),
+            last_prompt: Some("and fix it".into()),
+        };
+        // Changed: the chat is returned, to tell clients; the same again,
+        // nothing.
+        let changed = ledger.set_chat_session(&id, said.clone()).unwrap();
+        assert_eq!(changed.title.as_deref(), Some("Fix the pool leak"));
+        assert_eq!(changed.last_prompt.as_deref(), Some("and fix it"));
+        assert!(ledger.set_chat_session(&id, said.clone()).is_none());
+        let listed = &ledger.chats()[0];
+        assert_eq!(listed.title.as_deref(), Some("Fix the pool leak"));
+        // Its label: its name, else its title, else its id. Only the name
+        // and the id find it.
+        assert_eq!(listed.label(), "Fix the pool leak");
+        assert!(ledger.resolve_chat("Fix the pool leak").is_err());
+        ledger.rename_chat(&id, Some("leak")).unwrap();
+        assert_eq!(ledger.chat(&id).unwrap().label(), "leak");
+        ledger.rename_chat(&id, None).unwrap();
+        assert!(ledger
+            .set_chat_session(&id, ChatSession::default())
+            .is_some());
+        assert_eq!(ledger.chat(&id).unwrap().label(), id);
+        // Nothing of it in the file.
+        ledger.set_chat_session(&id, said.clone()).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with(&lines));
+        assert!(!written.contains("pool leak") && !written.contains("fix it"));
+        drop(ledger);
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        assert_eq!(ledger.chat(&id).unwrap().title, None);
+        // A closed chat's goes with it, and a closed chat takes none.
+        ledger.set_chat_session(&id, said.clone()).unwrap();
+        ledger.close_chat(&id).unwrap();
+        assert!(ledger.set_chat_session(&id, said).is_none());
+        assert!(ledger.state.chat_sessions.is_empty());
     }
 
     #[test]

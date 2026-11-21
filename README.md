@@ -198,7 +198,7 @@ tam brief NAME --set REF       Make REF the brief: a URL, a ticket id, a path
 tam brief NAME --local         Make the local file brief.md the brief again
 ```
 
-The members of a task work from one brief: the reference you give with `tam new --brief REF` or `tam brief --set REF` (a URL, a ticket id, a path; TAM neither fetches nor reads it), else the file `brief.md` in the task's directory (`~/.local/share/tam/tasks/NAME/`), which TAM starts with a heading per member. Next to it, `scratch/` is a directory the members share for transient notes. An agent is told both when its session starts, and how to write in the brief: under its own heading, and what the members agree on (an API shape, a name) under `Shared`, so that two agents do not overwrite each other's part. A changed brief reaches running agents at their next session start (resume, `/clear`, compaction); `tam peers` shows the current one. A pattern in the configuration can turn a ticket id into its URL and into the agents' start prompt (see Configuration). Dropping the task removes its directory: a `brief.md` the members wrote in is kept in `~/.local/share/tam/tasks/.dropped/`, and `tam drop` says where.
+The members of a task work from one brief: the reference you give with `tam new --brief REF` or `tam brief --set REF` (a URL, a ticket id, a path; TAM neither fetches nor reads it), else the file `brief.md` in the task's directory (`~/.local/share/tam/tasks/NAME/`, or under `$XDG_DATA_HOME/tam` when it is set), which TAM starts with a heading per member. Next to it, `scratch/` is a directory the members share for transient notes. An agent is told both when its session starts, and how to write in the brief: under its own heading, and what the members agree on (an API shape, a name) under `Shared`, so that two agents do not overwrite each other's part. A changed brief reaches running agents at their next session start (resume, `/clear`, compaction); `tam peers` shows the current one. A pattern in the configuration can turn a ticket id into its URL and into the agents' start prompt (see Configuration). Dropping the task removes its directory: a `brief.md` the members wrote in is kept in `~/.local/share/tam/tasks/.dropped/`, and `tam drop` says where.
 
 An agent can also read the other members' worktrees without asking, but not edit them: TAM adds them to the session's directories with a rule denying edits there, which covers Claude's file tools and the file commands it recognises in shell commands, not every program a command may run. A member that joined after the agent started is readable from the agent's next start. The task's directory is open to the agent as its worktree is: edits there follow its permission mode.
 
@@ -502,7 +502,7 @@ tam status                     Check if the daemon is running
 
 ## Configuration
 
-TAM reads `~/.config/tam/config.toml`:
+TAM reads `$XDG_CONFIG_HOME/tam/config.toml`, by default `~/.config/tam/config.toml`, on every platform (macOS too). It keeps its data (the task ledger, the tasks' directories) in `$XDG_DATA_HOME/tam`, by default `~/.local/share/tam`, the same way.
 
 ```toml
 [spawn]

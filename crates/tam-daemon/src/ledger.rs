@@ -374,10 +374,11 @@ pub struct Ledger {
     seq: usize,
 }
 
-/// Default ledger path: `$XDG_DATA_HOME/tam/ledger.jsonl`
-/// (`~/.local/share/tam/ledger.jsonl`).
+/// Default ledger path: `$XDG_DATA_HOME/tam/ledger.jsonl`, else
+/// `~/.local/share/tam/ledger.jsonl`, on every platform
+/// ([`tam_worktree::xdg::data_home`]). The task directories are next to it.
 pub fn default_path() -> PathBuf {
-    dirs::data_local_dir()
+    tam_worktree::xdg::data_home()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("tam")
         .join("ledger.jsonl")

@@ -1742,7 +1742,6 @@ name = "tam-daemon"
 version = "0.4.1"
 dependencies = [
  "anyhow",
- "dirs",
  "libc",
  "nix 0.29.0",
  "serde",

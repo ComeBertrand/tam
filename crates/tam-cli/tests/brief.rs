@@ -116,26 +116,19 @@ async fn a_brief_from_the_command_line() {
     }
     let tasks_dir = root.join("tasks");
 
-    // Where tam reads its config: $XDG_CONFIG_HOME, or on macOS
-    // ~/Library/Application Support.
-    let macos = root
-        .join("home")
-        .join("Library")
-        .join("Application Support");
-    for config in [root.join("config"), macos] {
-        let config = config.join("tam");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join("config.toml"),
-            r#"
+    // Where tam reads its config: $XDG_CONFIG_HOME/tam.
+    let config = root.join("config").join("tam");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        r#"
 [[brief.patterns]]
 match = '^CS-(\d+)$'
 reference = "https://tickets.example/CS-{1}"
 prompt = "/implement-task {brief}"
 "#,
-        )
-        .unwrap();
-    }
+    )
+    .unwrap();
     let src = root.join("home").join("src");
     repo(&src.join("api"));
     repo(&src.join("web"));

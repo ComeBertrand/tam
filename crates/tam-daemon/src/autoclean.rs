@@ -96,11 +96,11 @@ fn load_from(path: &Path) -> Setting {
     }
 }
 
-/// The setting in the config (`$XDG_CONFIG_HOME/tam/config.toml`, where the
-/// rest of tam reads it).
+/// The setting in tam's config file
+/// ([`tam_worktree::config::config_path`], where the rest of tam reads it).
 pub fn load() -> Setting {
-    match dirs::config_dir() {
-        Some(dir) => load_from(&dir.join("tam").join("config.toml")),
+    match tam_worktree::config::config_path() {
+        Some(path) => load_from(&path),
         None => Setting::default_days(),
     }
 }

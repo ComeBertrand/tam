@@ -138,18 +138,11 @@ async fn report(file: &Path) -> std::collections::BTreeMap<String, String> {
     panic!("the agent did not start");
 }
 
-/// Write tam's config where it reads it: `$XDG_CONFIG_HOME`, or on macOS
-/// `~/Library/Application Support`.
+/// Write tam's config where it reads it: `$XDG_CONFIG_HOME/tam`.
 fn write_config(root: &Path, text: &str) {
-    let macos = root
-        .join("home")
-        .join("Library")
-        .join("Application Support");
-    for dir in [root.join("config"), macos] {
-        let dir = dir.join("tam");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), text).unwrap();
-    }
+    let dir = root.join("config").join("tam");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), text).unwrap();
 }
 
 fn git(dir: &Path, args: &[&str]) {

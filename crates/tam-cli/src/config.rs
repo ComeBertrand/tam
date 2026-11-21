@@ -1,5 +1,5 @@
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -111,16 +111,12 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     })
 }
 
+/// Load config from `$XDG_CONFIG_HOME/tam/config.toml`, else
+/// `~/.config/tam/config.toml` ([`tam_worktree::config::config_path`]).
 pub fn load_config() -> Result<Config> {
-    let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("/"));
-
-    let tam_path = config_dir.join("tam").join("config.toml");
-
-    if tam_path.exists() {
-        let content = std::fs::read_to_string(&tam_path)?;
-        parse_config(&content)
-    } else {
-        Ok(Config::default())
+    match tam_worktree::config::config_path().filter(|path| path.exists()) {
+        Some(path) => parse_config(&std::fs::read_to_string(&path)?),
+        None => Ok(Config::default()),
     }
 }
 

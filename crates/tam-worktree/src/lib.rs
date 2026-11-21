@@ -12,3 +12,4 @@ pub mod git;
 pub mod init;
 pub mod pretty;
 pub mod worktree;
+pub mod xdg;

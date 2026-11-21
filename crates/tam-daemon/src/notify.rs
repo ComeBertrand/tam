@@ -9,7 +9,8 @@ use tracing::{error, info};
 pub struct NotifyConfig {
     /// Command template to run on state transitions, run with `sh -c`.
     /// Placeholders (escaped for the quoting they sit in):
-    /// - `{task}`, `{id}` (agent id), `{state}` (alias `{status}`), `{old_state}`
+    /// - `{task}` (a chat's label), `{id}` (agent id: the member's or
+    ///   chat's), `{state}` (alias `{status}`), `{old_state}`
     /// - `{kind}`: `question`, `permission`, `done`, `error`
     /// - `{message}`: question or permission asked, last response, or error
     /// - `{tool}`: tool waiting for permission; `{error}`: error kind
@@ -106,7 +107,8 @@ fn shell_quote(s: &str) -> String {
 pub struct Notification<'a> {
     /// Agent id.
     pub id: &'a str,
-    /// Task the agent runs for (the agent id when it has none).
+    /// Task the agent runs for, or its chat's label (the agent id when it
+    /// has neither).
     pub task: &'a str,
     pub old: AgentState,
     pub new: AgentState,

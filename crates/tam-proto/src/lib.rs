@@ -309,6 +309,49 @@ impl MemberHealth {
     }
 }
 
+/// A chat: a Claude session on a repository's main checkout, started from
+/// tam. It owns nothing on disk (no worktree, no branch); several can run
+/// on one repository at once. Its id is its agent's id (`$TAM_AGENT_ID`).
+///
+/// New fields must be optional (`#[serde(default)]`) so older clients keep
+/// decoding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatInfo {
+    /// `c-` and 8 hex digits, stable.
+    pub id: String,
+    /// The name the user gave it, unique among chats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Repository name (the directory name of its main checkout).
+    pub repo: String,
+    /// The repository's main checkout, where its agent runs.
+    pub dir: PathBuf,
+    /// Unix timestamp (seconds) of its creation; chats are listed in
+    /// creation order.
+    pub created_at: u64,
+    /// Kept: never closed for want of turns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep: bool,
+    /// The session its agent resumes by default: the latest one it had a
+    /// turn in, else the one it was made from. `None`: a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Unix timestamp (seconds) of the latest prompt the user gave its
+    /// agent (tam messages and background notifications do not count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_at: Option<u64>,
+    /// Number of agent runs started for it.
+    #[serde(default)]
+    pub run_count: usize,
+}
+
+impl ChatInfo {
+    /// How to name the chat to the user: its name, else its id.
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.id.clone())
+    }
+}
+
 /// A new task member's worktree: one the client created (`CreateTask`), or
 /// one for the daemon to create (`CreateMembers`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,10 +363,10 @@ pub struct NewMember {
     pub dir: PathBuf,
 }
 
-/// One agent run of a task member, from the daemon's ledger.
+/// One agent run of a task member or a chat, from the daemon's ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
-    /// Id of the member the run belongs to.
+    /// Id of the member (or chat) the run belongs to.
     pub member: String,
     pub provider: String,
     /// Agent session id, once known (resumed session or reported by the agent).
@@ -382,20 +425,22 @@ pub struct ScreenInfo {
     pub live: u64,
 }
 
-/// A message to a task member's agent, as the daemon recorded it.
+/// A message to the agent of a task member or a chat, as the daemon
+/// recorded it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageInfo {
     /// `msg-` and 8 hex digits.
     pub id: String,
-    /// Id of the sending member; `None` when the user sent it.
+    /// Id of the sending member or chat; `None` when the user sent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     /// How to name the sender: `user`, or its member label (see
-    /// `TaskInfo::member_label`), or its id once it no longer exists.
+    /// `TaskInfo::member_label`), a chat's id, or its id once it no longer
+    /// exists. `tam msg` takes it as a recipient.
     pub from_label: String,
-    /// Id of the recipient member.
+    /// Id of the recipient member or chat.
     pub to: String,
-    /// How to name the recipient (its member label).
+    /// How to name the recipient (its member label, a chat's id).
     pub to_label: String,
     pub text: String,
     /// Agent-to-agent hops leading to this message (0 when the user sent
@@ -430,10 +475,10 @@ pub enum Request {
         resume_session: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
-        /// Id of the task member the agent runs for. The daemon runs it in
-        /// the member's worktree under the member id (leave `dir` empty and
-        /// `id` unset, or give the same values) and records the run in the
-        /// ledger (start, session, end).
+        /// Id of the task member (or chat) the agent runs for. The daemon
+        /// runs it in the member's worktree (the chat's main checkout) under
+        /// that id (leave `dir` empty and `id` unset, or give the same
+        /// values) and records the run in the ledger (start, session, end).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         member: Option<String>,
     },
@@ -525,7 +570,10 @@ pub enum Request {
     Subscribe,
     /// Start the agent of a task member, in the member's current session by
     /// default. Replies `Running`; refused while the member has an agent.
+    /// A chat's agent starts the same way: `member` is then the chat's id,
+    /// and its current session (`ChatInfo::session`) is resumed by default.
     RunAgent {
+        /// A member id, or a chat id.
         member: String,
         /// Unset: Claude. A program to run in its place: for tam's tests,
         /// no client sets it.
@@ -607,17 +655,20 @@ pub enum Request {
         id: String,
         data: String,
     },
-    /// Send a message to a task member's agent. Replies `Sent`; pushes
-    /// `MessageSent`, then `MessageDelivered` once the agent has it. A member
-    /// with no running agent gets it when its next agent starts.
+    /// Send a message to the agent of a task member or a chat. Replies
+    /// `Sent`; pushes `MessageSent`, then `MessageDelivered` once the agent
+    /// has it. A member with no running agent gets it when its next agent
+    /// starts.
     SendMessage {
         /// Recipient: a task name (its only member), `<task>/<member>` or a
         /// member id; from a member's agent, also the short name of another
-        /// member of its task.
+        /// member of its task; then a chat's id or name (after everything
+        /// else: no name changes meaning).
         to: String,
         text: String,
         /// The caller's agent id (`$TAM_AGENT_ID`): the message comes from
-        /// that agent's member. Without one (or an unknown one), from the user.
+        /// that agent's member or chat. Without one (or an unknown one),
+        /// from the user.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
@@ -635,8 +686,9 @@ pub enum Request {
         id: String,
         timeout_secs: u64,
     },
-    /// Messages to or from the members of a task (of all tasks without one),
-    /// oldest first. Replies `Messages`.
+    /// Messages to or from the members of a task (of all tasks and chats
+    /// without one), oldest first. Replies `Messages`. A name that is no
+    /// task may be a chat's id or name: its messages.
     ListMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<String>,
@@ -741,6 +793,52 @@ pub enum Request {
         agent: String,
         ask: String,
         answer: AskAnswer,
+    },
+    /// Make a chat on the repository whose main checkout is `dir` (no
+    /// worktree, no branch: its agent runs there). Records it only:
+    /// `RunAgent` with its id starts its agent. Replies `Chat`; pushes
+    /// `ChatCreated`.
+    CreateChat {
+        /// A repository's main checkout (not a linked worktree).
+        dir: PathBuf,
+        /// Unique among chats; `None`: unnamed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// An existing Claude session of that repository for its agent to
+        /// resume, instead of a new one. Refused when a chat holds it as
+        /// its session already. Its existence is checked when the agent
+        /// starts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
+    /// All chats, in creation order. Replies `Chats`.
+    ListChats,
+    /// One chat with its runs. Replies `Chat`.
+    GetChat {
+        /// The chat's id or name.
+        chat: String,
+    },
+    /// Name a chat (`None`: unnamed). Replies `Chat`; pushes `ChatUpdated`.
+    RenameChat {
+        /// The chat's id or name.
+        chat: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Keep a chat (never closed for want of turns), or stop keeping it.
+    /// Replies `Chat`; pushes `ChatUpdated`.
+    KeepChat {
+        /// The chat's id or name.
+        chat: String,
+        keep: bool,
+    },
+    /// Close a chat: stop its agent (waited for) and forget the chat. Its
+    /// directory, branch and Claude transcript are left as they are: a chat
+    /// can be made again from its session. Replies `Chat`, the chat as it
+    /// was (its `session` too); pushes `ChatClosed`.
+    CloseChat {
+        /// The chat's id or name.
+        chat: String,
     },
 }
 
@@ -1008,6 +1106,17 @@ pub enum Response {
     HookOutput {
         output: String,
     },
+    /// All chats, in creation order (`ListChats`).
+    Chats {
+        chats: Vec<ChatInfo>,
+    },
+    /// One chat and its runs, oldest first.
+    Chat {
+        /// Boxed: keeps `Response` small.
+        chat: Box<ChatInfo>,
+        #[serde(default)]
+        runs: Vec<RunInfo>,
+    },
 }
 
 /// Daemon -> Client pushed event (unsolicited).
@@ -1058,6 +1167,16 @@ pub enum Event {
     /// A message reached its recipient's agent.
     MessageDelivered {
         message: MessageInfo,
+    },
+    ChatCreated {
+        chat: ChatInfo,
+    },
+    /// A chat changed: renamed, kept, a run started or ended, a turn.
+    ChatUpdated {
+        chat: ChatInfo,
+    },
+    ChatClosed {
+        id: String,
     },
 }
 
@@ -2362,6 +2481,123 @@ mod tests {
                 assert!(notified.is_empty());
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    fn sample_chat() -> ChatInfo {
+        ChatInfo {
+            id: "c-0000abcd".into(),
+            name: None,
+            repo: "api".into(),
+            dir: PathBuf::from("/src/api"),
+            created_at: 100,
+            keep: false,
+            session: None,
+            last_turn_at: None,
+            run_count: 0,
+        }
+    }
+
+    #[test]
+    fn chat_info_omits_unset_fields_and_labels_by_name_else_id() {
+        let chat = sample_chat();
+        assert_eq!(
+            serde_json::to_string(&chat).unwrap(),
+            r#"{"id":"c-0000abcd","repo":"api","dir":"/src/api","created_at":100,"run_count":0}"#
+        );
+        assert_eq!(chat.label(), "c-0000abcd");
+        let named = ChatInfo {
+            name: Some("debug".into()),
+            keep: true,
+            ..chat
+        };
+        assert_eq!(named.label(), "debug");
+        let back: ChatInfo = serde_json::from_str(&serde_json::to_string(&named).unwrap()).unwrap();
+        assert_eq!(back, named);
+    }
+
+    #[test]
+    fn chat_requests_wire_format() {
+        let json = serde_json::to_string(&Request::CreateChat {
+            dir: PathBuf::from("/src/api"),
+            name: None,
+            session: Some("s-1".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"create_chat","dir":"/src/api","session":"s-1"}"#
+        );
+        let json = serde_json::to_string(&Request::RenameChat {
+            chat: "c-0000abcd".into(),
+            name: Some("debug".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"rename_chat","chat":"c-0000abcd","name":"debug"}"#
+        );
+        let json = serde_json::to_string(&Request::KeepChat {
+            chat: "debug".into(),
+            keep: true,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"keep_chat","chat":"debug","keep":true}"#);
+        for (request, json) in [
+            (Request::ListChats, r#"{"type":"list_chats"}"#),
+            (
+                Request::GetChat { chat: "x".into() },
+                r#"{"type":"get_chat","chat":"x"}"#,
+            ),
+            (
+                Request::CloseChat { chat: "x".into() },
+                r#"{"type":"close_chat","chat":"x"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&request).unwrap(), json);
+        }
+    }
+
+    /// `ServerMessage` is untagged and tries `Response` first: chat events
+    /// must not decode as a response, nor chat responses as events.
+    #[test]
+    fn chat_events_and_responses_are_told_apart() {
+        for event in [
+            Event::ChatCreated {
+                chat: sample_chat(),
+            },
+            Event::ChatUpdated {
+                chat: sample_chat(),
+            },
+            Event::ChatClosed {
+                id: "c-0000abcd".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+                ServerMessage::Event(back) => {
+                    assert_eq!(serde_json::to_string(&back).unwrap(), json)
+                }
+                other => panic!("{json} decoded as {other:?}"),
+            }
+        }
+        for resp in [
+            Response::Chats {
+                chats: vec![sample_chat()],
+            },
+            Response::Chat {
+                chat: Box::new(sample_chat()),
+                runs: Vec::new(),
+            },
+        ] {
+            let json = serde_json::to_string(&resp).unwrap();
+            assert!(
+                matches!(
+                    serde_json::from_str::<ServerMessage>(&json).unwrap(),
+                    ServerMessage::Response(_)
+                ),
+                "{json}"
+            );
         }
     }
 }

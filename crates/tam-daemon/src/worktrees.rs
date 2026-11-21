@@ -296,18 +296,7 @@ pub(crate) fn check_new(members: &[NewMember], source: Option<&str>) -> Result<(
     for (i, m) in members.iter().enumerate() {
         let repo = &m.repo_root;
         let at = || repo.display().to_string();
-        if !repo.is_dir() {
-            bail!("{}: no such directory", repo.display());
-        }
-        let main = git::toplevel(repo)
-            .and_then(|top| Ok((top, git::repo_root(repo)?)))
-            .with_context(at)?;
-        if !worktree::same_path(&main.0, repo) || !worktree::same_path(&main.1, repo) {
-            bail!(
-                "{} is not the main checkout of a repository",
-                repo.display()
-            );
-        }
+        check_main_checkout(repo)?;
         if let Some(other) = members[..i]
             .iter()
             .find(|o| worktree::same_path(&o.dir, &m.dir))
@@ -326,6 +315,25 @@ pub(crate) fn check_new(members: &[NewMember], source: Option<&str>) -> Result<(
             bail!("{} is given twice on branch '{}'", repo.display(), m.branch);
         }
         worktree::check_add(repo, &m.dir, &m.branch, source).with_context(at)?;
+    }
+    Ok(())
+}
+
+/// Errors unless `repo` is the main checkout of a repository (not a linked
+/// worktree, nor a directory inside one).
+pub(crate) fn check_main_checkout(repo: &Path) -> Result<()> {
+    let at = || repo.display().to_string();
+    if !repo.is_dir() {
+        bail!("{}: no such directory", repo.display());
+    }
+    let main = git::toplevel(repo)
+        .and_then(|top| Ok((top, git::repo_root(repo)?)))
+        .with_context(at)?;
+    if !worktree::same_path(&main.0, repo) || !worktree::same_path(&main.1, repo) {
+        bail!(
+            "{} is not the main checkout of a repository",
+            repo.display()
+        );
     }
     Ok(())
 }

@@ -220,17 +220,23 @@ async fn a_chats_claude_agent() {
     let root = tmp.path().canonicalize().unwrap();
     std::env::set_var("HOME", root.join("home"));
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
-    // A notify command writing what it was given.
+    // A notify command writing what it was given, in the config written
+    // where tam reads it: `$XDG_CONFIG_HOME`, or on macOS `~/Library/
+    // Application Support`.
     let notified = root.join("notified");
-    std::fs::create_dir_all(root.join("config").join("tam")).unwrap();
-    std::fs::write(
-        root.join("config").join("tam").join("config.toml"),
-        format!(
-            "[notify]\ncommand = \"echo {{task}} {{id}} {{kind}} >> '{}'\"\non_states = [\"ready\"]\n",
-            notified.display()
-        ),
-    )
-    .unwrap();
+    let config = format!(
+        "[notify]\ncommand = \"echo {{task}} {{id}} {{kind}} >> '{}'\"\non_states = [\"ready\"]\n",
+        notified.display()
+    );
+    let macos = root
+        .join("home")
+        .join("Library")
+        .join("Application Support");
+    for dir in [root.join("config"), macos] {
+        let dir = dir.join("tam");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), &config).unwrap();
+    }
     let claude_dir = root.join("claude");
     std::env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
     let transcript = claude_dir

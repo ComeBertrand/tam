@@ -426,7 +426,7 @@ finder = "fzf"
 
 [tui]
 theme = "dark"                          # 24-bit palette; "unicorn": brighter, with rainbows; "ansi": the terminal's 16 colours. Default: dark when COLORTERM says truecolor
-animate = true                          # unicorn: the rainbows move (the logo, the selection's bar, the spinners)
+animate = true                          # unicorn: the rainbows move (the logo, the selection's bar, the spinners, the rules, the pane's border)
 
 [[tui.commands]]
 name = "open in editor"

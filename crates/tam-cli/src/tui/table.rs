@@ -127,7 +127,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw(" "),
                 ];
                 if t.rainbow {
-                    spans.extend(theme::rainbow_spans(&"─".repeat(rule), 0, Style::new()));
+                    let tick = app.spin.unwrap_or(0);
+                    spans.extend(theme::rainbow_spans(&"─".repeat(rule), tick, Style::new()));
                 } else {
                     spans.push(Span::styled("─".repeat(rule), Style::new().fg(t.subtle)));
                 }

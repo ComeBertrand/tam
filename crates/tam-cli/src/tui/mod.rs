@@ -11,7 +11,7 @@ mod triage;
 mod ui;
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,7 +33,10 @@ use crate::task::Task;
 use tam_proto::SessionChoice;
 
 use self::answer::{AnswerDialog, Outcome};
-use self::app::{App, Focused, MemberChoice, Mode, Pick, PickerItem, PickerState, TaskDetail};
+use self::app::{
+    App, Focused, MemberChoice, Mode, Pick, PickerItem, PickerState, Purpose, SessionPicker,
+    TaskDetail, NEW_SESSION,
+};
 use self::input::TextInput;
 use self::peek::{Peek, Scroll};
 
@@ -86,7 +89,19 @@ enum Action {
         force: bool,
         delete_branch: bool,
     },
-    NewTask,
+    /// Open the repository picker, for a new task or chat.
+    PickProject(Purpose),
+    /// The sessions a new chat in this repository (its main checkout) can
+    /// start from.
+    ChatHistory {
+        dir: PathBuf,
+    },
+    /// Make a chat in this repository, resuming `session` (else a new
+    /// one), start its agent and type into it.
+    CreateChat {
+        dir: PathBuf,
+        session: Option<String>,
+    },
     RunAgent {
         member: String,
     },
@@ -463,8 +478,8 @@ async fn run_loop(
                     drop_task(client, app, &name, &label, force, delete_branch).await;
                     screen_moved = true;
                 }
-                Action::NewTask => {
-                    start_new_task_flow(app);
+                Action::PickProject(purpose) => {
+                    start_pick_project(app, purpose);
                     if !app.discovering {
                         app.discovering = true;
                         let tx = projects_tx.clone();
@@ -475,6 +490,16 @@ async fn run_loop(
                 }
                 Action::RunAgent { member } => {
                     do_run(client, app, &member, SessionChoice::Current).await?;
+                }
+                Action::ChatHistory { dir } => {
+                    open_chat_history(client, app, dir).await;
+                }
+                Action::CreateChat { dir, session } => {
+                    create_chat(client, app, &dir, session).await;
+                    screen_moved = true;
+                    // As for the enter that gives the pane the keyboard:
+                    // the keys queued behind it are dropped.
+                    break;
                 }
                 Action::DoNewTask { name, dirs } => {
                     do_new_task(client, app, &name, &dirs).await?;
@@ -572,7 +597,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
     match &app.mode {
         Mode::Normal => handle_normal_key(key, app, config),
         Mode::NewTaskEnterName { .. } => handle_new_task_name_key(key, app),
-        Mode::SpawnEnterPath(_) => handle_enter_path_key(key, app),
+        Mode::SpawnEnterPath(..) => handle_enter_path_key(key, app),
         Mode::ConfirmDropTask { .. } => handle_confirm_drop_key(key, app),
         Mode::ConfirmForceDrop { .. } => handle_confirm_force_drop_key(key, app),
         Mode::ConfirmRepairOrDrop { .. } => handle_repair_or_drop_key(key, app),
@@ -580,7 +605,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             app.mode = Mode::Normal;
             Action::None
         }
-        Mode::NewTaskPickProject(_) => handle_picker_key(key, app, config),
+        Mode::PickProject(..) => handle_picker_key(key, app, config),
+        Mode::PickSession(_) => handle_session_key(key, app),
         Mode::Answer(_) => handle_answer_key(key, app),
         Mode::Terminal { .. } => handle_terminal_key(key, app),
         Mode::ConfirmCloseChat { .. } => handle_close_chat_key(key, app),
@@ -596,9 +622,10 @@ fn paste_into_prompt(text: &str, app: &mut App, config: &Config) {
     let prompt = app.filter_active
         || matches!(
             app.mode,
-            Mode::NewTaskPickProject(_)
+            Mode::PickProject(..)
+                | Mode::PickSession(_)
                 | Mode::NewTaskEnterName { .. }
-                | Mode::SpawnEnterPath(_)
+                | Mode::SpawnEnterPath(..)
                 | Mode::RenameChat { .. }
         );
     if !prompt {
@@ -678,7 +705,8 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             app.filter_active = true;
             Action::None
         }
-        (KeyCode::Char('n'), _) => Action::NewTask,
+        (KeyCode::Char('n'), _) => Action::PickProject(Purpose::Task),
+        (KeyCode::Char('c'), _) => Action::PickProject(Purpose::Chat),
         // A chat is its session: enter resumes it.
         (KeyCode::Char('r' | 'R'), _) if chat.as_ref().is_some_and(|(_, running)| !running) => {
             app.set_status(
@@ -905,7 +933,11 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             picker_mut(app, PickerState::select_prev)
         }
         KeyCode::Enter => return handle_picker_enter(app, config),
-        KeyCode::Tab => picker_mut(app, PickerState::toggle_mark),
+        // Several repositories make one task; a chat is in one.
+        KeyCode::Tab if matches!(app.mode, Mode::PickProject(_, Purpose::Task)) => {
+            picker_mut(app, PickerState::toggle_mark)
+        }
+        KeyCode::Tab => {}
         _ => picker_mut(app, |p| {
             p.edit(key);
         }),
@@ -935,9 +967,10 @@ fn handle_new_task_name_key(key: KeyEvent, app: &mut App) -> Action {
 }
 
 fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
-    let Mode::SpawnEnterPath(input) = &mut app.mode else {
+    let Mode::SpawnEnterPath(input, purpose) = &mut app.mode else {
         return Action::None;
     };
+    let purpose = *purpose;
     match key.code {
         KeyCode::Esc => app.mode = Mode::Normal,
         KeyCode::Enter => {
@@ -948,14 +981,15 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
                 app.set_status(format!("Not a directory: {path}"), Duration::from_secs(3));
                 return Action::None;
             }
-            match repository(&dir) {
-                Ok(root) => {
+            match (repository(&dir), purpose) {
+                (Ok(root), Purpose::Task) => {
                     app.mode = Mode::NewTaskEnterName {
                         project_dirs: vec![root],
                         name: TextInput::default(),
                     }
                 }
-                Err(e) => app.set_status(e, Duration::from_secs(5)),
+                (Ok(root), Purpose::Chat) => return Action::ChatHistory { dir: root },
+                (Err(e), _) => app.set_status(e, Duration::from_secs(5)),
             }
         }
         _ => {
@@ -990,7 +1024,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
             app.mode = Mode::Normal;
             return Action::None;
         }
-        Mode::NewTaskPickProject(picker) => {
+        Mode::PickProject(picker, _) | Mode::PickSession(SessionPicker { picker, .. }) => {
             match (mouse.kind, app.hits.picker) {
                 (MouseEventKind::ScrollDown, _) => picker.select_next(),
                 (MouseEventKind::ScrollUp, _) => picker.select_prev(),
@@ -1200,17 +1234,60 @@ fn handle_answer_key(key: KeyEvent, app: &mut App) -> Action {
     }
 }
 
+/// Apply `f` to the open picker (the repositories', or a new chat's
+/// sessions).
 fn picker_mut(app: &mut App, f: impl FnOnce(&mut PickerState)) {
-    if let Mode::NewTaskPickProject(p) = &mut app.mode {
+    if let Mode::PickProject(p, _) | Mode::PickSession(SessionPicker { picker: p, .. }) =
+        &mut app.mode
+    {
         f(p)
     }
+}
+
+/// The sessions a new chat can start from: enter starts it (a new session
+/// for the first item, else resuming the one picked), esc cancels; the
+/// filter and moves as in the repository picker (tab picks nothing).
+fn handle_session_key(key: KeyEvent, app: &mut App) -> Action {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Down => picker_mut(app, PickerState::select_next),
+        KeyCode::Up => picker_mut(app, PickerState::select_prev),
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            picker_mut(app, PickerState::select_next)
+        }
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            picker_mut(app, PickerState::select_prev)
+        }
+        KeyCode::Tab => {}
+        KeyCode::Enter => {
+            let Mode::PickSession(sessions) = &app.mode else {
+                return Action::None;
+            };
+            let Some(id) = sessions.picker.selected_item().map(|i| i.id.clone()) else {
+                return Action::None;
+            };
+            let Mode::PickSession(sessions) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+                unreachable!("picking a session");
+            };
+            return Action::CreateChat {
+                dir: sessions.dir,
+                session: (id != NEW_SESSION).then_some(id),
+            };
+        }
+        _ => picker_mut(app, |p| {
+            p.edit(key);
+        }),
+    }
+    Action::None
 }
 
 // ---------------------------------------------------------------------------
 // New task flow
 // ---------------------------------------------------------------------------
 
-fn start_new_task_flow(app: &mut App) {
+/// Open the repository picker at once (the projects found last time, while
+/// they are looked for again), for a new task or chat.
+fn start_pick_project(app: &mut App, purpose: Purpose) {
     let cwd_display = std::env::current_dir()
         .ok()
         .map(|p| ui::shorten_home(&p.display().to_string()))
@@ -1228,9 +1305,13 @@ fn start_new_task_flow(app: &mut App) {
     ];
     // Those found last time, while they are looked for again.
     items.extend(app.projects.iter().flatten().cloned());
-    let mut picker = PickerState::new("Pick project", items);
+    let title = match purpose {
+        Purpose::Task => "Pick project",
+        Purpose::Chat => "New chat · pick a repository",
+    };
+    let mut picker = PickerState::new(title, items);
     picker.loading = true;
-    app.mode = Mode::NewTaskPickProject(picker);
+    app.mode = Mode::PickProject(picker, purpose);
 }
 
 /// The projects under `$HOME` (`tam ls`'s discovery): it walks the
@@ -1258,10 +1339,12 @@ fn discover_projects() -> Vec<PickerItem> {
 /// Enter in the project picker: the projects picked with tab, else the
 /// highlighted one (or the path entry).
 fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
-    let Mode::NewTaskPickProject(picker) = &app.mode else {
+    let Mode::PickProject(picker, purpose) = &app.mode else {
         return Action::None;
     };
-    let ids = if picker.marked.is_empty() {
+    let purpose = *purpose;
+    // A chat: the highlighted repository.
+    let ids = if picker.marked.is_empty() || purpose == Purpose::Chat {
         match picker.selected_item() {
             Some(item) => vec![item.id.clone()],
             None => return Action::None,
@@ -1271,7 +1354,7 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
     };
     app.mode = Mode::Normal;
     if ids == ["__enter_path__"] {
-        app.mode = Mode::SpawnEnterPath(TextInput::default());
+        app.mode = Mode::SpawnEnterPath(TextInput::default(), purpose);
         return Action::None;
     }
 
@@ -1291,6 +1374,12 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
                 return Action::None;
             }
         }
+    }
+    if purpose == Purpose::Chat {
+        return match roots.pop() {
+            Some(dir) => Action::ChatHistory { dir },
+            None => Action::None,
+        };
     }
     app.mode = Mode::NewTaskEnterName {
         project_dirs: roots,
@@ -1524,7 +1613,7 @@ async fn resume_chat(client: &mut Client, app: &mut App, id: &str, label: &str) 
             let lines = match chats::session_gone(&e) {
                 Some(why) => vec![
                     format!("{why}."),
-                    "A chat is its session: d closes this one.".into(),
+                    "A chat is its session: d closes this one, c starts another.".into(),
                 ],
                 None => format!("{e:#}").lines().map(str::to_string).collect(),
             };
@@ -1537,10 +1626,77 @@ async fn resume_chat(client: &mut Client, app: &mut App, id: &str, label: &str) 
     }
 }
 
+/// The sessions a new chat in the repository `dir` (a main checkout) can
+/// start from, to pick from (a notice when the daemon cannot list them).
+async fn open_chat_history(client: &mut Client, app: &mut App, dir: PathBuf) {
+    match client.chat_history(&dir).await {
+        Ok(sessions) => app.mode = Mode::PickSession(SessionPicker::new(dir, sessions)),
+        Err(e) => {
+            app.mode = Mode::Notice {
+                title: "No Chat".into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
+        }
+    }
+}
+
+/// Make a chat in the repository `dir`, resuming `session` (else a new
+/// one), start its agent and give it the keyboard (see `App::starting`).
+/// A chat whose agent cannot start is closed again: it never ran, and it
+/// would hold the session. Shown without the filter when it would hide it.
+async fn create_chat(client: &mut Client, app: &mut App, dir: &Path, session: Option<String>) {
+    let failed = |app: &mut App, e: anyhow::Error| {
+        app.mode = Mode::Notice {
+            title: "Create Failed".into(),
+            lines: format!("{e:#}").lines().map(str::to_string).collect(),
+        };
+    };
+    let chat = match client.create_chat(dir, None, session.as_deref()).await {
+        Ok(chat) => chat,
+        Err(e) => return failed(app, e),
+    };
+    let id = chat.id.clone();
+    app.upsert_chat(chat);
+    let pick = Pick::Chat(id.clone());
+    if !app.visible_entries().iter().any(|e| e.pick() == pick) {
+        app.filter.clear();
+        app.filter_active = false;
+    }
+    app.select(&pick);
+    match client
+        .run_agent(&id, SessionChoice::Current, None, vec![])
+        .await
+    {
+        Ok(_) => {
+            app.mode = Mode::Terminal { agent: id.clone() };
+            app.starting = Some(id);
+            let what = match &session {
+                Some(_) => "Resumed a session in a new chat",
+                None => "Started a new chat",
+            };
+            app.set_status(format!("{what}: typing into it"), Duration::from_secs(3));
+        }
+        Err(e) => {
+            let closed = match client.close_chat(&id).await {
+                Ok(_) => "the chat is closed again".to_string(),
+                Err(close) => format!("closing the chat failed too: {close:#}"),
+            };
+            app.remove_chat(&id);
+            failed(
+                app,
+                e.context(format!("its agent did not start ({closed})")),
+            );
+        }
+    }
+}
+
 /// Close a chat (the daemon stops its agent); the list follows its events.
 async fn close_chat(client: &mut Client, app: &mut App, id: &str, label: &str) {
     match client.close_chat(id).await {
-        Ok(_) => app.set_status(format!("Closed '{label}'"), Duration::from_secs(4)),
+        Ok(_) => app.set_status(
+            format!("Closed '{label}': c makes it again from its repository's history"),
+            Duration::from_secs(5),
+        ),
         Err(e) => {
             app.mode = Mode::Notice {
                 title: "Close Failed".into(),
@@ -3174,6 +3330,190 @@ mod tests {
     }
 
     #[test]
+    fn c_picks_a_repository_then_what_the_chat_starts_from() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = tam_worktree::git::command()
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let (api, web) = (tmp.path().join("api"), tmp.path().join("web"));
+        for repo in [&api, &web] {
+            std::fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "i",
+                ],
+            );
+        }
+        let web_wt = tmp.path().join("web--x");
+        git(
+            &web,
+            &["worktree", "add", "-q", "-b", "x", web_wt.to_str().unwrap()],
+        );
+        let config = Config::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = chat_app();
+
+        assert!(matches!(
+            handle_key_event(press('c'), &mut app, &config),
+            Action::PickProject(Purpose::Chat)
+        ));
+        start_pick_project(&mut app, Purpose::Chat);
+        let Mode::PickProject(picker, Purpose::Chat) = &mut app.mode else {
+            panic!("not picking");
+        };
+        assert_eq!(picker.title, "New chat · pick a repository");
+        let item = |display: &str, id: &std::path::Path| PickerItem {
+            display: display.into(),
+            id: id.to_str().unwrap().into(),
+        };
+        picker.set_items(vec![
+            PickerItem {
+                display: "enter path...".into(),
+                id: "__enter_path__".into(),
+            },
+            item("api", &api),
+            item("web", &web),
+            item("x @web", &web_wt),
+        ]);
+        // One repository: tab picks nothing; a worktree stands for its
+        // repository's main checkout.
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        handle_key_event(key(KeyCode::Tab), &mut app, &config);
+        let Mode::PickProject(picker, _) = &app.mode else {
+            panic!("still picking");
+        };
+        assert!(picker.marked.is_empty());
+        assert_eq!(picker.selected, 1, "tab did not move");
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        let web_root = std::fs::canonicalize(&web).unwrap();
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::ChatHistory { dir } if dir == web_root
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // Or a path typed (the picker's second item).
+        start_pick_project(&mut app, Purpose::Chat);
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        handle_key_event(key(KeyCode::Enter), &mut app, &config);
+        assert!(matches!(app.mode, Mode::SpawnEnterPath(_, Purpose::Chat)));
+        paste_into_prompt(api.to_str().unwrap(), &mut app, &config);
+        let api_root = std::fs::canonicalize(&api).unwrap();
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::ChatHistory { dir } if dir == api_root
+        ));
+
+        // The daemon's history of the repository (newest first, those a
+        // chat holds already left out): a new chat first, then each.
+        let session =
+            |id: &str, title: Option<&str>, prompt: &str, ago: u64| tam_proto::SessionInfo {
+                id: id.into(),
+                title: title.map(str::to_string),
+                last_prompt: Some(prompt.into()),
+                modified_at: task::now() - ago,
+            };
+        let open = |app: &mut App| {
+            app.mode = Mode::PickSession(SessionPicker::new(
+                web_root.clone(),
+                vec![
+                    session("s-1", Some("Release deployment"), "deploy 26.8.4", 7200),
+                    session("s-2", None, "why is build 1234 slow", 9 * 86400),
+                ],
+            ));
+        };
+        open(&mut app);
+        let Mode::PickSession(sessions) = &app.mode else {
+            panic!("no sessions");
+        };
+        let ids: Vec<&str> = sessions
+            .picker
+            .filtered_items()
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(ids, [NEW_SESSION, "s-1", "s-2"]);
+        assert_eq!(sessions.picker.title, "New chat in web");
+        // Enter on the first: a new session.
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::CreateChat { dir, session: None } if dir == web_root
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        // Down to one: that session; tab picks nothing.
+        open(&mut app);
+        handle_key_event(key(KeyCode::Tab), &mut app, &config);
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::CreateChat { session: Some(s), .. } if s == "s-2"
+        ));
+        // The filter matches titles and prompts: what it leaves is what
+        // enter takes, never a new chat it does not match.
+        open(&mut app);
+        for c in "deploy".chars() {
+            handle_key_event(press(c), &mut app, &config);
+        }
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::CreateChat { session: Some(s), .. } if s == "s-1"
+        ));
+        open(&mut app);
+        paste_into_prompt("1234", &mut app, &config);
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::CreateChat { session: Some(s), .. } if s == "s-2"
+        ));
+        open(&mut app);
+        for c in "new".chars() {
+            handle_key_event(press(c), &mut app, &config);
+        }
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::CreateChat { session: None, .. }
+        ));
+        // Nothing matches: enter does nothing; esc closes.
+        open(&mut app);
+        for c in "zzz".chars() {
+            handle_key_event(press(c), &mut app, &config);
+        }
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::None
+        ));
+        handle_key_event(key(KeyCode::Esc), &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // A custom command on `c` keeps it.
+        app.commands = vec![CustomCommand {
+            name: "code".into(),
+            key: "c".into(),
+            command: "true".into(),
+        }];
+        assert!(matches!(
+            handle_key_event(press('c'), &mut app, &config),
+            Action::CustomCommand { name, .. } if name == "code"
+        ));
+    }
+
+    #[test]
     fn tab_picks_several_projects_in_order() {
         let tmp = tempfile::TempDir::new().unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
@@ -3223,13 +3563,13 @@ mod tests {
             ],
         );
         let mut app = App::new();
-        app.mode = Mode::NewTaskPickProject(picker);
+        app.mode = Mode::PickProject(picker, Purpose::Task);
         let config = Config::default();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
         // The path entry is an action, not a project: tab skips it.
         handle_picker_key(key(KeyCode::Tab), &mut app, &config);
-        let Mode::NewTaskPickProject(p) = &app.mode else {
+        let Mode::PickProject(p, _) = &app.mode else {
             panic!("still picking");
         };
         assert!(p.marked.is_empty());
@@ -3244,7 +3584,7 @@ mod tests {
         keys(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Tab]);
         // Tab again unpicks.
         keys(&mut app, &[KeyCode::Up, KeyCode::Tab]);
-        let Mode::NewTaskPickProject(p) = &app.mode else {
+        let Mode::PickProject(p, _) = &app.mode else {
             panic!("still picking");
         };
         assert_eq!(p.marked, [web.to_str().unwrap()]);
@@ -3555,8 +3895,8 @@ mod tests {
             id: format!("/src/{name}"),
         };
         let mut app = App::new();
-        start_new_task_flow(&mut app);
-        let Mode::NewTaskPickProject(picker) = &mut app.mode else {
+        start_pick_project(&mut app, Purpose::Task);
+        let Mode::PickProject(picker, Purpose::Task) = &mut app.mode else {
             panic!("the picker opens without waiting");
         };
         assert!(picker.loading);
@@ -3564,7 +3904,7 @@ mod tests {
         // Highlight the path entry and pick nothing yet; the projects come.
         picker.select_next();
         app.set_projects(vec![item("api"), item("web")]);
-        let Mode::NewTaskPickProject(picker) = &mut app.mode else {
+        let Mode::PickProject(picker, Purpose::Task) = &mut app.mode else {
             panic!("still picking");
         };
         assert!(!picker.loading);
@@ -3585,7 +3925,7 @@ mod tests {
             &mut app,
         );
         handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), &mut app);
-        let Mode::NewTaskPickProject(picker) = &app.mode else {
+        let Mode::PickProject(picker, Purpose::Task) = &app.mode else {
             panic!("still picking");
         };
         assert_eq!(picker.selected_item().unwrap().id, "/src/api");
@@ -3594,8 +3934,8 @@ mod tests {
         // the picker closed, they are kept for it.
         app.mode = Mode::Normal;
         app.set_projects(vec![item("docs")]);
-        start_new_task_flow(&mut app);
-        let Mode::NewTaskPickProject(picker) = &app.mode else {
+        start_pick_project(&mut app, Purpose::Task);
+        let Mode::PickProject(picker, Purpose::Task) = &app.mode else {
             panic!("picking");
         };
         assert_eq!(picker.items.last().unwrap().id, "/src/docs");

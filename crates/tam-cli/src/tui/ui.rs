@@ -10,7 +10,9 @@ use tam_proto::{AgentDetail, AgentState};
 use crate::chat::{time_left, Closes};
 use crate::task::TaskStatus;
 
-use super::app::{App, Focused, MemberChoice, Mode, Order, PickerState};
+use super::app::{
+    App, Focused, MemberChoice, Mode, Order, PickerState, Purpose, SessionPicker, NEW_SESSION,
+};
 use super::input::TextInput;
 use super::peek::{Peek, ScreenView};
 use super::{answer, fuzzy, table, theme, triage};
@@ -58,7 +60,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         frame.buffer_mut().set_style(header_area.union(body), dim);
     }
     app.hits.picker = match &mut app.mode {
-        Mode::NewTaskPickProject(picker) => Some(render_picker_popup(frame, picker)),
+        Mode::PickProject(picker, _) => Some(render_picker_popup(frame, picker)),
+        Mode::PickSession(sessions) => Some(render_session_popup(frame, sessions)),
         _ => None,
     };
     let stale = app.answer_stale();
@@ -66,7 +69,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         answer::render(frame, dialog, stale);
     }
     match &app.mode {
-        Mode::Normal | Mode::Terminal { .. } | Mode::NewTaskPickProject(_) | Mode::Answer(_) => {}
+        Mode::Normal
+        | Mode::Terminal { .. }
+        | Mode::PickProject(..)
+        | Mode::PickSession(_)
+        | Mode::Answer(_) => {}
         Mode::Help => render_help_popup(frame, app),
         Mode::ConfirmCloseChat { label, .. } => render_close_chat_popup(frame, label),
         Mode::RenameChat { name, title, .. } => {
@@ -76,7 +83,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             let joins = app.tasks.iter().any(|t| t.name == name.value());
             render_new_task_popup(frame, name, project_dirs, joins);
         }
-        Mode::SpawnEnterPath(path) => {
+        Mode::SpawnEnterPath(path, _) => {
             render_enter_path_popup(frame, path);
         }
         Mode::ConfirmDropTask { name, member } => {
@@ -243,11 +250,17 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled("esc", Style::new().bold()),
                 Span::raw(":cancel"),
             ],
-            Mode::NewTaskPickProject(_) => vec![
+            Mode::PickProject(_, Purpose::Task) => vec![
                 Span::styled(" enter", Style::new().bold()),
                 Span::raw(":select  "),
                 Span::styled("tab", Style::new().bold()),
                 Span::raw(":pick several  "),
+                Span::styled("esc", Style::new().bold()),
+                Span::raw(":cancel"),
+            ],
+            Mode::PickSession(_) => vec![
+                Span::styled(" enter", Style::new().bold()),
+                Span::raw(":start the chat  "),
                 Span::styled("esc", Style::new().bold()),
                 Span::raw(":cancel"),
             ],
@@ -423,7 +436,10 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         let drop = if gone { "recreate/drop" } else { "drop" };
         hints.push(("d", drop.into(), 1));
     }
-    hints.push(("n", "new".into(), 2));
+    hints.push(("n", "new task".into(), 2));
+    if free('c') {
+        hints.push(("c", "new chat".into(), 2));
+    }
     hints.push(("/", "filter".into(), 3));
     let order = match app.order {
         Order::Repo => "attention first",
@@ -780,6 +796,139 @@ fn render_picker_popup(frame: &mut Frame, picker: &mut PickerState) -> (Rect, us
     (list_area, offset)
 }
 
+/// What a new chat starts from: `+ new chat`, then the repository's
+/// sessions, newest first: title, last prompt (dim), age. Returns where
+/// its items are and the first one shown (for the mouse).
+fn render_session_popup(frame: &mut Frame, sessions: &mut SessionPicker) -> (Rect, usize) {
+    let t = theme::get();
+    let area = frame
+        .area()
+        .centered(Constraint::Percentage(70), Constraint::Percentage(60));
+    frame.render_widget(Clear, area);
+    let SessionPicker {
+        picker,
+        sessions: list,
+        ..
+    } = sessions;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(t.popup())
+        .border_style(Style::new().fg(t.accent))
+        .title(format!(" {} ", picker.title))
+        .title_style(Style::new().bold().fg(t.accent))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [filter_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let [prompt, text] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(filter_area);
+    frame.render_widget(Span::styled("> ", Style::new().fg(t.accent)), prompt);
+    picker.filter.render(frame, text, Style::new(), true);
+
+    let filtered = picker.filtered();
+    let height = list_area.height as usize;
+    let mut offset = picker.offset.min(filtered.len().saturating_sub(height));
+    if picker.selected < offset {
+        offset = picker.selected;
+    } else if height > 0 && picker.selected >= offset + height {
+        offset = picker.selected + 1 - height;
+    }
+    let width = list_area.width as usize;
+    let fit_cell = |line, width: usize| table::ellipsize(line, width as u16);
+    // Titles in a column of their own (at most half the width), the age
+    // at the right edge.
+    const AGE: usize = 4;
+    let title_width = list
+        .iter()
+        .filter_map(|s| s.title.as_deref())
+        .map(|title| Span::raw(title).width())
+        .max()
+        .unwrap_or(0)
+        .min(width / 2);
+    let matched = Style::new().fg(t.accent).bold();
+    let dim = Style::new().fg(t.muted);
+    let now = crate::task::now();
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .map(|(i, (item, positions))| {
+            let style = if i == picker.selected {
+                t.selection
+            } else {
+                Style::new()
+            };
+            let session = list
+                .iter()
+                .find(|s| s.id == item.id)
+                .filter(|_| item.id != NEW_SESSION);
+            let Some(session) = session else {
+                return ListItem::new(fuzzy::highlight(
+                    &item.display,
+                    positions,
+                    Style::new().fg(t.accent),
+                    matched,
+                ))
+                .style(style);
+            };
+            // The display is the title, then the prompt: the matched
+            // characters of each, highlighted where each is drawn.
+            let title_chars = session
+                .title
+                .as_deref()
+                .map_or(0, |title| title.chars().count());
+            let gap = SessionPicker::TITLE_GAP.chars().count();
+            let in_title: Vec<usize> = positions
+                .iter()
+                .copied()
+                .filter(|&p| session.title.is_none() || p < title_chars)
+                .collect();
+            let in_prompt: Vec<usize> = positions
+                .iter()
+                .filter(|&&p| p >= title_chars + gap)
+                .map(|p| p - title_chars - gap)
+                .collect();
+            let age = Span::styled(
+                format!(
+                    "{:>AGE$}",
+                    triage::age(now.saturating_sub(session.modified_at))
+                ),
+                dim,
+            );
+            let mut line = match (&session.title, &session.last_prompt) {
+                (Some(title), prompt) => {
+                    let title = fuzzy::highlight(title, &in_title, Style::new(), matched);
+                    let title = fit_cell(title, title_width);
+                    let pad = title_width.saturating_sub(title.width());
+                    let mut spans = title.spans;
+                    spans.push(Span::raw(" ".repeat(pad + 2)));
+                    let room = width.saturating_sub(title_width + 2 + 1 + AGE);
+                    if let Some(prompt) = prompt {
+                        let prompt =
+                            fuzzy::highlight(&triage::one_line(prompt), &in_prompt, dim, matched);
+                        spans.extend(fit_cell(prompt, room).spans);
+                    }
+                    Line::from(spans)
+                }
+                (None, _) => {
+                    let text = fuzzy::highlight(&item.display, &in_title, Style::new(), matched);
+                    fit_cell(text, width.saturating_sub(1 + AGE))
+                }
+            };
+            let pad = width.saturating_sub(line.width() + AGE);
+            line.spans.push(Span::raw(" ".repeat(pad)));
+            line.spans.push(age);
+            ListItem::new(line).style(style)
+        })
+        .collect();
+    frame.render_widget(List::new(items), list_area);
+    picker.offset = offset;
+    (list_area, offset)
+}
+
 /// The repositories of `dirs`, as the popup names them.
 fn repo_names(dirs: &[std::path::PathBuf]) -> String {
     let names: Vec<String> = dirs
@@ -1011,7 +1160,10 @@ fn item_help(app: &App) -> Vec<(String, String)> {
             Some(_) => (format!("({key})"), format!("{what}: taken")),
         });
     }
-    keys.push(entry("n", "new task"));
+    match app.key_taken('c') {
+        None => keys.push(entry("n/c", "new task / chat")),
+        Some(_) => keys.extend([entry("n", "new task"), entry("(c)", "new chat: taken")]),
+    }
     keys
 }
 
@@ -2080,7 +2232,7 @@ mod tests {
             PickerState::new("Pick project", vec![item("api"), item("web"), item("docs")]);
         picker.marked = vec!["/src/web".into(), "/src/api".into()];
         let mut app = App::new();
-        app.mode = Mode::NewTaskPickProject(picker);
+        app.mode = Mode::PickProject(picker, Purpose::Task);
         let s = screen(&mut app, 80, 24);
         if std::env::var_os("TAM_SHOW_SCREEN").is_some() {
             println!("{s}");
@@ -2877,6 +3029,71 @@ mod tests {
     }
 
     #[test]
+    fn the_sessions_a_new_chat_can_start_from() {
+        let session = |id: &str, title: Option<&str>, prompt: Option<&str>, ago: u64| {
+            tam_proto::SessionInfo {
+                id: id.into(),
+                title: title.map(str::to_string),
+                last_prompt: prompt.map(str::to_string),
+                modified_at: crate::task::now() - ago,
+            }
+        };
+        let mut app = chat_dashboard();
+        app.mode = Mode::PickSession(SessionPicker::new(
+            "/src/backend".into(),
+            vec![
+                session(
+                    "s-1",
+                    Some("Release deployment on staging"),
+                    Some("deploy 26.8.4 on staging-qr"),
+                    2 * 3600,
+                ),
+                session(
+                    "s-2",
+                    Some("Rounding in allotments"),
+                    Some("ok, now write the test"),
+                    3 * 86400,
+                ),
+                session("s-3", None, Some("why is build 1234 slow"), 9 * 86400),
+            ],
+        ));
+        let (s, cursor) = screen_and_cursor(&mut app, 100, 30);
+        show("sessions", &s);
+        assert!(s.contains("New chat in backend"), "{s}");
+        assert!(cursor.is_some(), "the filter's cursor");
+        let at = |text: &str| s.lines().position(|l| l.contains(text)).unwrap();
+        // A new chat first, then the sessions as the daemon listed them.
+        assert!(at("│ + new chat") < at("deploy 26.8.4"), "{s}");
+        assert!(at("deploy 26.8.4") < at("write the test"), "{s}");
+        assert!(at("write the test") < at("build 1234"), "{s}");
+        // Title, last prompt, age.
+        let release = s.lines().nth(at("deploy 26.8.4")).unwrap();
+        assert!(
+            release.contains("Release deployment on staging  deploy 26.8.4 on staging-qr"),
+            "{s}"
+        );
+        assert!(release.contains("on staging-qr      2h │"), "{s}");
+        // Without a title: its last prompt in the title's place.
+        let slow = s.lines().find(|l| l.contains("why is build 1234")).unwrap();
+        assert!(
+            slow.contains("│ why is build 1234 slow ") && slow.contains("9d │"),
+            "{s}"
+        );
+        assert!(s.contains("enter:start the chat"), "{s}");
+        // Filtered: the matched letters of the prompt highlighted.
+        if let Mode::PickSession(sessions) = &mut app.mode {
+            sessions.picker.filter = TextInput::from("qr");
+        }
+        let qr = cells_of(&mut app, 100, 30, "staging-qr");
+        assert_eq!(qr[8].1, theme::get().accent, "{qr:?}");
+        let s = screen(&mut app, 100, 30);
+        assert!(!s.contains("+ new chat") && !s.contains("Rounding"), "{s}");
+        // Narrow: cut, not garbled.
+        let s = screen(&mut app, 40, 12);
+        show("sessions 40x12", &s);
+    }
+
+    #[test]
     fn the_chat_dialogs() {
         let mut app = chat_dashboard();
         app.mode = Mode::ConfirmCloseChat {
@@ -3032,7 +3249,7 @@ mod tests {
         );
         picker.filter = TextInput::from("tw");
         picker.loading = true;
-        app.mode = Mode::NewTaskPickProject(picker);
+        app.mode = Mode::PickProject(picker, Purpose::Task);
         let (s, cursor) = screen_and_cursor(&mut app, 80, 24);
         show("picker tw", &s);
         assert!(s.contains("looking for projects…"), "{s}");
@@ -3053,7 +3270,7 @@ mod tests {
         let mut picker = PickerState::new("Pick project", items);
         picker.selected = 30;
         let mut app = App::new();
-        app.mode = Mode::NewTaskPickProject(picker);
+        app.mode = Mode::PickProject(picker, Purpose::Task);
         let s = screen(&mut app, 80, 24);
         assert!(s.contains("project-30"), "{s}");
         assert!(!s.contains("project-00"), "{s}");
@@ -3075,15 +3292,34 @@ mod tests {
                 Mode::Terminal {
                     agent: "m-5".into(),
                 },
-                Mode::NewTaskPickProject(PickerState::new(
-                    "Pick project",
-                    vec![item("api"), item("web")],
-                )),
+                Mode::PickProject(
+                    PickerState::new("Pick project", vec![item("api"), item("web")]),
+                    Purpose::Task,
+                ),
                 Mode::NewTaskEnterName {
                     project_dirs: vec!["/src/api".into()],
                     name: TextInput::from("a-rather-long-task-name-for-a-narrow-popup"),
                 },
-                Mode::SpawnEnterPath(TextInput::from("~/src")),
+                Mode::SpawnEnterPath(TextInput::from("~/src"), Purpose::Task),
+                Mode::PickSession(SessionPicker::new(
+                    "/src/api".into(),
+                    vec![tam_proto::SessionInfo {
+                        id: "s-1".into(),
+                        title: Some("A title long enough to be cut somewhere".into()),
+                        last_prompt: Some("and a prompt that is longer still, to cut".into()),
+                        modified_at: 0,
+                    }],
+                )),
+                Mode::ConfirmCloseChat {
+                    id: "c-1".into(),
+                    label: "a chat".into(),
+                },
+                Mode::RenameChat {
+                    id: "c-1".into(),
+                    label: "a chat".into(),
+                    title: Some("a chat".into()),
+                    name: TextInput::from("a rather long name for a chat, longer than its popup"),
+                },
                 Mode::ConfirmDropTask {
                     name: "unit-pricing".into(),
                     member: Some(MemberChoice {

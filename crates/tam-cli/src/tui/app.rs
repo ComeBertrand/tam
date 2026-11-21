@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 
-use tam_proto::{AgentInfo, ChatInfo, MessageInfo, RunInfo, TaskInfo};
+use tam_proto::{AgentInfo, ChatInfo, MessageInfo, RunInfo, SessionInfo, TaskInfo};
 
 use crate::chat::Chat;
 use crate::config::CustomCommand;
@@ -20,14 +20,20 @@ use super::peek::Peek;
 
 pub enum Mode {
     Normal,
-    NewTaskPickProject(PickerState),
+    /// The repositories of a new task (several with tab), or the one of a
+    /// new chat.
+    PickProject(PickerState, Purpose),
     /// The task's name, for worktrees in these repositories (main
     /// checkouts). The name of an existing task adds them to it.
     NewTaskEnterName {
         project_dirs: Vec<PathBuf>,
         name: TextInput,
     },
-    SpawnEnterPath(TextInput),
+    /// A repository's path, for a new task or chat.
+    SpawnEnterPath(TextInput, Purpose),
+    /// What a new chat starts from: a new session, or one of its
+    /// repository's.
+    PickSession(SessionPicker),
     ConfirmDropTask {
         name: String,
         /// The focused member, when the task has others: it can be dropped
@@ -83,6 +89,60 @@ pub enum Mode {
         title: Option<String>,
         name: TextInput,
     },
+}
+
+/// What the repository picker picks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// A new task: one repository or several (tab).
+    Task,
+    /// A new chat: one repository.
+    Chat,
+}
+
+/// The id of the session list's first item: a new session.
+pub const NEW_SESSION: &str = "__new__";
+
+/// What a new chat in the repository whose main checkout is `dir` starts
+/// from: a new session (the first item), or one of `sessions` (the
+/// repository's, newest first, those a chat holds left out: the daemon's
+/// `ChatHistory`), picked with the picker's filter.
+pub struct SessionPicker {
+    pub dir: PathBuf,
+    pub sessions: Vec<SessionInfo>,
+    /// Its items' ids: [`NEW_SESSION`], then the sessions' ids; their
+    /// display (what the filter matches) is the title, then the last
+    /// prompt (see [`SessionPicker::TITLE_GAP`]).
+    pub picker: PickerState,
+}
+
+impl SessionPicker {
+    /// Between a session's title and its last prompt in an item's display.
+    pub const TITLE_GAP: &str = "  ";
+
+    pub fn new(dir: PathBuf, sessions: Vec<SessionInfo>) -> Self {
+        let repo = dir.file_name().map_or_else(
+            || dir.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let mut items = vec![PickerItem {
+            display: "+ new chat".into(),
+            id: NEW_SESSION.into(),
+        }];
+        items.extend(sessions.iter().map(|s| PickerItem {
+            display: match (&s.title, &s.last_prompt) {
+                (Some(title), Some(prompt)) => format!("{title}{}{prompt}", Self::TITLE_GAP),
+                (Some(text), None) | (None, Some(text)) => text.clone(),
+                (None, None) => s.id.clone(),
+            },
+            id: s.id.clone(),
+        }));
+        Self {
+            picker: PickerState::new(format!("New chat in {repo}"), items),
+            dir,
+            sessions,
+        }
+    }
 }
 
 /// How the task list is ordered.
@@ -603,7 +663,7 @@ impl App {
     /// if it is open.
     pub fn set_projects(&mut self, projects: Vec<PickerItem>) {
         self.discovering = false;
-        if let Mode::NewTaskPickProject(picker) = &mut self.mode {
+        if let Mode::PickProject(picker, _) = &mut self.mode {
             let mut items: Vec<PickerItem> = picker
                 .items
                 .iter()
@@ -630,6 +690,18 @@ impl App {
         };
         if let Some(task) = self.selected_task().map(|t| t.name.clone()) {
             self.focus = Some(Focus { task, member });
+        }
+    }
+
+    /// Select an entry (if visible).
+    pub fn select(&mut self, pick: &Pick) {
+        if let Some(pos) = self
+            .visible_entries()
+            .iter()
+            .position(|e| e.pick() == *pick)
+        {
+            self.selected = pos;
+            self.sync_focus();
         }
     }
 

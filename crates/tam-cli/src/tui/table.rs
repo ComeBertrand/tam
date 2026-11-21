@@ -549,7 +549,7 @@ fn agent_note(agent: &AgentInfo) -> Line<'static> {
 }
 
 /// `line` cut to `width` columns, ending with `…` when cut.
-fn ellipsize(line: Line<'static>, width: u16) -> Line<'static> {
+pub(super) fn ellipsize(line: Line<'static>, width: u16) -> Line<'static> {
     let width = width as usize;
     if line.width() <= width {
         return line;

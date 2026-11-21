@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 
 use crate::agent::Agent;
 use crate::answer::{self, Delivery};
+use crate::autoclean;
 use crate::inbox::{self, Handover, Inbox, ReplyOutcome};
 use crate::ledger::{ChatSession, Ledger, Owner};
 use crate::notify::{self, Notification, NotifyConfig};
@@ -30,6 +31,8 @@ pub struct Daemon {
     ledger_path: PathBuf,
     reconcile_every: Duration,
     chat_sessions_every: Duration,
+    autoclean: autoclean::Source,
+    autoclean_every: Duration,
 }
 
 struct DaemonState {
@@ -88,6 +91,8 @@ impl Daemon {
             ledger_path,
             reconcile_every: RECONCILE_INTERVAL,
             chat_sessions_every: CHAT_SESSION_INTERVAL,
+            autoclean: autoclean::Source::default(),
+            autoclean_every: autoclean::INTERVAL,
         }
     }
 
@@ -102,6 +107,23 @@ impl Daemon {
     /// [`RECONCILE_INTERVAL`] (and on start).
     pub fn reconcile_every(mut self, interval: Duration) -> Self {
         self.reconcile_every = interval;
+        self
+    }
+
+    /// Look for chats past their time every `interval` instead of
+    /// [`autoclean::INTERVAL`] (and on start).
+    pub fn autoclean_every(mut self, interval: Duration) -> Self {
+        self.autoclean_every = interval;
+        self
+    }
+
+    /// Close chats after `limit` without a turn (`None`: never), whatever
+    /// `[chat] autoclean` says.
+    pub fn close_chats_after(mut self, limit: Option<Duration>) -> Self {
+        self.autoclean = autoclean::Source::given(match limit {
+            Some(limit) => autoclean::Setting::After(limit),
+            None => autoclean::Setting::Off,
+        });
         self
     }
 
@@ -153,6 +175,10 @@ impl Daemon {
             asks: answer::Asks::default(),
         }));
 
+        // Chats past their time are closed before any client sees them.
+        let mut autoclean = self.autoclean.clone();
+        clean_chats(&state, &mut autoclean).await;
+
         // The chats' titles before the first client asks.
         refresh_chat_sessions(&state).await;
 
@@ -193,6 +219,13 @@ impl Daemon {
         tokio::spawn(chat_session_loop(
             Arc::downgrade(&state),
             self.chat_sessions_every,
+        ));
+
+        // And chats past their time, periodically.
+        tokio::spawn(autoclean_loop(
+            Arc::downgrade(&state),
+            autoclean,
+            self.autoclean_every,
         ));
 
         loop {
@@ -1314,12 +1347,15 @@ async fn handle_hook_event(
         };
     };
     let before = agent.info(agent_id).detail;
+    let was = agent.current_state();
     let Some(result) = agent.handle_hook_event(event, payload) else {
         return Response::Error {
             message: format!("unknown hook event '{}' for agent '{}'", event, agent_id),
         };
     };
     info!(id = %agent_id, event = %event, result = ?result, "hook event");
+    // Out of a wait on the user (a permission, a question): answered.
+    let answered = autoclean::waits_on_user(was) && agent.current_state() != was;
 
     let changed = agent.info(agent_id).detail != before;
     let session = agent
@@ -1336,6 +1372,9 @@ async fn handle_hook_event(
     }
     if let Some((member, session_id)) = session {
         state.record_hook_session(&member, &session_id);
+    }
+    if answered {
+        state.user_answered(agent_id);
     }
     // After a merge or split: what changed, and its task now.
     if let Some(context) = state.take_peer_note(agent_id, event, payload) {
@@ -3142,6 +3181,7 @@ async fn handle_answer(
                 if let Some(agent) = state.agents.get_mut(agent_id) {
                     agent.answered();
                 }
+                state.user_answered(agent_id);
                 if let Some(info) = state.agent_info(agent_id) {
                     state.broadcast(Event::AgentUpdated {
                         id: agent_id.to_string(),
@@ -3170,6 +3210,27 @@ async fn handle_answer(
 // ---------------------------------------------------------------------------
 
 impl DaemonState {
+    /// Close the open chat `id`: take its agent out of the table (the end of
+    /// its run is recorded with it), forget the chat, tell clients. Returns
+    /// the agent, for the caller to kill outside the lock, and the chat as
+    /// it was, with its runs. `CloseChat` and autoclean both close this way.
+    fn close_chat(
+        &mut self,
+        id: &str,
+    ) -> (
+        Option<Agent>,
+        Result<(tam_proto::ChatInfo, Vec<tam_proto::RunInfo>)>,
+    ) {
+        let agent = self.take_member_agent(id);
+        let chat = self.ledger.chat(id).expect("the chat is still open");
+        let runs = self.ledger.runs_of(id);
+        let closed = self.ledger.close_chat(id).map(|()| {
+            self.broadcast(Event::ChatClosed { id: id.to_string() });
+            (chat, runs)
+        });
+        (agent, closed)
+    }
+
     /// Record that the user prompted the agent of chat `id`, telling clients.
     fn chat_turn(&mut self, id: &str) {
         match self.ledger.chat_turn(id) {
@@ -3282,14 +3343,10 @@ async fn handle_close_chat(state: &Arc<Mutex<DaemonState>>, target: &str) -> Res
                 }
             }
         };
-        // The end of its run is recorded with it.
-        let agent = state.take_member_agent(&id);
-        let chat = state.ledger.chat(&id).expect("the chat is still open");
-        let runs = state.ledger.runs_of(&id);
-        let response = match state.ledger.close_chat(&id) {
-            Ok(()) => {
+        let (agent, closed) = state.close_chat(&id);
+        let response = match closed {
+            Ok((chat, runs)) => {
                 info!(chat = %id, "chat closed");
-                state.broadcast(Event::ChatClosed { id });
                 Response::Chat {
                     chat: Box::new(chat),
                     runs,
@@ -3476,5 +3533,102 @@ async fn handle_chat_history(state: &Arc<Mutex<DaemonState>>, dir: PathBuf) -> R
             .into_iter()
             .filter(|s| !held.contains(&s.id))
             .collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autoclean (#65): chats past their time closed, at start and periodically
+// (see `autoclean.rs`).
+// ---------------------------------------------------------------------------
+
+impl DaemonState {
+    /// The user answered what agent `agent_id` waited on (a permission, a
+    /// question): for a chat's agent, a turn.
+    fn user_answered(&mut self, agent_id: &str) {
+        let chat = self.agents.get(agent_id).and_then(Agent::owner);
+        if let Some(chat) = chat.filter(|id| self.ledger.is_chat(id)) {
+            let chat = chat.to_string();
+            self.chat_turn(&chat);
+        }
+    }
+
+    /// The open chats past their time at `now` that may be closed: no agent
+    /// runs for them, or one at the prompt nobody is attached to or typing in.
+    fn chats_due(&self, now: u64) -> Vec<tam_proto::ChatInfo> {
+        self.ledger
+            .chats()
+            .into_iter()
+            .filter(|chat| chat.closes_at.is_some_and(|at| at <= now))
+            .filter(|chat| {
+                let agent = self.agents.get(&chat.id).map(|a| a.info(&chat.id));
+                autoclean::may_close(agent.map(|a| (a.state, a.viewers)))
+            })
+            .collect()
+    }
+}
+
+/// Close chats past their time every `every` (the first pass is at start).
+/// Holds the state only during a pass: a daemon shut down lets go of its
+/// ledger at once (a test starts the next one in the same process).
+async fn autoclean_loop(
+    state: Weak<Mutex<DaemonState>>,
+    mut source: autoclean::Source,
+    every: Duration,
+) {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Some(state) = state.upgrade() else {
+            break;
+        };
+        if state.lock().await.shutdown {
+            break;
+        }
+        clean_chats(&state, &mut source).await;
+    }
+}
+
+/// Close the chats past their time, as `CloseChat` does: chosen and closed
+/// in one hold of the lock (a turn cannot come in between), their agents
+/// killed after. The setting is read again first: when it changed, every
+/// chat's `closes_at` did.
+async fn clean_chats(state: &Arc<Mutex<DaemonState>>, source: &mut autoclean::Source) {
+    let limit = source.limit();
+    let agents: Vec<Agent> = {
+        let mut state = state.lock().await;
+        if state.ledger.set_chat_limit(limit) {
+            for chat in state.ledger.chats() {
+                state.broadcast(Event::ChatUpdated { chat });
+            }
+        }
+        let due = state.chats_due(crate::ledger::now());
+        due.into_iter()
+            .filter_map(|chat| {
+                let (agent, closed) = state.close_chat(&chat.id);
+                match closed {
+                    Ok(_) => info!(
+                        chat = %chat.id,
+                        name = ?chat.name,
+                        last_turn_at = ?chat.last_turn_at,
+                        closes_at = ?chat.closes_at,
+                        "chat closed by autoclean: no turn for too long"
+                    ),
+                    Err(e) => error!(
+                        chat = %chat.id,
+                        "autoclean stopped the agent, but the chat is kept: {e:#}"
+                    ),
+                }
+                agent
+            })
+            .collect()
+    };
+    if !agents.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || {
+            for agent in agents {
+                agent.kill_and_drop();
+            }
+        })
+        .await;
     }
 }

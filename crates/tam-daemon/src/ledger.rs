@@ -36,7 +36,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -182,7 +182,8 @@ pub enum LedgerEvent {
         keep: bool,
         timestamp: u64,
     },
-    /// The user prompted the chat's agent. Only the latest is kept.
+    /// The user prompted the chat's agent, or answered what it waited on.
+    /// Only the latest is kept.
     ChatTurn {
         chat: String,
         timestamp: u64,
@@ -310,6 +311,8 @@ struct ChatRecord {
     created_at: u64,
     keep: bool,
     last_turn_at: Option<u64>,
+    /// When it was last un-kept: its autoclean clock starts again then.
+    unkept_at: Option<u64>,
     /// Order of its `ChatCreated`: chats are listed in creation order.
     order: usize,
     history: History,
@@ -341,6 +344,9 @@ struct State {
     /// What Claude's files say of each open chat's session, by chat id. In
     /// memory only.
     chat_sessions: HashMap<String, ChatSession>,
+    /// Seconds without a turn after which autoclean closes a chat (`None`:
+    /// off), set by the daemon from `[chat] autoclean`. In memory only.
+    chat_limit: Option<u64>,
 }
 
 /// What Claude's files say of a chat's session (see `crate::sessions`).
@@ -1168,6 +1174,7 @@ impl State {
                     created_at: *timestamp,
                     keep: false,
                     last_turn_at: None,
+                    unkept_at: None,
                     order: seq,
                     history: History::default(),
                 };
@@ -1187,11 +1194,16 @@ impl State {
                 record.name = name.clone();
                 record.history.replace(seq, event);
             }
-            LedgerEvent::ChatKept { chat, keep, .. } => {
+            LedgerEvent::ChatKept {
+                chat,
+                keep,
+                timestamp,
+            } => {
                 let Some(record) = self.chats.get_mut(chat) else {
                     return;
                 };
                 record.keep = *keep;
+                record.unkept_at = (!*keep).then_some(*timestamp);
                 record.history.replace(seq, event);
             }
             LedgerEvent::ChatTurn { chat, timestamp } => {
@@ -1265,10 +1277,23 @@ impl State {
             keep: chat.keep,
             session: self.current_session(&chat.id, CLAUDE),
             last_turn_at: chat.last_turn_at,
+            closes_at: self.closes_at(chat),
             run_count: chat.history.runs.len(),
             title: claude.title,
             last_prompt: claude.last_prompt,
         }
+    }
+
+    /// When autoclean closes the chat: `chat_limit` after its latest turn,
+    /// un-keep or creation (also for one made from an existing session:
+    /// its clock starts in tam). `None` when it is kept or autoclean off.
+    fn closes_at(&self, chat: &ChatRecord) -> Option<u64> {
+        let limit = self.chat_limit.filter(|_| !chat.keep)?;
+        let since = [chat.last_turn_at, chat.unkept_at]
+            .into_iter()
+            .flatten()
+            .fold(chat.created_at, u64::max);
+        Some(since.saturating_add(limit))
     }
 
     /// Forget a task and its members.
@@ -1630,7 +1655,18 @@ impl Ledger {
         Ok(true)
     }
 
-    /// Record that the user prompted the chat's agent now.
+    /// Set how long a chat may go without a turn before autoclean closes it
+    /// (`None`: never), which every `ChatInfo::closes_at` follows. Returns
+    /// whether it changed.
+    pub fn set_chat_limit(&mut self, limit: Option<Duration>) -> bool {
+        let limit = limit.map(|l| l.as_secs());
+        let changed = self.state.chat_limit != limit;
+        self.state.chat_limit = limit;
+        changed
+    }
+
+    /// Record that the user prompted the chat's agent now (or answered what
+    /// it waited on: autoclean counts both).
     pub fn chat_turn(&mut self, id: &str) -> Result<()> {
         self.require_chat(id)?;
         self.append(LedgerEvent::ChatTurn {
@@ -3780,6 +3816,70 @@ mod tests {
         ledger.close_chat(&id).unwrap();
         assert!(ledger.set_chat_session(&id, said).is_none());
         assert!(ledger.state.chat_sessions.is_empty());
+    }
+
+    #[test]
+    fn a_chat_closes_its_limit_after_its_latest_turn_unkeep_or_creation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ledger.jsonl");
+        const DAYS_3: u64 = 3 * 86_400;
+        let three_days = Some(Duration::from_secs(DAYS_3));
+        let (made, turned, unkept, kept) = ("c-00000001", "c-00000002", "c-00000003", "c-00000004");
+        let turn = |chat: &str, timestamp| LedgerEvent::ChatTurn {
+            chat: chat.into(),
+            timestamp,
+        };
+        let keep = |chat: &str, keep, timestamp| LedgerEvent::ChatKept {
+            chat: chat.into(),
+            keep,
+            timestamp,
+        };
+        write_lines(
+            &path,
+            &[
+                chat_created(made, "/src/api", Some("s-1"), 1000),
+                chat_created(turned, "/src/api", None, 1000),
+                turn(turned, 5000),
+                chat_created(unkept, "/src/api", None, 1000),
+                turn(unkept, 2000),
+                keep(unkept, true, 3000),
+                keep(unkept, false, 9000),
+                chat_created(kept, "/src/api", None, 1000),
+                keep(kept, true, 2000),
+            ],
+            &[],
+        );
+        let closes = |ledger: &Ledger, id: &str| ledger.chat(id).unwrap().closes_at;
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        // None until the daemon sets the limit.
+        assert!(ledger.chats().iter().all(|c| c.closes_at.is_none()));
+        assert!(ledger.set_chat_limit(three_days));
+        assert!(!ledger.set_chat_limit(three_days));
+        // Made from a session: its clock starts at its creation in tam.
+        assert_eq!(closes(&ledger, made), Some(1000 + DAYS_3));
+        assert_eq!(closes(&ledger, turned), Some(5000 + DAYS_3));
+        assert_eq!(closes(&ledger, unkept), Some(9000 + DAYS_3));
+        assert_eq!(closes(&ledger, kept), None);
+
+        // A turn and an un-keep start it again; a keep stops it.
+        ledger.chat_turn(made).unwrap();
+        let chat = ledger.chat(made).unwrap();
+        assert_eq!(chat.closes_at, Some(chat.last_turn_at.unwrap() + DAYS_3));
+        let before = now();
+        assert!(ledger.keep_chat(kept, false).unwrap());
+        assert!(closes(&ledger, kept).unwrap() >= before + DAYS_3);
+        assert!(ledger.keep_chat(turned, true).unwrap());
+        assert_eq!(closes(&ledger, turned), None);
+        // Off: never.
+        assert!(ledger.set_chat_limit(None));
+        assert!(ledger.chats().iter().all(|c| c.closes_at.is_none()));
+        drop(ledger);
+
+        // Compaction keeps the latest keep, so the time of an un-keep.
+        let mut ledger = Ledger::open(&path).unwrap().0;
+        ledger.set_chat_limit(three_days);
+        assert_eq!(closes(&ledger, unkept), Some(9000 + DAYS_3));
+        assert_eq!(closes(&ledger, turned), None);
     }
 
     #[test]

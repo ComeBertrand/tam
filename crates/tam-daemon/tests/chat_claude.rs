@@ -6,7 +6,7 @@
 //! the user's prompts are its turns (a tam message or a background
 //! notification is none); `[notify]` names it by its name and id; messages
 //! reach it through its inbox hook; a client answers its permission
-//! requests; a restart keeps its session and last turn; closing it keeps
+//! requests (a turn too); a restart keeps its session and last turn; closing it keeps
 //! Claude's transcript, and the chat can be made again from that session.
 //!
 //! The agent is a fake `claude` (it writes its arguments, then sleeps),
@@ -462,6 +462,8 @@ async fn a_chats_claude_agent() {
         output["hookSpecificOutput"]["decision"]["behavior"],
         "allow"
     );
+    // The user's answer is a turn too (autoclean, #65).
+    assert_eq!(turns_recorded(&ledger), 2);
 
     // A restart keeps its session and last turn; its agent starts again
     // in that session.
@@ -492,7 +494,7 @@ async fn a_chats_claude_agent() {
             .collect::<Vec<_>>()
     };
     assert_eq!(without_titles(after.clone()), without_titles(before));
-    assert_eq!(after[0].last_turn_at, turned.last_turn_at);
+    assert!(after[0].last_turn_at >= turned.last_turn_at);
     std::fs::remove_file(args.join(&id)).unwrap();
     match conn.request(&run(&id, &env)).await {
         Response::Running { resumed, .. } => assert_eq!(resumed.as_deref(), Some(SESSION)),

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use tam_proto::{
     AgentInfo, ChatInfo, MemberInfo, MemberOutcome, MemberState, NewMember, Request, Response,
-    RunInfo, ScreenInfo, ServerMessage, SessionChoice, TaskInfo, WorktreeReport,
+    RunInfo, ScreenInfo, ServerMessage, SessionChoice, SessionInfo, TaskInfo, WorktreeReport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
@@ -682,6 +682,20 @@ impl Client {
             keep,
         };
         Ok(chat_reply("KeepChat", self.send(request).await?)?.0)
+    }
+
+    /// The Claude sessions of the repository whose main checkout is `dir`
+    /// that a chat can be made from, newest first (those a chat holds left
+    /// out).
+    pub async fn chat_history(&mut self, dir: &Path) -> Result<Vec<SessionInfo>> {
+        let request = Request::ChatHistory {
+            dir: dir.to_path_buf(),
+        };
+        match self.send(request).await? {
+            Response::Sessions { sessions } => Ok(sessions),
+            Response::Error { message } => anyhow::bail!("{message}"),
+            other => Err(unexpected("ChatHistory", other)),
+        }
     }
 
     /// Close a chat (its agent stopped and waited for). Returns it as it

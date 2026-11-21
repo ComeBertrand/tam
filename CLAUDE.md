@@ -415,7 +415,7 @@ adopt). `tam-cli` depends on all three.
   fit (`ui::fit_hints`, by priority). `tam ps` (`ps.rs`) prints the same
   rows as text: a row per task, most urgent first, and below a task with
   several members a row per member (status, worktree, context).
-- **Chats in the dashboard (#67)** — `App::chats` (`chat::Chat`: the info
+- **Chats in the dashboard (#67, #68)** — `App::chats` (`chat::Chat`: the info
   and its running agent), from `ListChats` at start, then `ChatCreated`/
   `ChatUpdated` (`App::upsert_chat`, keeping the agent) and `ChatClosed`;
   agent events find a chat's agent as a member's (`App::agent_slot`,
@@ -442,7 +442,25 @@ adopt). `tam-cli` depends on all three.
   `d` asks (`Mode::ConfirmCloseChat`, `y`/`enter`) then `CloseChat`; `p`
   keeps or unkeeps (`KeepChat`; the status line says when it closes then);
   `N` names it (`Mode::RenameChat`, empty: Claude's title again; a refusal
-  opens a notice); `s`, `a` and custom commands as on a task. Custom
+  opens a notice); `s`, `a` and custom commands as on a task. `c` (#68)
+  makes one: the repository picker (`Purpose::Chat`: the highlighted
+  repository, a worktree standing for its main checkout; `tab` does
+  nothing), then `ChatHistory` (`Action::ChatHistory`, `open_chat_history`)
+  opens `Mode::PickSession` (`app::SessionPicker`: `+ new chat` first, id
+  `NEW_SESSION`, then the sessions as the daemon lists them, newest first,
+  those a chat holds left out; an item's display, what the filter matches,
+  is the title then the last prompt, `SessionPicker::TITLE_GAP` apart,
+  drawn as columns with the age by `ui::render_session_popup`; `+ new chat`
+  drops out when the filter does not match it, so enter never makes a new
+  chat for a filter typed to find a session). `enter` is
+  `Action::CreateChat`: `create_chat` sends `CreateChat` (no name: Claude's
+  title shows until the user names it), takes the chat at once
+  (`upsert_chat`, the filter emptied if it would hide it), selects it,
+  starts its agent (`RunAgent`, `Current`) and gives it the keyboard
+  (`Mode::Terminal`, `App::starting`); an agent that cannot start closes
+  the chat again, as `tam chat` does. A session picked that is still open
+  in a plain terminal is not detected (two processes would write it):
+  sessions are to be opened from tam. Custom
   commands (`config::CommandValues`): `{task}` the task's name or the
   chat's label, `{id}` the member's or chat's id, `{dir}` the worktree or
   the main checkout, `{provider}`. `c`, `p` and `N` came after custom
@@ -476,7 +494,7 @@ adopt). `tam-cli` depends on all three.
   attach). `ui::tests::dump_the_dashboard_in_colour` (ignored)
   writes the fixture dashboard as ANSI text to `$TAM_UI_DUMP`.
 - **Dashboard input** — prompts (the filter, the picker's filter, the task
-  name, the path) are `tui/input.rs` `TextInput`: cursor movement and
+  name, a chat's name, the path) are `tui/input.rs` `TextInput`: cursor movement and
   editing, drawn with the terminal's cursor. `tui/fuzzy.rs` matches the
   filter (task, member names, repositories, branches; the list's order
   kept) and ranks the picker, with positions to highlight. `?` is
@@ -485,12 +503,16 @@ adopt). `tam-cli` depends on all three.
   SGR `?1006`: no motion), off before attaching (before the input reader
   pauses: a report must never reach the agent) and back after.
   `handle_mouse` uses `App::hits`, where the last draw put the list's rows
-  (task index, member), the pane and the picker's items. Input events are
+  (entry index, member), the pane and the picker's items. Input events are
   handled in batches (all those queued, then one draw); the screen is
   fetched again once per batch (`screen_moved`). `n` opens the picker at
-  once (`start_new_task_flow`, with `App::projects` from last time);
+  once (`start_pick_project`, with `App::projects` from last time);
   `discover_projects` runs on a thread, `App::set_projects` merges its
-  result, keeping the filter, picks and highlighted item.
+  result, keeping the filter, picks and highlighted item. The picker is
+  `Mode::PickProject(picker, Purpose)` (and the path prompt
+  `SpawnEnterPath(_, Purpose)`): `n`'s for a task, `c`'s for a chat (see
+  Chats in the dashboard), one mode so that pastes, the mouse and the
+  projects found reach both.
 - **Brief and task directory (#25)** — one brief per task: a reference the
   user gave (URL, ticket id, path; tam never fetches or reads it), recorded
   as `BriefSet` (kept with the task's events, latest only: a re-created
@@ -759,8 +781,13 @@ cargo test
   tests on `chat_app()`: selection across the sections, enter resuming then
   typing (`App::check_typing` while starting), `f`, `r`/`R`, close with its
   confirmation, keep, rename, custom commands and the keys they took, an
-  answer, chat and agent events. Resuming against a live daemon (the
-  dashboard always starts Claude) is not covered by a test.
+  answer, chat and agent events; `c`: the picker for one repository (a
+  worktree standing for its repository, a path typed), the session list
+  from a `Sessions` reply (`+ new chat` first, the filter, enter's
+  `CreateChat`), its drawing, and `c` taken by a custom command. Resuming
+  or creating against a live daemon (the dashboard always starts Claude) is
+  not covered by a test: run the dev dashboard by hand in a sandbox (see
+  Testing hooks by hand) with a fake `claude` on its `PATH`.
 - `agent_env.rs`, in both crates: the daemon's runs an agent found only on
   the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
   value) in replies, events, errors and every file next to the ledger,

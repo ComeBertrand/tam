@@ -337,9 +337,16 @@ pub struct ChatInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// Unix timestamp (seconds) of the latest prompt the user gave its
-    /// agent (tam messages and background notifications do not count).
+    /// agent (tam messages and background notifications do not count), or
+    /// answer to what it waited on (a permission, a question).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn_at: Option<u64>,
+    /// Unix timestamp (seconds) from which autoclean closes it, as soon as
+    /// its agent is not running or at the prompt with nobody attached or
+    /// typing (`[chat] autoclean` after its last turn, answer, un-keep or
+    /// creation). `None`: kept, or autoclean is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closes_at: Option<u64>,
     /// Number of agent runs started for it.
     #[serde(default)]
     pub run_count: usize,
@@ -2539,6 +2546,7 @@ mod tests {
             keep: false,
             session: None,
             last_turn_at: None,
+            closes_at: None,
             run_count: 0,
             title: None,
             last_prompt: None,
@@ -2556,11 +2564,19 @@ mod tests {
         let named = ChatInfo {
             name: Some("debug".into()),
             keep: true,
-            ..chat
+            ..chat.clone()
         };
         assert_eq!(named.label(), "debug");
         let back: ChatInfo = serde_json::from_str(&serde_json::to_string(&named).unwrap()).unwrap();
         assert_eq!(back, named);
+        let closing = ChatInfo {
+            last_turn_at: Some(200),
+            closes_at: Some(200 + 3 * 86_400),
+            ..chat
+        };
+        let json = serde_json::to_string(&closing).unwrap();
+        assert!(json.contains(r#""closes_at":259400"#), "{json}");
+        assert_eq!(serde_json::from_str::<ChatInfo>(&json).unwrap(), closing);
         // Claude's title comes between the name and the id.
         let titled = ChatInfo {
             title: Some("Fix the pool leak".into()),

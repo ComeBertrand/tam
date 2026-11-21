@@ -424,6 +424,9 @@ on_states = ["ready", "blocked", "question", "error"]   # default
 [session]
 finder = "fzf"
 
+[chat]
+autoclean = 3                           # days without a turn before a chat is closed (fractions too); 0 or false: never
+
 [tui]
 theme = "dark"                          # 24-bit palette; "unicorn": brighter, with rainbows; "ansi": the terminal's 16 colours. Default: dark when COLORTERM says truecolor
 animate = true                          # unicorn: the rainbows move (the logo, the selection's bar, the spinners, the rules, the pane's border)
@@ -440,6 +443,8 @@ prompt = "/implement-task {brief}"      # the agents' start prompt for tam new w
 ```
 
 A brief pattern turns what you type into the task's brief (`reference`: `{0}` is the match, `{1}`… its groups, `{brief}` what you typed; without `reference`, the brief stays as typed), and gives the agents of `tam new` their start prompt (`prompt`, where `{brief}` is the brief). A brief that matches no pattern and names an existing file is recorded as its absolute path.
+
+A chat (a Claude session on a repository's main checkout, started from tam) is closed by itself after `autoclean` days without a turn: a prompt you type, or an answer to a permission request or a question. The days count from its last turn, its creation, or when you stopped keeping it. A chat is never closed while its agent works or waits on you, nor while you are attached to it or typing in it, and a kept chat never is. Claude's transcript stays (until Claude deletes old ones, after 30 days by default): the chat can be made again from its session. The setting is read again every minute: no restart needed.
 
 The notify command runs with `sh -c` on state changes, except while you are attached to the agent. Placeholders are escaped for the quoting they sit in:
 

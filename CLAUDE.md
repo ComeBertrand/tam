@@ -582,6 +582,30 @@ adopt). `tam-cli` depends on all three.
   `chat_transcript`, never guesses it (several sessions share its
   directory). Known limit: under the daemon's `HOME`/`CLAUDE_CONFIG_DIR`.
   The dashboard ignores chat events for now (#67).
+- **Chat autoclean (#65)** — `tam-daemon/src/autoclean.rs`, passes at the
+  end of `daemon.rs`. A chat is closed by itself after `[chat] autoclean`
+  days without a turn (3 by default, fractions allowed; `0`/`false` off,
+  `true` 3; a config or value that cannot be read: off, warned in the
+  daemon's log, so a typo never starts closing chats). Elapsed time from
+  the latest of its creation (also for one made from an existing session),
+  its last `ChatTurn` and its last un-keep (`ChatRecord::unkept_at`, from
+  the `ChatKept` compaction keeps). A `ChatTurn` is also recorded when the
+  user answers what a chat's agent waited on (`DaemonState::user_answered`:
+  a hook takes it out of `blocked`/`question`, or `Answer`): only the user
+  ends that. A kept chat is exempt; starting its agent is no turn.
+  `clean_chats` runs at start, before the socket listens (no agent runs
+  then: every chat past its time goes), then every `autoclean::INTERVAL`
+  (60s; `Daemon::autoclean_every` in tests), reading the config again each
+  time (`autoclean::Source`; `Daemon::close_chats_after` gives the limit
+  instead, for tests). In one hold of the lock it closes the chats past
+  `closes_at` whose agent is not running, or is `ready`/`idle`/`error` with
+  no viewer (attached, or typing in a pane: `autoclean::may_close`), through
+  `DaemonState::close_chat` as `CloseChat` does (`AgentExited`, `ChatClosed`,
+  the agent killed outside the lock); only the log says it was autoclean.
+  Clients get `ChatInfo::closes_at` (from when it is closed, once at the
+  prompt; `None`: kept or off), computed in `State::chat_info` from the
+  limit the daemon gives the ledger (`Ledger::set_chat_limit`, in memory; a
+  change pushes `ChatUpdated` for every chat): #67's last day and time left.
 
 ## Build & check
 
@@ -629,6 +653,12 @@ cargo test
   read again as Claude rewrites it, gone while its agent runs a new
   session, there at once after a restart); `sessions.rs` unit tests write
   fixture lines by hand (never copied from real files).
+- Chat autoclean: the daemon's `chat_autoclean.rs` (one test: it sets
+  `HOME`, `XDG_CONFIG_HOME` and `CLAUDE_CONFIG_DIR`, so `[chat] autoclean`
+  is read from the test's config and no one's `[notify]` runs): pre-dated ledger lines
+  closed at start or not, a change of the setting reaching clients; on the
+  timer, a fake `claude` with played hooks kept open while blocked,
+  working, asking or typed in, an answer recorded as a turn, then closed.
 - `agent_env.rs`, in both crates: the daemon's runs an agent found only on
   the `PATH` sent with `RunAgent` and looks for a sentinel variable (name and
   value) in replies, events, errors and every file next to the ledger,

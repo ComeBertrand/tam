@@ -7,9 +7,10 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use tam_proto::{AgentDetail, AgentState};
 
+use crate::chat::{time_left, Closes};
 use crate::task::TaskStatus;
 
-use super::app::{App, MemberChoice, Mode, Order, PickerState};
+use super::app::{App, Focused, MemberChoice, Mode, Order, PickerState};
 use super::input::TextInput;
 use super::peek::{Peek, ScreenView};
 use super::{answer, fuzzy, table, theme, triage};
@@ -67,6 +68,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Normal | Mode::Terminal { .. } | Mode::NewTaskPickProject(_) | Mode::Answer(_) => {}
         Mode::Help => render_help_popup(frame, app),
+        Mode::ConfirmCloseChat { label, .. } => render_close_chat_popup(frame, label),
+        Mode::RenameChat { name, title, .. } => {
+            render_rename_chat_popup(frame, name, title.as_deref());
+        }
         Mode::NewTaskEnterName { name, project_dirs } => {
             let joins = app.tasks.iter().any(|t| t.name == name.value());
             render_new_task_popup(frame, name, project_dirs, joins);
@@ -143,14 +148,14 @@ fn render_filter(frame: &mut Frame, area: Rect, app: &App) {
 fn render_tasks(frame: &mut Frame, area: Rect, app: &mut App) {
     app.hits.list = Rect::default();
     app.hits.rows.clear();
-    if !app.visible_tasks().is_empty() {
+    if !app.visible_entries().is_empty() {
         table::render(frame, area, app);
         return;
     }
     let text = if app.filter.is_empty() {
-        "No tasks. Press n to create one."
+        "No tasks or chats. n: new task, c: new chat."
     } else {
-        "No matching tasks."
+        "Nothing matches."
     };
     let text = Paragraph::new(text)
         .alignment(HorizontalAlignment::Center)
@@ -159,9 +164,12 @@ fn render_tasks(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(text, Rect::new(area.x, y, area.width, 1));
 }
 
-/// The task count, how many need the user, and how the list is ordered.
+/// The chat and task counts, how many need the user, and how the list is
+/// ordered.
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let total = app.tasks.len();
+    let tasks = app.tasks.len();
+    let chats = app.chats.len();
+    let total = tasks + chats;
     let needs = app.needs_attention_count();
 
     let t = theme::get();
@@ -179,13 +187,16 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     };
     spans.push(Span::raw(" "));
 
+    let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
     if total == 0 {
         spans.push(Span::raw("no tasks"));
     } else {
-        spans.push(Span::raw(format!(
-            "{total} task{} ",
-            if total == 1 { "" } else { "s" }
-        )));
+        let counts: Vec<String> = [(chats, "chat"), (tasks, "task")]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| count(n, what))
+            .collect();
+        spans.push(Span::raw(format!("{} ", counts.join("  "))));
         if needs > 0 {
             spans.push(Span::styled(
                 format!(" {needs} need{} you ", if needs == 1 { "s" } else { "" }),
@@ -263,6 +274,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 ]);
                 hints
             }
+            Mode::ConfirmCloseChat { .. } => vec![
+                Span::styled(" y", Style::new().bold()),
+                Span::raw("/"),
+                Span::styled("enter", Style::new().bold()),
+                Span::raw(":close  "),
+                Span::styled("any", Style::new().bold()),
+                Span::raw(":cancel"),
+            ],
+            Mode::RenameChat { .. } => vec![
+                Span::styled(" enter", Style::new().bold()),
+                Span::raw(":rename (empty: Claude's title)  "),
+                Span::styled("esc", Style::new().bold()),
+                Span::raw(":cancel"),
+            ],
             Mode::ConfirmForceDrop { .. } => vec![
                 Span::styled(" y", Style::new().bold()),
                 Span::raw(":drop anyway  "),
@@ -347,16 +372,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
 /// matters (0 most: kept when the footer cannot show them all).
 type Hint<'a> = (&'a str, String, u8);
 
-/// The task list's keys, for the selection.
+/// The list's keys, for the selection.
 fn normal_hints(app: &App) -> Vec<Hint<'_>> {
     let selected = app.selected_task();
-    let has_agent = app
-        .focused_member()
-        .is_some_and(|(_, m)| m.agent_info.is_some());
-    let asks = app
-        .focused_member()
-        .and_then(|(_, m)| m.agent_info.as_ref())
-        .is_some_and(|a| a.detail.ask.is_some());
+    let chat = app.selected_chat();
+    let agent = app.focused().and_then(|f| f.agent());
+    let has_agent = agent.is_some();
+    let asks = agent.is_some_and(|a| a.detail.ask.is_some());
+    let free = |key: char| app.key_taken(key).is_none();
     let mut hints = Vec::new();
     if asks {
         hints.push(("a", "answer".into(), 0));
@@ -365,9 +388,21 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         hints.push(("enter", "type".into(), 0));
         hints.push(("f", "full screen".into(), 3));
         hints.push(("s", "stop".into(), 1));
+    } else if chat.is_some() {
+        hints.push(("enter", "resume".into(), 0));
     } else if selected.is_some() {
         hints.push(("r", "run".into(), 0));
         hints.push(("R", "new session".into(), 2));
+    }
+    if let Some(chat) = chat {
+        hints.push(("d", "close".into(), 1));
+        if free('p') {
+            let keep = if chat.info.keep { "unkeep" } else { "keep" };
+            hints.push(("p", keep.into(), 2));
+        }
+        if free('N') {
+            hints.push(("N", "rename".into(), 3));
+        }
     }
     {
         let peek = &app.peek;
@@ -479,15 +514,16 @@ pub(super) fn first_line(s: &str) -> &str {
         .unwrap_or("")
 }
 
-/// The pane, about the focused member of the selected task: its agent's
-/// screen; without an agent, how its last run ended, its branch and its
-/// messages (see `triage`). The bottom border says what the screen may no
-/// longer show: why its turn failed, what auto mode refused, messages
-/// waiting for the agent.
+/// The pane, about the focused member of the selected task or the selected
+/// chat: its agent's screen; without an agent, how its last run ended, its
+/// branch (a member's) and its messages (see `triage`). The bottom border
+/// says what the screen may no longer show: why its turn failed, what auto
+/// mode refused, messages waiting for the agent, and when a chat in its
+/// last day closes.
 fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
-    let focused = app.focused_member();
-    let label = focused.map_or_else(|| "—".to_string(), |(t, m)| t.member_label(m));
-    let agent = focused.and_then(|(_, m)| m.agent_info.as_ref());
+    let focused = app.focused();
+    let label = focused.map_or_else(|| "—".to_string(), |f| f.label());
+    let agent = focused.and_then(|f| f.agent());
 
     let title = match peek.scrolled_back() {
         Some(0) => format!(" {label} · scrolled back "),
@@ -519,15 +555,24 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     {
         block = block.title_bottom(Line::styled(format!(" {text} "), Style::new().fg(color)));
     }
-    let detail = focused.and_then(|(task, _)| app.detail.as_ref().filter(|d| d.task == task.name));
+    let shown = app.pick();
+    let detail = app
+        .detail
+        .as_ref()
+        .filter(|d| shown.as_ref() == Some(&d.of));
     let queued = match (focused, detail, agent) {
-        (Some((_, member)), Some(detail), Some(_)) => detail
+        (Some(focused), Some(detail), Some(_)) => detail
             .messages
             .iter()
-            .filter(|m| m.to == member.id() && m.delivered_at.is_none())
+            .filter(|m| m.to == focused.id() && m.delivered_at.is_none())
             .count(),
         _ => 0,
     };
+    if let Some(text) = focused.and_then(|f| f.chat()).and_then(|c| closing(app, c)) {
+        block = block.title_bottom(
+            Line::styled(format!(" {text} "), Style::new().fg(t.warn)).right_aligned(),
+        );
+    }
     if queued > 0 {
         let s = if queued == 1 { "" } else { "s" };
         block = block.title_bottom(
@@ -545,22 +590,48 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     }
     peek.room = (inner.width, inner.height);
 
-    let Some((task, member)) = focused.filter(|_| agent.is_none()) else {
-        render_screen(frame, inner, peek, typing);
-        return;
+    let view = match focused {
+        Some(Focused::Member(task, member)) if agent.is_none() => triage::triage(
+            task,
+            member,
+            detail,
+            app.branches.get(member.id()),
+            crate::task::now(),
+        ),
+        Some(Focused::Chat(chat)) if agent.is_none() => triage::chat(
+            chat,
+            detail,
+            app.starting.as_deref() == Some(chat.info.id.as_str()),
+            app.key_taken('p').is_none(),
+            crate::task::now(),
+        ),
+        _ => {
+            render_screen(frame, inner, peek, typing);
+            return;
+        }
     };
-    let view = triage::triage(
-        task,
-        member,
-        detail,
-        app.branches.get(member.id()),
-        crate::task::now(),
-    );
     frame.render_widget(
         Paragraph::new(triage::fit(view, inner.width, inner.height)),
         inner,
     );
     peek.height = 0;
+}
+
+/// When a chat in its last day closes, and how to keep it (when `p` is the
+/// dashboard's).
+fn closing(app: &App, chat: &crate::chat::Chat) -> Option<String> {
+    let closes = Closes::of(&chat.info, crate::task::now());
+    if !closes.last_day() {
+        return None;
+    }
+    let when = match closes {
+        Closes::In(left) => format!("closes in {}", time_left(left)),
+        _ => "closes when idle".into(),
+    };
+    Some(match app.key_taken('p') {
+        None => format!("{when} · p keeps it"),
+        Some(_) => when,
+    })
 }
 
 /// The border of `area` fading through the hues, moving clockwise round
@@ -802,20 +873,7 @@ fn render_enter_path_popup(frame: &mut Frame, path: &TextInput) {
 fn render_help_popup(frame: &mut Frame, app: &App) {
     let entry = |key: &str, what: &str| (key.to_string(), what.to_string());
     let mut sections: Vec<(&str, Vec<(String, String)>)> = vec![
-        (
-            "Task",
-            vec![
-                entry("j/k ↑/↓", "select"),
-                entry("enter", "type (ctrl-] back)"),
-                entry("f", "full screen (⇧enter)"),
-                entry("r", "run, resuming"),
-                entry("R", "run, new session"),
-                entry("s", "stop the agent"),
-                entry("a", "answer what it asks"),
-                entry("d", "drop (or recreate)"),
-                entry("n", "new task"),
-            ],
-        ),
+        ("Task or chat", item_help(app)),
         (
             "List",
             vec![
@@ -823,8 +881,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
                 entry("gg/G", "first / last task"),
                 entry("t", "by repo / attention"),
                 entry("T", "next theme"),
-                entry("click", "select a row"),
-                entry("wheel", "move the selection"),
+                entry("click", "select (wheel: move)"),
             ],
         ),
         (
@@ -933,6 +990,101 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         }
         _ => {}
     }
+}
+
+/// The keys on a task or chat; one a custom command took says so.
+fn item_help(app: &App) -> Vec<(String, String)> {
+    let entry = |key: &str, what: &str| (key.to_string(), what.to_string());
+    let mut keys = vec![
+        entry("j/k ↑/↓", "select"),
+        entry("enter", "type (ctrl-] back)"),
+        entry("f", "full screen (⇧enter)"),
+        entry("r/R", "run (R: new session)"),
+        entry("s", "stop the agent"),
+        entry("a", "answer what it asks"),
+        entry("d", "drop / close a chat"),
+    ];
+    for (key, what) in [('p', "keep a chat, or not"), ('N', "name a chat")] {
+        keys.push(match app.key_taken(key) {
+            None => (key.to_string(), what.to_string()),
+            // The custom commands' section says by which.
+            Some(_) => (format!("({key})"), format!("{what}: taken")),
+        });
+    }
+    keys.push(entry("n", "new task"));
+    keys
+}
+
+/// Asks to close a chat: what closing does, and what it does not.
+fn render_close_chat_popup(frame: &mut Frame, label: &str) {
+    let red = |key: &'static str| Span::styled(key, Style::new().bold().fg(theme::get().bad));
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("Close chat "),
+            Span::styled(label, Style::new().bold()),
+            Span::raw("?"),
+        ]),
+        Line::raw("Its agent stops and tam forgets the chat. Nothing on"),
+        Line::raw("disk changes, and Claude keeps the session: c makes the"),
+        Line::raw("chat again from the repository's history."),
+        Line::raw(""),
+        Line::from(vec![
+            red("y"),
+            Span::raw(" close · "),
+            Span::styled("n", Style::new().bold()),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    let content_width = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (content_width as u16 + 8).max(30);
+    let height = lines.len() as u16 + 4;
+    let area = frame
+        .area()
+        .centered(Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().bad))
+        .title(" Close Chat ")
+        .title_style(Style::new().bold().fg(theme::get().bad))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A chat's name to type; empty, it shows Claude's `title` again.
+fn render_rename_chat_popup(frame: &mut Frame, name: &TextInput, title: Option<&str>) {
+    // 2 content rows + 2 border + 2 vertical padding = 6
+    let area = frame
+        .area()
+        .centered(Constraint::Length(60), Constraint::Length(6));
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().accent))
+        .title(" Rename Chat ")
+        .title_style(Style::new().bold().fg(theme::get().accent))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [name_row, hint_row] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let label = "Name: ";
+    let [label_area, text] =
+        Layout::horizontal([Constraint::Length(label.len() as u16), Constraint::Fill(1)])
+            .areas(name_row);
+    frame.render_widget(Span::raw(label), label_area);
+    name.render(frame, text, Style::new().bold(), true);
+    let hint = match title {
+        Some(title) => format!("empty: Claude's title, {title}"),
+        None => "empty: Claude's title, once it has one".into(),
+    };
+    frame.render_widget(Line::raw(hint).fg(theme::get().muted), hint_row);
 }
 
 /// Asks to drop a task, or (with `member`, the focused member of a task
@@ -1410,11 +1562,14 @@ mod tests {
 
     // -- The triage pane ---------------------------------------------------
 
+    use crate::chat::Chat;
     use crate::task::Task;
-    use crate::tui::app::TaskDetail;
+    use crate::tui::app::{Pick, TaskDetail};
     use crate::tui::branch::{BranchState, Observation};
     use crate::tui::input::TextInput;
-    use tam_proto::{AgentInfo, MemberHealth, MemberInfo, MessageInfo, RunInfo, TaskInfo};
+    use tam_proto::{
+        AgentInfo, ChatInfo, MemberHealth, MemberInfo, MessageInfo, RunInfo, TaskInfo,
+    };
 
     fn member_info(id: &str, name: &str) -> MemberInfo {
         MemberInfo {
@@ -1540,9 +1695,8 @@ mod tests {
             vec![agent_in("m-1", AgentState::Blocked, 190, blocked())],
         );
         app.detail = Some(TaskDetail {
-            task: "feat".into(),
             messages: vec![message("msg-1", None, "m-1", "please also run clippy", 600)],
-            ..Default::default()
+            ..TaskDetail::of(Pick::Task("feat".into()))
         });
         let s = screen(&mut app, 100, 34);
         assert!(s.contains("╭ feat ─"), "{s}");
@@ -1811,7 +1965,7 @@ mod tests {
     fn without_an_agent_the_pane_says_how_its_last_run_ended() {
         let mut app = triage_app(vec![member_info("m-1", "app")], vec![]);
         app.detail = Some(TaskDetail {
-            task: "feat".into(),
+            of: Pick::Task("feat".into()),
             runs: vec![RunInfo {
                 member: "m-1".into(),
                 provider: "claude".into(),
@@ -2045,7 +2199,7 @@ mod tests {
             std::fs::write(dir.join(format!("{name}-{w}x{h}.ansi")), text).unwrap();
         };
         for (w, h) in [(100, 30), (160, 40), (200, 50)] {
-            let mut app = dashboard();
+            let mut app = chat_dashboard();
             app.spin = Some(2);
             select(&mut app, "unit-pricing");
             let mut app = with_pane(app);
@@ -2057,6 +2211,19 @@ mod tests {
                 member: None,
             };
             draw(&mut app, w, h, "drop");
+            app.mode = Mode::Normal;
+            app.toggle_order();
+            draw(&mut app, w, h, "attention");
+            app.toggle_order();
+            // A chat in its last day, without an agent.
+            select_chat(&mut app, "c-0000dddd");
+            let mut app = with_pane(app);
+            draw(&mut app, w, h, "chat");
+            app.mode = Mode::ConfirmCloseChat {
+                id: "c-0000dddd".into(),
+                label: "Chat design".into(),
+            };
+            draw(&mut app, w, h, "close");
         }
     }
 
@@ -2394,6 +2561,346 @@ mod tests {
         );
     }
 
+    // -- Chats --------------------------------------------------------------
+
+    fn chat_info(id: &str, name: Option<&str>, title: Option<&str>, repo: &str) -> ChatInfo {
+        ChatInfo {
+            id: id.into(),
+            name: name.map(str::to_string),
+            repo: repo.into(),
+            dir: format!("/src/{repo}").into(),
+            created_at: crate::task::now() - 5 * 86400,
+            keep: false,
+            session: Some(format!("s-{id}")),
+            last_turn_at: Some(crate::task::now() - 3600),
+            closes_at: Some(crate::task::now() + 2 * 86400),
+            run_count: 1,
+            title: title.map(str::to_string),
+            last_prompt: None,
+        }
+    }
+
+    /// The day's dashboard with four chats: one ready, one working, one
+    /// kept and asking, one without an agent in its last day.
+    fn chat_dashboard() -> App {
+        let mut app = dashboard();
+        let release = chat_info(
+            "c-0000aaaa",
+            None,
+            Some("Release deployment on staging"),
+            "backend",
+        );
+        let rounding = chat_info(
+            "c-0000bbbb",
+            None,
+            Some("Why rounding differs between runs"),
+            "backend",
+        );
+        let mut support = chat_info(
+            "c-0000cccc",
+            Some("Answering the support thread"),
+            Some("Support thread"),
+            "backend",
+        );
+        support.keep = true;
+        support.closes_at = None;
+        let mut design = chat_info("c-0000dddd", None, Some("Chat design"), "tam");
+        design.last_turn_at = Some(crate::task::now() - 2 * 86400 - 19 * 3600);
+        design.closes_at = Some(crate::task::now() + 5 * 3600 - 30);
+        design.last_prompt = Some("can we put the time left on the border instead?".into());
+        let question = AgentDetail {
+            pending: Some(Pending {
+                tool: Some("AskUserQuestion".into()),
+                summary: "Reply in English or French?".into(),
+            }),
+            ..Default::default()
+        };
+        let mut agents = vec![
+            agent_in("c-0000aaaa", AgentState::Ready, 120, AgentDetail::default()),
+            agent_in(
+                "c-0000bbbb",
+                AgentState::Working,
+                10,
+                AgentDetail::default(),
+            ),
+            agent_in("c-0000cccc", AgentState::Question, 300, question),
+        ];
+        agents[0].context_percent = Some(41);
+        agents[1].context_percent = Some(12);
+        agents[2].context_percent = Some(63);
+        app.set_chats(
+            [release, rounding, support, design]
+                .into_iter()
+                .map(|info| Chat::new(info, &agents))
+                .collect(),
+        );
+        app
+    }
+
+    fn select_chat(app: &mut App, id: &str) {
+        app.selected = app
+            .visible_entries()
+            .iter()
+            .position(|e| e.pick() == Pick::Chat(id.into()))
+            .unwrap();
+        app.sync_focus();
+    }
+
+    /// The colours of the cells of `text` on the screen (its first
+    /// occurrence).
+    fn cells_of(app: &mut App, width: u16, height: u16, text: &str) -> Vec<(String, Color)> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        for y in 0..height {
+            let row: Vec<&str> = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+            let line: String = row.concat();
+            if let Some(at) = line.find(text) {
+                let x = line[..at].chars().count() as u16;
+                let n = text.chars().count() as u16;
+                return (x..x + n)
+                    .map(|x| (buf[(x, y)].symbol().to_string(), buf[(x, y)].fg))
+                    .collect();
+            }
+        }
+        panic!("{text} not on screen");
+    }
+
+    #[test]
+    fn chats_come_first_in_a_section_of_their_own() {
+        let mut app = chat_dashboard();
+        app.selected = 0;
+        let s = screen(&mut app, 80, 44);
+        show("chats 80x44", &s);
+        assert!(s.contains(" tam  4 chats  7 tasks  5 need you "), "{s}");
+        let rows: Vec<&str> = s.lines().skip(2).collect();
+        assert_eq!(rows[0].trim_end_matches([' ', '─']), " chats", "{s}");
+        // In creation order, their repository where a task has its branch.
+        assert!(
+            rows[1].starts_with("▌◆ ready      2m Release deployment on staging    "),
+            "{s}"
+        );
+        assert!(rows[1].ends_with(" backend  41% ━━━━"), "{s}");
+        assert!(
+            rows[2].contains("10s Why rounding differs between runs"),
+            "{s}"
+        );
+        assert!(rows[3].contains("5m Answering the support thread ∞"), "{s}");
+        // No agent: since its last turn.
+        assert!(rows[4].starts_with(" ○ idle       2d Chat design ◔"), "{s}");
+        assert!(rows[4].contains(" tam"), "{s}");
+        assert_eq!(rows[5].trim_end_matches([' ', '─']), " backend", "{s}");
+
+        // In its last day: the name dimmed, the mark in the warning
+        // colour; kept: the mark dim.
+        let t = theme::get();
+        let design = cells_of(&mut app, 80, 44, "Chat design ◔");
+        assert!(
+            design[..11].iter().all(|(_, fg)| *fg == t.muted),
+            "{design:?}"
+        );
+        assert_eq!(design[12], ("◔".into(), t.warn));
+        let support = cells_of(&mut app, 80, 44, "thread ∞");
+        assert_eq!(support[0].1, Color::Reset);
+        assert_eq!(support[7], ("∞".into(), t.muted));
+
+        // Chats alone: counted as such.
+        let mut alone = App::new();
+        alone.set_chats(app.chats.clone());
+        let s = screen(&mut alone, 80, 24);
+        assert!(s.contains(" tam  4 chats  2 need you "), "{s}");
+
+        // Neither named nor titled yet: its id, dimmed.
+        app.upsert_chat(chat_info("c-0000eeee", None, None, "backend"));
+        let new = cells_of(&mut app, 80, 44, "c-0000eeee");
+        assert!(new.iter().all(|(_, fg)| *fg == t.muted), "{new:?}");
+
+        // Wide, the list above the pane: what a chat waits on, what one
+        // without an agent was last asked.
+        let s = screen(&mut app, 120, 44);
+        show("chats 120x44", &s);
+        assert!(s.contains("question: Reply in English or French?"), "{s}");
+        assert!(s.contains("can we put the time left on the border"), "{s}");
+    }
+
+    #[test]
+    fn attention_first_mixes_chats_and_tasks() {
+        let mut app = chat_dashboard();
+        select_chat(&mut app, "c-0000dddd");
+        app.toggle_order();
+        assert_eq!(
+            app.selected_chat().map(|c| c.info.id.as_str()),
+            Some("c-0000dddd"),
+            "selection kept"
+        );
+        let s = screen(&mut app, 100, 30);
+        show("chats attention 100x30", &s);
+        assert!(!s.contains(" chats ─"), "{s}");
+        let rows: Vec<&str> = s.lines().skip(2).collect();
+        let starts = |i: usize, text: &str| rows[i].trim_start().starts_with(text);
+        // What waits on the user (a question or a permission alike), by
+        // name: the chat, the blocked task, the task with a question.
+        assert!(
+            starts(0, "? question   5m Answering the support thread ∞"),
+            "{s}"
+        );
+        assert!(starts(1, "▲ block"), "{s}");
+        assert!(starts(2, "unit-pricing"), "{s}");
+        // A chat's repository in REPO, `chat` where a task has its branch.
+        let chat_row = rows[0];
+        let repo = chat_row.find("backend").unwrap();
+        assert!(chat_row[repo..].contains(" chat "), "{s}");
+        assert!(s.contains("Release deployment on staging"), "{s}");
+    }
+
+    #[test]
+    fn a_cut_chat_name_keeps_its_mark() {
+        let mut app = chat_dashboard();
+        let mut design = app.chats[3].info.clone();
+        design.title = Some("Chat design for the dashboard's chats section".into());
+        app.upsert_chat(design);
+        let s = screen(&mut app, 50, 20);
+        show("chats 50x20", &s);
+        let row = s.lines().find(|l| l.contains("Chat design")).unwrap();
+        assert!(row.contains("… ◔"), "{s}");
+        assert!(s.contains("Answering the support … ∞"), "{s}");
+    }
+
+    #[test]
+    fn the_filter_finds_chats_by_name_title_and_repository() {
+        let mut app = chat_dashboard();
+        app.filter_active = true;
+        app.filter = TextInput::from("rounding");
+        let s = screen(&mut app, 80, 24);
+        show("filter rounding", &s);
+        assert!(s.contains("Why rounding differs between runs"), "{s}");
+        assert!(s.contains("fix-allotment-rounding"), "{s}");
+        assert!(!s.contains("Release deployment"), "{s}");
+        // A chat's repository.
+        app.filter = TextInput::from("tam");
+        let s = screen(&mut app, 80, 24);
+        assert!(s.contains("Chat design"), "{s}");
+        assert!(!s.contains("Why rounding"), "{s}");
+        assert!(!s.contains("backend ─"), "{s}");
+        // Its title, when it has a name too.
+        app.filter = TextInput::from("Support thread");
+        let s = screen(&mut app, 80, 24);
+        assert!(s.contains("Answering the support thread"), "{s}");
+        app.filter = TextInput::from("zzz");
+        let s = screen(&mut app, 80, 24);
+        assert!(s.contains("Nothing matches."), "{s}");
+    }
+
+    #[test]
+    fn a_chat_s_pane_is_its_screen_and_says_when_it_closes() {
+        let mut app = chat_dashboard();
+        select_chat(&mut app, "c-0000aaaa");
+        let mut app = with_pane(app);
+        let s = screen(&mut app, 100, 34);
+        show("chat pane", &s);
+        assert!(s.contains("╭ Release deployment on staging ─"), "{s}");
+        assert!(s.contains("> run the tests"), "{s}");
+        assert!(!s.contains("closes in"), "{s}");
+
+        // Without an agent: what enter does, what it was last asked; in
+        // its last day, when it closes on the border.
+        select_chat(&mut app, "c-0000dddd");
+        let mut app = with_pane(app);
+        let s = screen(&mut app, 100, 34);
+        show("idle chat pane", &s);
+        assert!(s.contains("╭ Chat design ─"), "{s}");
+        assert!(s.contains("○ idle · no agent"), "{s}");
+        assert!(s.contains("enter resumes its session"), "{s}");
+        assert!(
+            s.contains("last prompt: can we put the time left on the border instead?"),
+            "{s}"
+        );
+        assert!(s.contains("in /src/tam"), "{s}");
+        assert!(s.contains(" closes in 5h · p keeps it ╯"), "{s}");
+        // Its agent starting: said so.
+        app.starting = Some("c-0000dddd".into());
+        let s = screen(&mut app, 100, 34);
+        assert!(s.contains("starting · its agent is on its way"), "{s}");
+        assert!(!s.contains("enter resumes"), "{s}");
+        app.starting = None;
+        // Due: closed as soon as it is idle.
+        let mut design = app.chats[3].info.clone();
+        design.closes_at = Some(crate::task::now() - 60);
+        app.upsert_chat(design);
+        let s = screen(&mut app, 100, 34);
+        assert!(s.contains(" closes when idle · p keeps it ╯"), "{s}");
+        // `p` taken by a custom command: not offered.
+        app.commands = vec![crate::config::CustomCommand {
+            name: "preview".into(),
+            key: "p".into(),
+            command: "true".into(),
+        }];
+        let s = screen(&mut app, 100, 34);
+        assert!(s.contains(" closes when idle ╯"), "{s}");
+        assert!(!s.contains(":keep"), "{s}");
+    }
+
+    #[test]
+    fn the_footer_and_help_have_a_chat_s_keys() {
+        let mut app = chat_dashboard();
+        select_chat(&mut app, "c-0000dddd");
+        let s = screen(&mut app, 160, 30);
+        let footer = s.lines().last().unwrap();
+        for hint in ["enter:resume", "d:close", "p:keep", "N:rename"] {
+            assert!(footer.contains(hint), "{hint}: {footer}");
+        }
+        assert!(!footer.contains("r:run"), "{footer}");
+        select_chat(&mut app, "c-0000cccc");
+        let s = screen(&mut app, 160, 30);
+        let footer = s.lines().last().unwrap();
+        for hint in ["enter:type", "s:stop", "p:unkeep"] {
+            assert!(footer.contains(hint), "{hint}: {footer}");
+        }
+        // A key a custom command took: its command's, in the help too.
+        app.commands = vec![crate::config::CustomCommand {
+            name: "notes".into(),
+            key: "N".into(),
+            command: "true".into(),
+        }];
+        let s = screen(&mut app, 160, 30);
+        let footer = s.lines().last().unwrap();
+        assert!(
+            !footer.contains("N:rename") && footer.contains("N:notes"),
+            "{s}"
+        );
+        app.mode = Mode::Help;
+        let s = screen(&mut app, 100, 30);
+        show("help, N taken", &s);
+        assert!(s.contains("(N)        name a chat: taken"), "{s}");
+        assert!(s.contains("N          notes"), "{s}");
+    }
+
+    #[test]
+    fn the_chat_dialogs() {
+        let mut app = chat_dashboard();
+        app.mode = Mode::ConfirmCloseChat {
+            id: "c-0000dddd".into(),
+            label: "Chat design".into(),
+        };
+        let s = screen(&mut app, 100, 30);
+        show("close chat", &s);
+        assert!(s.contains("Close chat Chat design?"), "{s}");
+        assert!(s.contains("Claude keeps the session"), "{s}");
+        assert!(s.contains("y/enter:close"), "{s}");
+        app.mode = Mode::RenameChat {
+            id: "c-0000dddd".into(),
+            label: "Chat design".into(),
+            title: Some("Chat design".into()),
+            name: TextInput::from("dashboard"),
+        };
+        let (s, cursor) = screen_and_cursor(&mut app, 100, 30);
+        show("rename chat", &s);
+        assert!(s.contains("Name: dashboard"), "{s}");
+        assert!(s.contains("empty: Claude's title, Chat design"), "{s}");
+        assert!(cursor.is_some());
+    }
+
     // -- Help, filter, prompts -------------------------------------------
 
     #[test]
@@ -2615,6 +3122,19 @@ mod tests {
                     if normal && pane && width >= 80 {
                         show(&format!("filter + pane {width}x{height}"), &s);
                     }
+                }
+            }
+        }
+        // On a chat in its last day, without an agent (its mark, its view,
+        // the closing border), and on one with a screen.
+        for chat in ["c-0000dddd", "c-0000aaaa"] {
+            for (width, height) in [(1, 1), (10, 3), (24, 6), (40, 10), (80, 24), (250, 70)] {
+                for mode in modes() {
+                    let mut app = chat_dashboard();
+                    select_chat(&mut app, chat);
+                    let mut app = with_pane(app);
+                    app.mode = mode;
+                    screen(&mut app, width, height);
                 }
             }
         }

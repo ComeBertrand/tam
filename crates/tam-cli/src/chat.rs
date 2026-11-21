@@ -45,6 +45,54 @@ impl Chat {
     }
 }
 
+/// When autoclean closes a chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closes {
+    /// Kept: never closed for want of turns.
+    Kept,
+    /// Autoclean is off.
+    Off,
+    /// Its time is past: closed as soon as its agent is idle with nobody
+    /// attached or typing.
+    Due,
+    /// In this many seconds.
+    In(u64),
+}
+
+impl Closes {
+    /// When autoclean closes `chat`, from `now` (a Unix timestamp).
+    pub fn of(chat: &ChatInfo, now: u64) -> Self {
+        match chat.closes_at {
+            _ if chat.keep => Self::Kept,
+            None => Self::Off,
+            Some(at) if at <= now => Self::Due,
+            Some(at) => Self::In(at - now),
+        }
+    }
+
+    /// Less than a day left (or none): the chat is in its last day.
+    pub fn last_day(self) -> bool {
+        match self {
+            Self::Due => true,
+            Self::In(left) => left < 86400,
+            Self::Kept | Self::Off => false,
+        }
+    }
+}
+
+/// A time left, rounded up: `10m`, `5h`, `3d` (`3d` from a turn just now).
+pub fn time_left(secs: u64) -> String {
+    let minutes = secs.div_ceil(60);
+    let hours = secs.div_ceil(3600);
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else if hours < 24 {
+        format!("{hours}h")
+    } else {
+        format!("{}d", secs.div_ceil(86400))
+    }
+}
+
 /// How messages to the user name a chat: `'name' (c-…)`, or its id alone.
 pub fn describe(chat: &ChatInfo) -> String {
     let label = chat.label();
@@ -177,17 +225,25 @@ pub async fn start_detached(
 /// no longer be resumed (Claude deleted the transcript): a chat is its
 /// session, so another session is another chat.
 fn cannot_resume(chat: &ChatInfo, e: anyhow::Error) -> anyhow::Error {
-    let message = format!("{e:#}");
-    if !message.contains("can no longer be resumed") {
+    let Some(message) = session_gone(&e) else {
         return e;
-    }
-    let message = message.trim_end_matches(": start a new one");
+    };
     anyhow::anyhow!(
         "{message}. A chat is its session: close this one (tam close {}) and start another \
          (tam chat {})",
         chat.id,
         crate::shorten_home(&chat.dir.display().to_string())
     )
+}
+
+/// Why a chat's agent did not start, when it is that its session can no
+/// longer be resumed (Claude deleted the transcript), without the daemon's
+/// advice to start a new session: a chat cannot.
+pub fn session_gone(e: &anyhow::Error) -> Option<String> {
+    let message = format!("{e:#}");
+    message
+        .contains("can no longer be resumed")
+        .then(|| message.trim_end_matches(": start a new one").to_string())
 }
 
 /// When `name`, which named no task, names a chat: an error saying so,

@@ -1,17 +1,19 @@
-//! The task list: a row per task, under a header row per repository (or
-//! the most urgent first), and a row per member below a task with several.
-//! Its columns fit the width: the least useful go first when it is narrow.
+//! The list: the chats' section, then a row per task under a header row per
+//! repository (or chats and tasks together, the most urgent first), and a
+//! row per member below a task with several. Its columns fit the width: the
+//! least useful go first when it is narrow.
 
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, HighlightSpacing, Row as TableRow, Table, TableState};
 use ratatui::Frame;
-use tam_proto::AgentState;
+use tam_proto::{AgentInfo, AgentState};
 
+use crate::chat::{Chat, Closes};
 use crate::task::{Member, Task, TaskStatus};
 
-use super::app::{self, App, Order, Row};
+use super::app::{self, App, Order, Pick, Row};
 use super::branch::Observation;
 use super::fuzzy;
 use super::theme;
@@ -80,7 +82,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let now = crate::task::now();
     let rows = app.rows();
     let focused = app.focused_member().map(|(_, m)| m.id().to_string());
-    let selected = app.selected_task().map(|t| t.name.clone());
+    let selected = app.pick();
 
     let mut cols = vec![Col::Status, Col::Age, Col::Task];
     if app.order == Order::Attention {
@@ -91,7 +93,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         cols.push(Col::Note);
     }
     let cell = |row: &Row, col| match *row {
-        Row::Group(_) => Line::default(),
+        Row::Group(_) | Row::Chats => Line::default(),
+        Row::Chat(chat) => chat_cell(col, chat, app, now),
         Row::Task(task) => task_cell(col, task, app, now),
         Row::Member { task, member, last } => {
             let marked = focused.as_deref() == Some(member.id());
@@ -118,22 +121,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .zip(cells)
         .map(|(row, cells)| match row {
-            Row::Group(task) => {
-                // The repositories, and a rule to the list's edge.
-                let name = app::repo_group(task);
-                let rule = (width as usize).saturating_sub(Span::raw(name.as_str()).width() + 1);
-                let mut spans = vec![
-                    Span::styled(name, Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                ];
-                if t.rainbow {
-                    let tick = app.spin.unwrap_or(0);
-                    spans.extend(theme::rainbow_spans(&"─".repeat(rule), tick, Style::new()));
-                } else {
-                    spans.push(Span::styled("─".repeat(rule), Style::new().fg(t.subtle)));
-                }
-                TableRow::new([Cell::from(Line::from(spans)).column_span(cols.len() as u16)])
-            }
+            Row::Group(task) => header_row(app::repo_group(task), width, cols.len(), app),
+            Row::Chats => header_row("chats".into(), width, cols.len(), app),
+            // The name cut before its mark, never the mark.
+            Row::Chat(chat) => TableRow::new(cols.iter().zip(cells).map(|(&col, line)| {
+                Cell::from(match col {
+                    Col::Task => chat_name(chat, app, now, task_width),
+                    Col::Note => ellipsize(line, note_width),
+                    _ => line,
+                })
+            })),
             _ => TableRow::new(cols.iter().zip(cells).map(|(&col, line)| {
                 Cell::from(match col {
                     Col::Task => ellipsize(line, task_width),
@@ -153,13 +150,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    // The selected task's rows, from its group's header when it is the
+    // The selected entry's rows, from its group's header when it is the
     // first in it.
-    let selected_row = rows
-        .iter()
-        .position(|r| matches!(r, Row::Task(t) if Some(&t.name) == selected.as_ref()));
+    let selected_row = rows.iter().position(|r| match (r, &selected) {
+        (Row::Task(t), Some(Pick::Task(name))) => t.name == *name,
+        (Row::Chat(c), Some(Pick::Chat(id))) => c.info.id == *id,
+        _ => false,
+    });
     let block = selected_row.map(|i| {
-        let start = if i > 0 && matches!(rows[i - 1], Row::Group(_)) {
+        let start = if i > 0 && matches!(rows[i - 1], Row::Group(_) | Row::Chats) {
             i - 1
         } else {
             i
@@ -180,18 +179,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             offset = (end - height).min(row);
         }
     }
-    // For the mouse: the task (its index among the visible ones) and the
+    // For the mouse: the entry (its index among the visible ones) and the
     // member each row is about.
-    let mut task_index = 0;
+    let mut index = 0;
     let row_tasks: Vec<Option<(usize, Option<String>)>> = rows
         .iter()
         .map(|row| match row {
-            Row::Group(_) => None,
-            Row::Task(_) => {
-                task_index += 1;
-                Some((task_index - 1, None))
+            Row::Group(_) | Row::Chats => None,
+            Row::Task(_) | Row::Chat(_) => {
+                index += 1;
+                Some((index - 1, None))
             }
-            Row::Member { member, .. } => Some((task_index - 1, Some(member.id().to_string()))),
+            Row::Member { member, .. } => Some((index - 1, Some(member.id().to_string()))),
         })
         .collect();
     drop(rows);
@@ -224,6 +223,24 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .skip(app.table_offset)
         .take(height)
         .collect();
+}
+
+/// A section's header row: its name (the repositories, or `chats`), and a
+/// rule to the list's edge.
+fn header_row(name: String, width: u16, cols: usize, app: &App) -> TableRow<'static> {
+    let t = theme::get();
+    let rule = (width as usize).saturating_sub(Span::raw(name.as_str()).width() + 1);
+    let mut spans = vec![
+        Span::styled(name, Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+    ];
+    if t.rainbow {
+        let tick = app.spin.unwrap_or(0);
+        spans.extend(theme::rainbow_spans(&"─".repeat(rule), tick, Style::new()));
+    } else {
+        spans.push(Span::styled("─".repeat(rule), Style::new().fg(t.subtle)));
+    }
+    TableRow::new([Cell::from(Line::from(spans)).column_span(cols as u16)])
 }
 
 /// A task's or member's name, the characters the filter matched
@@ -364,8 +381,71 @@ fn member_cell(
             .and_then(|a| a.context_percent)
             .map(context_display)
             .unwrap_or_default(),
-        Col::Note => note_cell(member),
+        Col::Note => match agent {
+            Some(agent) => agent_note(agent),
+            None => match crate::health::problem(&member.info) {
+                Some(problem) => Line::styled(problem, Style::new().fg(theme::get().bad)),
+                None => Line::default(),
+            },
+        },
     }
+}
+
+/// A chat's cells: as a task's, its repository where a task has its branch
+/// (in the REPO column attention first, the branch's then saying `chat`).
+fn chat_cell(col: Col, chat: &Chat, app: &App, now: u64) -> Line<'static> {
+    let dim = Style::new().fg(theme::get().muted);
+    let agent = chat.agent.as_ref();
+    match col {
+        Col::Status => status_cell(chat.status(), app.spin),
+        Col::Age => {
+            let since = agent.and_then(|a| a.state_since).unwrap_or(chat.last());
+            Line::styled(age(now.saturating_sub(since)), dim).right_aligned()
+        }
+        Col::Task => chat_name(chat, app, now, u16::MAX),
+        Col::Repo => Line::raw(chat.info.repo.clone()),
+        Col::Branch => match app.order {
+            Order::Repo => Line::styled(chat.info.repo.clone(), dim),
+            Order::Attention => Line::styled("chat", dim),
+        },
+        Col::Ctx => agent
+            .and_then(|a| a.context_percent)
+            .map(context_display)
+            .unwrap_or_default(),
+        // Without an agent: what it was last asked.
+        Col::Note => match (agent, &chat.info.last_prompt) {
+            (Some(agent), _) => agent_note(agent),
+            (None, Some(prompt)) => Line::styled(one_line(prompt), dim),
+            (None, None) => Line::default(),
+        },
+    }
+}
+
+/// A chat's name (the user's, else Claude's title, else its id, dimmed),
+/// in `width` columns, then its mark, never cut: `◔` (in its last day: the
+/// name dimmed) or `∞` (kept).
+fn chat_name(chat: &Chat, app: &App, now: u64, width: u16) -> Line<'static> {
+    let t = theme::get();
+    let info = &chat.info;
+    let closes = Closes::of(info, now);
+    let mark = match closes {
+        _ if closes.last_day() => Some(Span::styled("◔", Style::new().fg(t.warn))),
+        Closes::Kept => Some(Span::styled("∞", Style::new().fg(t.muted))),
+        _ => None,
+    };
+    let untitled = info.name.is_none() && info.title.is_none();
+    let style = if untitled || closes.last_day() {
+        Style::new().fg(t.muted)
+    } else {
+        Style::new()
+    };
+    let name = name_line(&info.label(), app.filter.value(), style);
+    let Some(mark) = mark else {
+        return ellipsize(name, width);
+    };
+    let mut line = ellipsize(name, width.saturating_sub(2));
+    line.spans.extend([Span::raw(" "), mark]);
+    line
 }
 
 /// A status: its mark and name; a working agent's mark turns (`spin`: the
@@ -454,27 +534,17 @@ fn branch_cell(member: &Member, observation: Option<&Observation>) -> Line<'stat
     Line::from(spans)
 }
 
-/// What the member waits on, on one line: the permission or question, why
+/// What an agent waits on, on one line: the permission or question, why
 /// its turn failed or what auto mode refused, the start of its last
-/// message; what is wrong with its worktree.
-fn note_cell(member: &Member) -> Line<'static> {
+/// message.
+fn agent_note(agent: &AgentInfo) -> Line<'static> {
     let dim = Style::new().fg(theme::get().muted);
-    match &member.agent_info {
-        Some(agent) => {
-            if let Some((text, color)) = agent_detail_line(agent.state, &agent.detail) {
-                return Line::styled(one_line(&text), Style::new().fg(color));
-            }
-            match (&agent.detail.last_message, agent.state) {
-                (Some(message), AgentState::Ready) => {
-                    Line::styled(one_line(first_line(message)), dim)
-                }
-                _ => Line::default(),
-            }
-        }
-        None => match crate::health::problem(&member.info) {
-            Some(problem) => Line::styled(problem, Style::new().fg(theme::get().bad)),
-            None => Line::default(),
-        },
+    if let Some((text, color)) = agent_detail_line(agent.state, &agent.detail) {
+        return Line::styled(one_line(&text), Style::new().fg(color));
+    }
+    match (&agent.detail.last_message, agent.state) {
+        (Some(message), AgentState::Ready) => Line::styled(one_line(first_line(message)), dim),
+        _ => Line::default(),
     }
 }
 

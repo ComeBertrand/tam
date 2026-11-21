@@ -3,7 +3,7 @@
 //! status, worktree and context), as in the dashboard's list; then what is
 //! wrong with worktrees. `tam ps --json` is `script::ps`.
 
-use crate::chat::Chat;
+use crate::chat::{time_left, Chat, Closes};
 use crate::health;
 use crate::task::{Member, Task};
 use crate::{format_age, shorten_home};
@@ -103,22 +103,11 @@ pub fn chat_lines(chats: &[Chat]) -> Vec<String> {
 /// closes at the prompt with nobody attached), `kept`, or `-` when
 /// autoclean is off.
 fn closes(chat: &tam_proto::ChatInfo, now: u64) -> String {
-    match chat.closes_at {
-        _ if chat.keep => "kept".into(),
-        None => "-".into(),
-        Some(at) if at <= now => "due".into(),
-        Some(at) => {
-            let left = at - now;
-            let minutes = left.div_ceil(60);
-            let hours = left.div_ceil(3600);
-            if minutes < 60 {
-                format!("in {minutes}m")
-            } else if hours < 24 {
-                format!("in {hours}h")
-            } else {
-                format!("in {}d", left.div_ceil(86400))
-            }
-        }
+    match Closes::of(chat, now) {
+        Closes::Kept => "kept".into(),
+        Closes::Off => "-".into(),
+        Closes::Due => "due".into(),
+        Closes::In(left) => format!("in {}", time_left(left)),
     }
 }
 

@@ -1,11 +1,13 @@
 //! What the pane shows for a member without an agent, so without a screen:
 //! how its last run ended or what is wrong with its worktree, its branch
-//! and its latest messages (see `ui::render_pane`).
+//! and its latest messages (see `ui::render_pane`); for a chat without an
+//! agent, what enter does, what it was last asked and its latest messages.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use tam_proto::{MemberHealth, MessageInfo, RunInfo};
 
+use crate::chat::Chat;
 use crate::task::{Member, Task, TaskStatus};
 
 use super::app::TaskDetail;
@@ -124,11 +126,88 @@ fn idle_lines(
         };
         body.push((fix.into(), dim));
     }
+    spans.push(Span::raw(format!(
+        " · {}",
+        last_run(runs, member.id(), task.run_count, now)
+    )));
+    (Line::from(spans), body)
+}
+
+/// The view of a chat without an agent: what enter does (resume its
+/// session, or start a new one), what it was last asked, where it runs;
+/// `starting`: its agent was just started. `p_keeps`: `p` is the
+/// dashboard's (to say how to stop keeping a kept chat).
+pub fn chat(
+    chat: &Chat,
+    detail: Option<&TaskDetail>,
+    starting: bool,
+    p_keeps: bool,
+    now: u64,
+) -> Triage {
+    let info = &chat.info;
+    let dim = Style::new().fg(theme::get().muted);
+    let headline = if starting {
+        Line::styled(
+            "◌ starting · its agent is on its way",
+            Style::new()
+                .fg(theme::get().muted)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        let status = chat.status();
+        let (_, color) = status_display(&status);
+        let runs = detail.map_or(&[][..], |d| &d.runs[..]);
+        Line::from(vec![
+            Span::styled(
+                format!("{} {status}", glyph(status)),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                " · {}",
+                last_run(runs, &info.id, info.run_count, now)
+            )),
+        ])
+    };
+    let mut body = Vec::new();
+    if !starting {
+        let enter = match &info.session {
+            Some(_) => "enter resumes its session",
+            None => "enter starts its session",
+        };
+        body.push((enter.to_string(), dim));
+    }
+    if let Some(prompt) = &info.last_prompt {
+        body.push((format!("last prompt: {}", one_line(prompt)), Style::new()));
+    }
+    body.push((
+        format!(
+            "in {}",
+            super::ui::shorten_home(&info.dir.display().to_string())
+        ),
+        dim,
+    ));
+    if info.keep {
+        let unkeep = if p_keeps { " (p: no longer)" } else { "" };
+        body.push((format!("kept: never closed for want of turns{unkeep}"), dim));
+    }
+    let messages = detail
+        .map(|d| message_lines(&info.id, &d.messages, now))
+        .unwrap_or_default();
+    Triage {
+        headline,
+        body,
+        branch: None,
+        messages,
+    }
+}
+
+/// How the last run of `id` (a member or a chat) ended, or that it runs.
+fn last_run(runs: &[RunInfo], id: &str, run_count: usize, now: u64) -> String {
     let last = runs
         .iter()
-        .filter(|r| r.member == member.id())
+        .filter(|r| r.member == id)
         .max_by_key(|r| r.started_at);
-    let about = match last {
+    match last {
         Some(run) => match run.ended_at {
             Some(ended) => {
                 let how = match run.exit_code {
@@ -149,11 +228,9 @@ fn idle_lines(
                 age(now.saturating_sub(run.started_at))
             ),
         },
-        None if task.run_count == 0 => "no agent · never ran".into(),
+        None if run_count == 0 => "no agent · never ran".into(),
         None => "no agent".into(),
-    };
-    spans.push(Span::raw(format!(" · {about}")));
-    (Line::from(spans), body)
+    }
 }
 
 /// The member's branch, how it compares with the default branch and what it

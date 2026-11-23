@@ -43,9 +43,7 @@ pub struct Peek {
 /// How to move through an agent's screen and history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scroll {
-    PageUp,
-    PageDown,
-    /// Lines up (the mouse wheel).
+    /// Lines up (`k` in scroll mode, the mouse wheel).
     Up(u16),
     /// Lines down.
     Down(u16),
@@ -107,7 +105,6 @@ impl Peek {
             return;
         };
         let shown = self.first_line(screen);
-        let page = u64::from(self.height.saturating_sub(1).max(1));
         // Live again once the pane would reach the live screen's bottom.
         let bottom = screen.live + u64::from(screen.size().0);
         let height = u64::from(self.height);
@@ -125,8 +122,6 @@ impl Peek {
                 .filter(|line| line + height < bottom)
         };
         self.from = match scroll {
-            Scroll::PageUp => up(page),
-            Scroll::PageDown => down(page),
             Scroll::Up(lines) => up(u64::from(lines)),
             Scroll::Down(lines) => down(u64::from(lines)),
             Scroll::Oldest if screen.oldest < shown => Some(screen.oldest),
@@ -410,38 +405,40 @@ mod tests {
     }
 
     #[test]
-    fn paging_moves_through_history_and_back_to_live() {
+    fn lines_move_through_history_and_back_to_live() {
         // A 4-row screen, line N reading "line N+1": lines 20-23 on the
         // screen (the cursor's row blank), 10-19 in history.
         let screen = info(20, 4, &lines(21..=23), 20, 10, 20);
         let mut p = peek(&screen, 3);
         // The pane shows the content's bottom, cursor included: 21-23.
         assert_eq!(draw(&p, 20, 3), ["line 22", "line 23", ""]);
-        p.scroll(Scroll::PageDown);
+        p.scroll(Scroll::Down(1));
         assert_eq!(p.from, None, "already live");
 
-        p.scroll(Scroll::PageUp);
+        // A line up from what the pane shows.
+        p.scroll(Scroll::Up(1));
+        assert_eq!(p.from, Some(20));
+        assert_eq!(p.scrolled_back(), Some(0));
+        p.scroll(Scroll::Up(1));
         assert_eq!(p.from, Some(19));
         assert_eq!(p.scrolled_back(), Some(1));
-        for _ in 0..5 {
-            p.scroll(Scroll::PageUp);
+        for _ in 0..20 {
+            p.scroll(Scroll::Up(1));
         }
         // Stops at the oldest line kept.
         assert_eq!(p.from, Some(10));
-        p.scroll(Scroll::PageUp);
-        assert_eq!(p.from, Some(10));
-        p.scroll(Scroll::PageDown);
-        assert_eq!(p.from, Some(12));
+        p.scroll(Scroll::Down(1));
+        assert_eq!(p.from, Some(11));
         p.scroll(Scroll::Live);
         assert_eq!(p.from, None);
         p.scroll(Scroll::Oldest);
         assert_eq!(p.from, Some(10));
-        for _ in 0..5 {
-            p.scroll(Scroll::PageDown);
+        for _ in 0..10 {
+            p.scroll(Scroll::Down(1));
         }
         assert_eq!(p.from, Some(20));
-        // The next page reaches the live screen's bottom: live again.
-        p.scroll(Scroll::PageDown);
+        // The next line reaches the live screen's bottom: live again.
+        p.scroll(Scroll::Down(1));
         assert_eq!(p.from, None);
     }
 
@@ -463,7 +460,7 @@ mod tests {
     #[test]
     fn scrolled_back_view_stays_on_its_lines() {
         let mut p = peek(&info(20, 4, &lines(21..=23), 20, 10, 20), 3);
-        p.scroll(Scroll::PageUp);
+        p.scroll(Scroll::Up(2));
         assert_eq!(p.from, Some(19));
         // The daemon's window from line 19, after more output.
         p.set_screen(&info(20, 4, &rows(20..=23), 19, 10, 25));
@@ -484,7 +481,7 @@ mod tests {
     #[test]
     fn nothing_to_scroll_stays_live() {
         let mut p = peek(&info(20, 10, &lines(1..=3), 0, 0, 0), 5);
-        p.scroll(Scroll::PageUp);
+        p.scroll(Scroll::Up(1));
         p.scroll(Scroll::Oldest);
         assert_eq!(p.from, None);
     }

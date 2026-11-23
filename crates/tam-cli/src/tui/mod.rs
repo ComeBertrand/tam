@@ -340,9 +340,9 @@ async fn run_loop(
         app.sync_focus();
         // The pane keeps the keyboard only for the agent it took it for.
         app.check_typing();
-        // Typing into it is looking at it: the daemon is told with the
-        // watch (see `refresh_peek`).
-        if app.peek.viewing != matches!(app.mode, Mode::Terminal { .. }) {
+        // Typing into it or scrolling it is looking at it: the daemon is
+        // told with the watch (see `refresh_peek`).
+        if app.peek.viewing != app.mode.pane_agent().is_some() {
             screen_moved = true;
         }
         // Whatever moved the selection (a key, a re-sort, an agent starting
@@ -402,6 +402,8 @@ async fn run_loop(
 
         // Typed into the pane in this batch: one write, in order.
         let mut typed: Option<(String, Vec<u8>)> = None;
+        // Whatever scrolled the pane (leaving scroll mode, too): fetched again.
+        let from = app.peek.from;
         for ev in events {
             // As if drawn between them: keys act on the member the pane
             // would show.
@@ -562,6 +564,7 @@ async fn run_loop(
                 break;
             }
         }
+        screen_moved |= app.peek.from != from;
         if let Some((agent, bytes)) = typed {
             type_keys(client, app, agent, &bytes).await;
         }
@@ -609,6 +612,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::PickSession(_) => handle_session_key(key, app),
         Mode::Answer(_) => handle_answer_key(key, app),
         Mode::Terminal { .. } => handle_terminal_key(key, app),
+        Mode::Scroll { .. } => handle_scroll_key(key, app),
         Mode::ConfirmCloseChat { .. } => handle_close_chat_key(key, app),
         Mode::RenameChat { .. } => handle_rename_chat_key(key, app),
     }
@@ -641,7 +645,7 @@ fn paste_into_prompt(text: &str, app: &mut App, config: &Config) {
 /// other key goes to the agent as its bytes.
 fn handle_terminal_key(key: KeyEvent, app: &mut App) -> Action {
     if keys::is_leave(key) {
-        app.mode = Mode::Normal;
+        app.leave_pane();
         return Action::None;
     }
     let app_cursor = app
@@ -650,6 +654,24 @@ fn handle_terminal_key(key: KeyEvent, app: &mut App) -> Action {
         .as_ref()
         .is_some_and(|s| s.application_cursor());
     keys::encode(key, app_cursor).map_or(Action::None, Action::Keys)
+}
+
+/// The pane scrolls: `j`/`k` (`↓`/`↑`) a line, `g`/`G` (`home`/`end`) to
+/// the oldest line kept or the live screen; ctrl-] gives the keyboard back
+/// to the list, on the live screen. Any other key does nothing: neither the
+/// agent's nor the list's.
+fn handle_scroll_key(key: KeyEvent, app: &mut App) -> Action {
+    if keys::is_leave(key) {
+        app.leave_pane();
+        return Action::None;
+    }
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => Action::ScrollPeek(Scroll::Down(1)),
+        KeyCode::Char('k') | KeyCode::Up => Action::ScrollPeek(Scroll::Up(1)),
+        KeyCode::Char('g') | KeyCode::Home => Action::ScrollPeek(Scroll::Oldest),
+        KeyCode::Char('G') | KeyCode::End => Action::ScrollPeek(Scroll::Live),
+        _ => Action::None,
+    }
 }
 
 fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
@@ -667,9 +689,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         .map(|c| (c.info.clone(), c.agent.is_some()));
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::Quit,
-        // Vim's scroll keys, before the letters' own keys (ctrl-d is not drop).
-        (KeyCode::Char('u' | 'b'), KeyModifiers::CONTROL) => Action::ScrollPeek(Scroll::PageUp),
-        (KeyCode::Char('d' | 'f'), KeyModifiers::CONTROL) => Action::ScrollPeek(Scroll::PageDown),
+        // They scrolled the pane by pages once: never the letters' own keys
+        // (ctrl-d is not drop, ctrl-f not full screen).
+        (KeyCode::Char('u' | 'b' | 'd' | 'f'), KeyModifiers::CONTROL) => Action::None,
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
         // The agent's terminal on the whole screen; a chat's agent started
@@ -703,6 +725,13 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         },
         (KeyCode::Char('/'), _) => {
             app.filter_active = true;
+            Action::None
+        }
+        // The pane scrolls, a line at a time (see `handle_scroll_key`).
+        (KeyCode::Char('v'), _) => {
+            if let Some(agent) = app.peek_agent() {
+                app.mode = Mode::Scroll { agent };
+            }
             Action::None
         }
         (KeyCode::Char('n'), _) => Action::PickProject(Purpose::Task),
@@ -820,8 +849,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             Some(cmd) => custom_command(app, cmd),
             None => Action::None,
         },
-        (KeyCode::PageUp, _) => Action::ScrollPeek(Scroll::PageUp),
-        (KeyCode::PageDown, _) => Action::ScrollPeek(Scroll::PageDown),
         (KeyCode::Home, _) => Action::ScrollPeek(Scroll::Oldest),
         (KeyCode::End, _) => Action::ScrollPeek(Scroll::Live),
         _ => Action::None,
@@ -1009,11 +1036,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
     match &mut app.mode {
         Mode::Normal => {}
         // A click in the list gives it the keyboard back; the wheel scrolls
-        // as in the list.
-        Mode::Terminal { .. } => {
+        // the pane as in the list.
+        Mode::Terminal { .. } | Mode::Scroll { .. } => {
             let in_list = app.hits.list.contains(at);
             if click && in_list {
-                app.mode = Mode::Normal;
+                app.leave_pane();
             } else if in_list {
                 // The wheel there would move the selection, and the
                 // keyboard with it.
@@ -1404,7 +1431,7 @@ fn repository(dir: &std::path::Path) -> Result<PathBuf, String> {
 /// lines scrolled back to), and have the daemon tell when it changes.
 async fn refresh_peek(client: &mut Client, app: &mut App) {
     let wanted = app.peek_agent();
-    let viewing = matches!(app.mode, Mode::Terminal { .. });
+    let viewing = app.mode.pane_agent().is_some();
     let peek = &mut app.peek;
     if peek.agent != wanted {
         // Another agent: from its live screen.
@@ -2344,13 +2371,11 @@ mod tests {
     }
 
     #[test]
-    fn page_keys_scroll_the_preview() {
+    fn home_and_end_scroll_the_preview_page_keys_no_more() {
         let config = Config::default();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = App::new();
         for (code, scroll) in [
-            (KeyCode::PageUp, Scroll::PageUp),
-            (KeyCode::PageDown, Scroll::PageDown),
             (KeyCode::Home, Scroll::Oldest),
             (KeyCode::End, Scroll::Live),
         ] {
@@ -2359,6 +2384,189 @@ mod tests {
                 Action::ScrollPeek(s) if s == scroll
             ));
         }
+        for code in [KeyCode::PageUp, KeyCode::PageDown] {
+            assert!(matches!(
+                handle_normal_key(key(code), &mut app, &config),
+                Action::None
+            ));
+        }
+    }
+
+    #[test]
+    fn v_scrolls_the_pane_a_line_at_a_time_until_ctrl_bracket() {
+        use tam_proto::AgentState::{Blocked, Ready, Working};
+        let config = Config::default();
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let mut app = two_member_app(&[("m-1", Working), ("m-2", Blocked)]);
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        handle_key_event(press('v'), &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Scroll { agent } if agent == "m-2"));
+
+        let scrolls = |app: &mut App, code, modifiers| match handle_key_event(
+            key(code, modifiers),
+            app,
+            &Config::default(),
+        ) {
+            Action::ScrollPeek(scroll) => Some(scroll),
+            _ => None,
+        };
+        let none = KeyModifiers::NONE;
+        for (code, scroll) in [
+            (KeyCode::Char('j'), Scroll::Down(1)),
+            (KeyCode::Down, Scroll::Down(1)),
+            (KeyCode::Char('k'), Scroll::Up(1)),
+            (KeyCode::Up, Scroll::Up(1)),
+            (KeyCode::Char('g'), Scroll::Oldest),
+            (KeyCode::Home, Scroll::Oldest),
+            (KeyCode::End, Scroll::Live),
+        ] {
+            assert_eq!(scrolls(&mut app, code, none), Some(scroll), "{code:?}");
+        }
+        let shift = KeyModifiers::SHIFT;
+        assert_eq!(
+            scrolls(&mut app, KeyCode::Char('G'), shift),
+            Some(Scroll::Live)
+        );
+        // Every other key does nothing: neither the agent's (nothing typed)
+        // nor the list's (`d` would drop, `q` quit, enter type).
+        for (code, modifiers) in [
+            (KeyCode::Char('q'), none),
+            (KeyCode::Char('d'), none),
+            (KeyCode::Char('s'), none),
+            (KeyCode::Char('l'), none),
+            (KeyCode::Char('v'), none),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (KeyCode::Enter, none),
+            (KeyCode::Esc, none),
+        ] {
+            assert!(
+                matches!(
+                    handle_key_event(key(code, modifiers), &mut app, &config),
+                    Action::None
+                ),
+                "{code:?}"
+            );
+            assert!(matches!(&app.mode, Mode::Scroll { agent } if agent == "m-2"));
+        }
+        // A re-sort keeps it on its agent.
+        app.update_state("m-1", Blocked);
+        app.update_state("m-2", Ready);
+        app.sync_focus();
+        app.check_typing();
+        assert!(matches!(&app.mode, Mode::Scroll { agent } if agent == "m-2"));
+
+        // The wheel scrolls the pane, never the list (the selection, and
+        // the pane with it, would move).
+        draw(&mut app, 80, 24);
+        let pane = app.hits.pane.unwrap();
+        assert!(matches!(
+            handle_mouse(
+                mouse(MouseEventKind::ScrollUp, pane.x + 2, pane.y + 2),
+                &mut app
+            ),
+            Action::ScrollPeek(Scroll::Up(3))
+        ));
+        let list = app.hits.list;
+        assert!(matches!(
+            handle_mouse(mouse(MouseEventKind::ScrollDown, 3, list.y + 1), &mut app),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Scroll { .. }));
+
+        // ctrl-] (read as ctrl-5 without the kitty protocol): back to the
+        // list, on the live screen.
+        app.peek.from = Some(4);
+        let leave = key(KeyCode::Char('5'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            handle_key_event(leave, &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.peek.from, None);
+        assert!(matches!(
+            handle_key_event(press('j'), &mut app, &config),
+            Action::SelectNext
+        ));
+
+        // A click in the list leaves too.
+        handle_key_event(press('v'), &mut app, &config);
+        assert!(matches!(app.mode, Mode::Scroll { .. }));
+        app.peek.from = Some(4);
+        let click = MouseEventKind::Down(MouseButton::Left);
+        handle_mouse(mouse(click, 3, list.y + 1), &mut app);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.peek.from, None);
+
+        // Its agent exits: back to the list, and the keys still coming
+        // (a held `j`) are dropped, not run.
+        handle_key_event(press('v'), &mut app, &config);
+        let Mode::Scroll { agent } = &app.mode else {
+            panic!("not scrolling");
+        };
+        let agent = agent.clone();
+        app.remove_agent(&agent);
+        app.sync_focus();
+        app.check_typing();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status_message().unwrap().contains("the agent exited"));
+        let selected = app.selected;
+        assert!(matches!(
+            handle_key_event(press('j'), &mut app, &config),
+            Action::None
+        ));
+        assert_eq!(app.selected, selected);
+
+        // No agent: nothing to scroll.
+        app.dropping_keys_until = None;
+        app.remove_agent("m-1");
+        app.remove_agent("m-2");
+        app.sync_focus();
+        handle_key_event(press('v'), &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn v_scrolls_a_chat_s_pane_and_never_starts_its_agent() {
+        let config = Config::default();
+        let mut app = chat_app();
+        select(&mut app, Pick::Chat("c-1".into()));
+        handle_key_event(press('v'), &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Scroll { agent } if agent == "c-1"));
+        let leave = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL);
+        handle_key_event(leave, &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+        // Without an agent: nothing to scroll, and nothing resumed (as
+        // enter does).
+        select(&mut app, Pick::Chat("c-2".into()));
+        assert!(matches!(
+            handle_key_event(press('v'), &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.starting, None);
+    }
+
+    #[test]
+    fn v_is_a_custom_command_s_when_one_took_it() {
+        use tam_proto::AgentState::Working;
+        let config = Config {
+            commands: vec![CustomCommand {
+                name: "view".into(),
+                key: "v".into(),
+                command: "true".into(),
+            }],
+            ..Config::default()
+        };
+        let mut app = two_member_app(&[("m-1", Working)]);
+        app.commands = config.commands.clone();
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        assert!(matches!(
+            handle_key_event(press('v'), &mut app, &config),
+            Action::CustomCommand { ref name, .. } if name == "view"
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     /// Tasks `feat` (members app and web) and `other`, with the agents
@@ -2663,16 +2871,15 @@ mod tests {
         let h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
         handle_normal_key(h, &mut app, &config);
         assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
-        // ctrl-d and ctrl-u scroll the pane: never the drop dialog.
+        // ctrl-d, ctrl-u, ctrl-f and ctrl-b scrolled the pane by pages
+        // once: never the drop dialog nor full screen.
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        assert!(matches!(
-            handle_normal_key(ctrl('d'), &mut app, &config),
-            Action::ScrollPeek(Scroll::PageDown)
-        ));
-        assert!(matches!(
-            handle_normal_key(ctrl('u'), &mut app, &config),
-            Action::ScrollPeek(Scroll::PageUp)
-        ));
+        for c in ['d', 'u', 'f', 'b'] {
+            assert!(matches!(
+                handle_normal_key(ctrl(c), &mut app, &config),
+                Action::None
+            ));
+        }
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(attach_target(&mut app).as_deref(), Some("m-1"));
 

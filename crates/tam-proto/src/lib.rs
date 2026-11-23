@@ -679,9 +679,10 @@ pub enum Request {
     WatchScreen {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        /// The user is at this agent's screen (typing into it): the watch
-        /// counts as a viewer, as an attach does (no notification), until
-        /// the connection watches something else or closes.
+        /// The user is at this agent's screen (typing into it, or
+        /// scrolling through it): the watch counts as a viewer, as an
+        /// attach does (no notification), until the connection watches
+        /// something else or closes.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         viewing: bool,
     },

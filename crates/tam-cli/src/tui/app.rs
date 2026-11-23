@@ -77,6 +77,12 @@ pub enum Mode {
     Terminal {
         agent: String,
     },
+    /// The pane scrolls through this agent's screen and history: `j`/`k`
+    /// move it a line, until ctrl-] (back to the live screen). Keys go
+    /// neither to the agent nor to the list. Drawn as in `Normal`.
+    Scroll {
+        agent: String,
+    },
     /// Asks to close a chat.
     ConfirmCloseChat {
         id: String,
@@ -89,6 +95,16 @@ pub enum Mode {
         title: Option<String>,
         name: TextInput,
     },
+}
+
+impl Mode {
+    /// The agent whose pane has the keyboard: typed into, or scrolled.
+    pub fn pane_agent(&self) -> Option<&str> {
+        match self {
+            Mode::Terminal { agent } | Mode::Scroll { agent } => Some(agent),
+            _ => None,
+        }
+    }
 }
 
 /// What the repository picker picks for.
@@ -947,27 +963,39 @@ impl App {
         self.peek.agent != self.peek_agent()
     }
 
-    /// The pane keeps the keyboard only for the agent it took it for: while
-    /// the pane shows it, or while it starts for the chat the pane is on.
+    /// The pane keeps the keyboard (typed into or scrolled) only for the
+    /// agent it took it for: while the pane shows it, or while it starts
+    /// for the chat the pane is on.
     pub fn check_typing(&mut self) {
-        let Mode::Terminal { agent } = &self.mode else {
+        let Some(agent) = self.mode.pane_agent() else {
             return;
         };
-        let starting = self.starting.as_deref() == Some(agent.as_str())
+        let starting = self.starting.as_deref() == Some(agent)
             && self.focused().is_some_and(|f| f.id() == agent);
         match self.peek_agent() {
-            Some(shown) if shown == *agent => {}
+            Some(shown) if shown == agent => {}
             Some(_) => self.stop_typing("the pane shows another agent"),
             None if starting => {}
             None => self.stop_typing("the agent exited"),
         }
     }
 
+    /// The pane gives the keyboard back to the list, asked to (ctrl-], a
+    /// click in the list): scrolled, it shows the live screen again (the
+    /// event loop fetches it when `peek.from` changed).
+    pub fn leave_pane(&mut self) {
+        if matches!(self.mode, Mode::Scroll { .. }) {
+            self.peek.from = None;
+        }
+        self.mode = Mode::Normal;
+    }
+
     /// The pane gives the keyboard back without having been asked to
     /// (`why`): said in the status line, and the keys still coming are
-    /// dropped (see `dropping_keys_until`).
+    /// dropped (see `dropping_keys_until`): a held `j` scrolling the pane
+    /// would move the selection otherwise.
     pub fn stop_typing(&mut self, why: &str) {
-        if matches!(self.mode, Mode::Terminal { .. }) {
+        if self.mode.pane_agent().is_some() {
             self.mode = Mode::Normal;
             self.dropping_keys_until = Some(std::time::Instant::now() + TYPING_PAUSE);
             self.set_status(

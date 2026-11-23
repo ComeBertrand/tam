@@ -54,7 +54,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_footer(frame, footer_area, app);
 
     // Overlay popups, over a dimmed dashboard
-    if !matches!(app.mode, Mode::Normal | Mode::Terminal { .. }) {
+    if !matches!(
+        app.mode,
+        Mode::Normal | Mode::Terminal { .. } | Mode::Scroll { .. }
+    ) {
         let dim = Style::reset().fg(theme::get().muted);
         // Not the footer: it has the dialog's keys.
         frame.buffer_mut().set_style(header_area.union(body), dim);
@@ -71,6 +74,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Normal
         | Mode::Terminal { .. }
+        | Mode::Scroll { .. }
         | Mode::PickProject(..)
         | Mode::PickSession(_)
         | Mode::Answer(_) => {}
@@ -316,6 +320,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::raw(":back to the list  "),
                 Span::raw("every other key goes to the agent"),
             ],
+            Mode::Scroll { .. } => vec![
+                Span::styled(" j/k", Style::new().bold()),
+                Span::raw(":line down/up  "),
+                Span::styled("g/G", Style::new().bold()),
+                Span::raw(":oldest/live  "),
+                Span::styled("ctrl-]", Style::new().bold()),
+                Span::raw(":back to the list"),
+            ],
             Mode::Answer(ref dialog) => {
                 let mut hints = vec![Span::raw(" ")];
                 for (key, what) in dialog.hints(app.answer_stale()) {
@@ -422,7 +434,9 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         if selected.is_some_and(|t| t.members.len() > 1) {
             hints.push(("h/l", "member".into(), 1));
         }
-        hints.push(("pgup/pgdn", "scroll".into(), 3));
+        if has_agent && free('v') {
+            hints.push(("v", "scroll".into(), 3));
+        }
         if peek.from.is_some() {
             hints.push(("end", "live".into(), 1));
         }
@@ -543,25 +557,30 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
 
     let title = match peek.scrolled_back() {
         Some(0) => format!(" {label} · scrolled back "),
+        Some(1) => format!(" {label} · 1 line into history "),
         Some(n) => format!(" {label} · {n} lines into history "),
         None => format!(" {label} "),
     };
     let t = theme::get();
-    // The pane has the keyboard: its border says so.
+    // The pane has the keyboard (typed into, or scrolled): its border says so.
     let typing = matches!(app.mode, Mode::Terminal { .. });
+    let keyboard = app.mode.pane_agent().is_some();
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(if typing {
+        .border_type(if keyboard {
             BorderType::Thick
         } else {
             BorderType::Rounded
         })
-        .border_style(Style::new().fg(if typing { t.accent } else { t.subtle }))
+        .border_style(Style::new().fg(if keyboard { t.accent } else { t.subtle }))
         .title(Line::styled(title, Style::new().fg(t.accent).bold()));
-    if typing {
-        block = block.title_top(
-            Line::styled(" typing · ctrl-] back to the list ", t.chip(t.accent)).right_aligned(),
-        );
+    let chip = match app.mode {
+        Mode::Terminal { .. } => Some(" typing · ctrl-] back to the list "),
+        Mode::Scroll { .. } => Some(" scrolling · j/k · ctrl-] back to the list "),
+        _ => None,
+    };
+    if let Some(chip) = chip {
+        block = block.title_top(Line::styled(chip, t.chip(t.accent)).right_aligned());
     }
     // Not a request it waits on: its screen shows that one.
     let waiting = |state| matches!(state, AgentState::Blocked | AgentState::Question);
@@ -601,7 +620,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if t.rainbow && !typing {
+    if t.rainbow && !keyboard {
         rainbow_border(frame, area, app.spin.unwrap_or(0));
     }
     peek.room = (inner.width, inner.height);
@@ -1037,7 +1056,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
             "Pane",
             vec![
                 entry("h/l ←/→", "another member"),
-                entry("pgup/pgdn", "scroll (ctrl-u/d, wheel)"),
+                scroll_help(app),
                 entry("home/end", "oldest line / live"),
             ],
         ),
@@ -1142,6 +1161,15 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
 }
 
 /// The keys on a task or chat; one a custom command took says so.
+/// `v`, unless a custom command took it (the custom commands' section
+/// says which).
+fn scroll_help(app: &App) -> (String, String) {
+    match app.key_taken('v') {
+        None => ("v".into(), "scroll (j/k, wheel)".into()),
+        Some(_) => ("(v)".into(), "scroll: taken (wheel)".into()),
+    }
+}
+
 fn item_help(app: &App) -> Vec<(String, String)> {
     let entry = |key: &str, what: &str| (key.to_string(), what.to_string());
     let mut keys = vec![
@@ -1674,10 +1702,10 @@ mod tests {
         app.peek = Peek::default();
         let s = screen(&mut app, 80, 20);
         assert!(s.contains("(no agent running)"), "{s}");
-        assert!(s.contains("pgup/pgdn:scroll"), "{s}");
+        // Nothing to scroll.
+        assert!(!s.contains("v:scroll"), "{s}");
         // Narrower: the footer keeps what matters most, help among them.
         let s = screen(&mut app, 36, 20);
-        assert!(!s.contains("pgup/pgdn:scroll"), "{s}");
         assert!(s.contains("?:help  q:quit"), "{s}");
 
         // Lines 0-9 in history, the live screen (5 rows) shows 10-12.
@@ -1710,6 +1738,13 @@ mod tests {
         let s = screen(&mut app, 80, 20);
         assert!(s.contains("— · 6 lines into history"), "{s}");
         assert!(s.contains("end:live"), "{s}");
+        // One line up.
+        let peek = &mut app.peek;
+        peek.from = Some(9);
+        info.top = 9;
+        peek.set_screen(&info);
+        let s = screen(&mut app, 80, 20);
+        assert!(s.contains("— · 1 line into history"), "{s}");
     }
 
     // -- The triage pane ---------------------------------------------------
@@ -2550,6 +2585,53 @@ mod tests {
     }
 
     #[test]
+    fn v_scrolls_the_pane_and_says_how_to_leave() {
+        let mut app = dashboard();
+        select(&mut app, "unit-pricing");
+        let mut app = with_pane(app);
+        let agent = app.peek_agent().expect("an agent");
+        let s = screen(&mut app, 160, 40);
+        let footer = s.lines().last().unwrap();
+        assert!(footer.contains("v:scroll"), "{footer}");
+
+        app.mode = Mode::Scroll { agent };
+        let s = screen(&mut app, 160, 40);
+        show("scrolling", &s);
+        // The pane has the keyboard: a thick border, and how to leave.
+        assert!(
+            s.contains("scrolling · j/k · ctrl-] back to the list"),
+            "{s}"
+        );
+        assert!(s.contains('┏'), "{s}");
+        let footer = s.lines().last().unwrap();
+        for hint in [
+            "j/k:line down/up",
+            "g/G:oldest/live",
+            "ctrl-]:back to the list",
+        ] {
+            assert!(footer.contains(hint), "{hint}: {footer}");
+        }
+
+        // A custom command took `v`: its key, in the help too.
+        app.mode = Mode::Normal;
+        app.commands = vec![crate::config::CustomCommand {
+            name: "view".into(),
+            key: "v".into(),
+            command: "true".into(),
+        }];
+        let s = screen(&mut app, 160, 40);
+        let footer = s.lines().last().unwrap();
+        assert!(
+            !footer.contains("v:scroll") && footer.contains("v:view"),
+            "{footer}"
+        );
+        app.mode = Mode::Help;
+        let s = screen(&mut app, 100, 30);
+        show("help, v taken", &s);
+        assert!(s.contains("(v)       scroll: taken (wheel)"), "{s}");
+    }
+
+    #[test]
     fn the_list_groups_tasks_by_repository_with_member_rows() {
         let mut app = dashboard();
         let s = screen(&mut app, 80, 44);
@@ -3024,8 +3106,8 @@ mod tests {
         app.mode = Mode::Help;
         let s = screen(&mut app, 100, 30);
         show("help, N taken", &s);
-        assert!(s.contains("(N)        name a chat: taken"), "{s}");
-        assert!(s.contains("N          notes"), "{s}");
+        assert!(s.contains("(N)       name a chat: taken"), "{s}");
+        assert!(s.contains("N         notes"), "{s}");
     }
 
     #[test]
@@ -3341,6 +3423,9 @@ mod tests {
                     "unit-pricing/frontend".into(),
                     colors_and_size(),
                 )),
+                Mode::Scroll {
+                    agent: "m-5".into(),
+                },
             ]
         };
         for (width, height) in [(1, 1), (10, 3), (24, 6), (40, 10), (80, 24), (250, 70)] {

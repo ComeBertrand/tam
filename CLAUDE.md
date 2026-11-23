@@ -320,11 +320,22 @@ adopt). `tam-cli` depends on all three.
   `MessageSent`/`MessageDelivered`). `tui/branch.rs` asks git, read-only
   with `GIT_OPTIONAL_LOCKS=0`, off the UI thread, one worktree at a time
   (`App::branch_due`: the focused member every 10s, the others every 60s for
-  the task list, any after its state changes). `h`/`l` like `←`/`→`,
-  `ctrl-u`/`ctrl-d` like `pgup`/`pgdn`. Member actions (enter, `s`, `r`,
-  `R`, `a`, custom commands) apply to the focused member or chat
-  (`App::focused`, an `app::Focused`; `focused_member` for task-only
-  code): the one the pane shows: the most urgent one when
+  the task list, any after its state changes). `h`/`l` like `←`/`→`.
+  `v` scrolls the pane (`Mode::Scroll { agent }`, `handle_scroll_key`):
+  `j`/`k` (`↓`/`↑`) a line (`Scroll::Down(1)`/`Up(1)`: `Screen { from }`
+  again), `g`/`G` (`home`/`end`) the oldest line kept or live; every
+  other key does nothing (neither the agent's nor the list's). It ends
+  as typing does (`Mode::pane_agent` names the agent of either): ctrl-]
+  or a click in the list (`App::leave_pane`: back to the live screen), or
+  unasked through `check_typing`/`stop_typing`, the keys still coming
+  dropped (a held `j` would move the selection). Thick border, a chip
+  saying how to leave, the wheel over the list does nothing, and it
+  counts as viewing too. No page keys: `pgup`/`pgdn` do nothing, and
+  ctrl-u/d/f/b neither (never `d`'s drop or `f`'s attach); the wheel over
+  the pane and `home`/`end` scroll in the list's mode too. Member actions
+  (enter, `s`, `r`, `R`, `a`, custom commands) apply to the focused member
+  or chat (`App::focused`, an `app::Focused`; `focused_member` for
+  task-only code): the one the pane shows: the most urgent one when
   the selection landed on the task, pinned while the task stays selected (a
   key never acts on a member the pane did not show), and `←`/`→` move it.
   The dashboard redraws every second (times in state).
@@ -473,7 +484,7 @@ adopt). `tam-cli` depends on all three.
   sessions are to be opened from tam. Custom
   commands (`config::CommandValues`): `{task}` the task's name or the
   chat's label, `{id}` the member's or chat's id, `{dir}` the worktree or
-  the main checkout, `{provider}`. `c`, `p` and `N` came after custom
+  the main checkout, `{provider}`. `c`, `p`, `N` and `v` came after custom
   commands could bind them (`config::YIELDING_KEYS`): a config that binds
   one still loads (every command reads it, hooks too), the key runs the
   custom command (`App::key_taken`, checked first in `handle_normal_key`),

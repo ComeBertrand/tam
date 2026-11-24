@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
@@ -35,6 +36,14 @@ pub struct Launch {
     /// should `exec` the command, which then keeps its pid. Empty: none.
     pub wrapper: Vec<String>,
 }
+
+/// How long a process hung up ([`Pty::hang_up`]) has to exit before its
+/// process group is killed.
+const HANGUP_GRACE: Duration = Duration::from_secs(1);
+
+/// How long, once a process hung up exited, to wait for whatever else held
+/// its PTY (its jobs, the shell a wrapper forked) to let go of it.
+const RELEASE_WAIT: Duration = Duration::from_secs(1);
 
 /// `TERM` of a process whose caller has none (a script, cron): its
 /// terminal is a PTY, drawn by tam's screen and the viewers' terminals.
@@ -131,6 +140,14 @@ impl Pty {
         let pty = openpty(&size, None).context("failed to create PTY")?;
         let master = pty.master;
         let slave = pty.slave;
+        // Neither end is for the processes the daemon starts (this one
+        // gets the slave as its stdio, and other agents and shells, which
+        // run what the user types, nothing of it); and a PTY is released
+        // only once every process holding its slave lets go.
+        for fd in [&master, &slave] {
+            fcntl(fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+                .context("failed to set up PTY")?;
+        }
 
         // Grab raw fd before slave is consumed (valid in child after fork)
         let slave_raw_fd = slave.as_raw_fd();
@@ -226,6 +243,31 @@ impl Pty {
             if Instant::now() >= deadline {
                 return false;
             }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Hang the process up, as a terminal that closes does: SIGHUP, on
+    /// which an interactive shell hangs up its jobs (each in a process
+    /// group of its own) and exits; then, if it is still there after
+    /// [`HANGUP_GRACE`], SIGKILL to its process group. Returns once it
+    /// exited and nothing holds the PTY any more (its jobs are gone, and
+    /// so is the shell when the process is a wrapper that forked it), or
+    /// [`RELEASE_WAIT`] after it exited: a job that ignored the hangup is
+    /// left. A shell that does not hang up its jobs (dash) leaves them.
+    pub fn hang_up(&mut self) {
+        let pid = Pid::from_raw(self.child.id() as i32);
+        let _ = kill(pid, Signal::SIGHUP);
+        if !self.wait_exit(HANGUP_GRACE) {
+            // Not reaped: the pid is still the group's.
+            let _ = killpg(pid, Signal::SIGKILL);
+            if !self.wait_exit(Duration::from_secs(2)) {
+                error!(pid = %self.child.id(), "process did not exit after SIGKILL, abandoning");
+                return;
+            }
+        }
+        let deadline = Instant::now() + RELEASE_WAIT;
+        while !self.released() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
     }

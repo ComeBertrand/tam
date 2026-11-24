@@ -1,12 +1,10 @@
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tam_proto::{AgentInfo, AgentResponse, AgentState, Ask, ScreenInfo};
-use tokio::sync::{broadcast, watch};
+use tam_proto::{AgentInfo, AgentResponse, AgentState, Ask};
 
 use crate::provider::{HookData, HookResult, Provider};
 pub use crate::pty::Launch;
@@ -119,10 +117,6 @@ impl Agent {
     /// started: members that joined since are not among them.
     pub fn readable(&self) -> &[PathBuf] {
         &self.readable
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.pty.pid()
     }
 
     pub fn provider_name(&self) -> &str {
@@ -254,42 +248,6 @@ impl Agent {
 
     pub fn context_percent(&self) -> Option<u8> {
         self.context_percent
-    }
-
-    /// Get the viewer count handle for increment/decrement by attach sessions.
-    pub fn viewers(&self) -> Arc<AtomicUsize> {
-        self.pty.viewers()
-    }
-
-    /// See [`Pty::attach_output`].
-    pub fn attach_output(&self) -> (Vec<u8>, broadcast::Receiver<Vec<u8>>) {
-        self.pty.attach_output()
-    }
-
-    /// The text of the agent's terminal: history, then screen.
-    pub fn text(&self) -> String {
-        self.pty.text()
-    }
-
-    /// Get a clone of the PTY master fd (kept alive by Arc).
-    pub fn pty_master(&self) -> Arc<OwnedFd> {
-        self.pty.master()
-    }
-
-    /// Resize the agent's PTY (at least 1×1) and notify the agent process.
-    pub fn resize(&self, cols: u16, rows: u16) {
-        self.pty.resize(cols, rows);
-    }
-
-    /// The agent's screen: live, or scrolled back to line `from`.
-    pub fn screen(&self, from: Option<u64>) -> ScreenInfo {
-        self.pty.screen(from)
-    }
-
-    /// Notified on each change of the agent's screen. Closed once the agent
-    /// and its PTY are gone.
-    pub fn screen_changes(&self) -> watch::Receiver<()> {
-        self.pty.screen_changes()
     }
 
     /// Whether messages reach the agent through its inbox hook.

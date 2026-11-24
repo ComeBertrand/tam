@@ -10,5 +10,6 @@ pub mod peers;
 pub mod provider;
 pub mod pty;
 pub mod sessions;
+pub mod shell;
 pub mod terminal;
 mod worktrees;

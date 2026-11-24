@@ -630,6 +630,12 @@ impl Client {
         match self.send(request).await? {
             Response::Member { task, member, .. } => Ok(Target::Member(task, *member)),
             Response::Chat { chat, runs } => Ok(Target::Chat(*chat, runs)),
+            // No command takes a shell yet (#83).
+            Response::Shell { shell } => Err(anyhow::anyhow!(
+                "'{}' is a shell ({}), not a task member or a chat",
+                shell.id,
+                shell.name()
+            )),
             other => Err(not_found("ResolveTarget", other)),
         }
     }

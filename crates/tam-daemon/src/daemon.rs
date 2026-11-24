@@ -23,7 +23,9 @@ use crate::inbox::{self, Handover, Inbox, ReplyOutcome};
 use crate::ledger::{ChatSession, Ledger, Owner};
 use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
+use crate::pty::Pty;
 use crate::sessions;
+use crate::shell::{self, Place, Shell};
 use crate::worktrees::{self, Checked, Observation, Recorded, Removal};
 
 pub struct Daemon {
@@ -33,10 +35,17 @@ pub struct Daemon {
     chat_sessions_every: Duration,
     autoclean: autoclean::Source,
     autoclean_every: Duration,
+    idle_timeout: Duration,
 }
 
 struct DaemonState {
     agents: HashMap<String, Agent>,
+    /// Shells, by id (`sh-xxxxxxxx`): apart from the agents, so that
+    /// nothing about agents (hooks, state, notifications, runs, messages,
+    /// autoclean) sees them. The PTY requests find either (`pty`).
+    shells: HashMap<String, Shell>,
+    /// The next shell's opening order.
+    next_shell: u64,
     /// Task ledger — the daemon is its only writer.
     ledger: Ledger,
     /// Tasks being dropped: no agent may start in them meanwhile.
@@ -52,6 +61,8 @@ struct DaemonState {
     connected_clients: Arc<AtomicUsize>,
     /// When set, the daemon will shut down after this instant if still idle.
     idle_deadline: Option<Instant>,
+    /// How long the daemon stays up with no agent, no shell and no client.
+    idle_timeout: Duration,
     /// Message delivery state (the messages are in the ledger).
     inbox: Inbox,
     /// What changed in a member's task since its agent last heard (merge,
@@ -61,8 +72,8 @@ struct DaemonState {
     asks: answer::Asks,
 }
 
-/// Default idle timeout before daemon auto-shuts down (seconds).
-const IDLE_TIMEOUT_SECS: u64 = 30;
+/// How long the daemon stays up with no agent, no shell and no client.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Capacity of the event broadcast channel. A subscriber that falls this far
 /// behind misses events.
@@ -93,7 +104,15 @@ impl Daemon {
             chat_sessions_every: CHAT_SESSION_INTERVAL,
             autoclean: autoclean::Source::default(),
             autoclean_every: autoclean::INTERVAL,
+            idle_timeout: IDLE_TIMEOUT,
         }
+    }
+
+    /// Shut down after `timeout` with no agent, no shell and no client
+    /// instead of [`IDLE_TIMEOUT`].
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
     }
 
     /// Read what Claude's files say of the chats' sessions every
@@ -161,6 +180,8 @@ impl Daemon {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let state = Arc::new(Mutex::new(DaemonState {
             agents: HashMap::new(),
+            shells: HashMap::new(),
+            next_shell: 0,
             ledger,
             dropping: HashSet::new(),
             worktrees: Arc::new(Mutex::new(())),
@@ -170,6 +191,7 @@ impl Daemon {
             socket_path: self.socket_path.clone(),
             connected_clients: Arc::new(AtomicUsize::new(0)),
             idle_deadline: None,
+            idle_timeout: self.idle_timeout,
             inbox: Inbox::default(),
             peer_changes: HashMap::new(),
             asks: answer::Asks::default(),
@@ -319,16 +341,16 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             let _ = state.event_tx.send(Event::StateChange { id, old, new });
         }
 
-        // Auto-shutdown: if no agents and no clients, start countdown
-        let has_agents = !state.agents.is_empty();
+        // Auto-shutdown: if no agents, shells and clients, start countdown
+        let has_agents = !state.agents.is_empty() || !state.shells.is_empty();
         let has_clients = state.connected_clients.load(Ordering::Relaxed) > 0;
 
         if has_agents || has_clients {
             state.idle_deadline = None;
         } else if state.idle_deadline.is_none() {
-            let deadline = Instant::now() + std::time::Duration::from_secs(IDLE_TIMEOUT_SECS);
-            info!("no agents or clients, auto-shutdown in {IDLE_TIMEOUT_SECS}s");
-            state.idle_deadline = Some(deadline);
+            let timeout = state.idle_timeout;
+            info!("no agents, shells or clients, auto-shutdown in {timeout:?}");
+            state.idle_deadline = Some(Instant::now() + timeout);
         } else if let Some(deadline) = state.idle_deadline {
             if Instant::now() >= deadline {
                 info!("idle timeout reached, auto-shutting down");
@@ -409,7 +431,7 @@ impl DaemonState {
     }
 
     /// Remove agents whose process exited, telling clients and recording the
-    /// end of their run.
+    /// end of their run; and shells whose process exited.
     fn reap_exited(&mut self) {
         let exited: Vec<(String, i32)> = self
             .agents
@@ -422,6 +444,48 @@ impl DaemonState {
                 self.agent_gone(&id, &agent, exit_code);
             }
         }
+        self.reap_shells();
+    }
+
+    /// Remove the shells whose process exited, telling clients.
+    fn reap_shells(&mut self) {
+        let exited: Vec<String> = self
+            .shells
+            .iter_mut()
+            .filter_map(|(id, shell)| shell.has_exited().then(|| id.clone()))
+            .collect();
+        for id in exited {
+            info!(id = %id, "shell exited");
+            self.shells.remove(&id);
+            self.broadcast(Event::ShellClosed { id });
+        }
+    }
+
+    /// The PTY of an agent or a shell: what the requests on terminals
+    /// (attach, screen, keys, size, scrollback) act on.
+    fn pty(&self, id: &str) -> Option<&Pty> {
+        match self.agents.get(id) {
+            Some(agent) => Some(agent.pty()),
+            None => self.shells.get(id).map(Shell::pty),
+        }
+    }
+
+    /// Take the shells of these task members out of the table, telling
+    /// clients. The caller closes them.
+    fn take_shells_of(&mut self, members: &[String]) -> Vec<Shell> {
+        let ids: Vec<String> = self
+            .shells
+            .iter()
+            .filter(|(_, s)| s.member().is_some_and(|m| members.iter().any(|id| id == m)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| {
+                let shell = self.shells.remove(&id)?;
+                self.broadcast(Event::ShellClosed { id });
+                Some(shell)
+            })
+            .collect()
     }
 
     /// An agent was removed from the table: emit `AgentExited` and record the
@@ -596,14 +660,14 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 if let Request::Attach { id, cols, rows } = request {
                     let attach_resources = {
                         let state_guard = state.lock().await;
-                        match state_guard.agents.get(&id) {
-                            Some(agent) => {
+                        match state_guard.pty(&id) {
+                            Some(pty) => {
                                 // Before the replay: it is drawn at this size.
-                                agent.resize(cols, rows);
-                                let (replay, output_rx) = agent.attach_output();
-                                Ok((output_rx, replay, agent.pty_master(), agent.viewers()))
+                                pty.resize(cols, rows);
+                                let (replay, output_rx) = pty.attach_output();
+                                Ok((output_rx, replay, pty.master(), pty.viewers()))
                             }
-                            None => Err(format!("agent '{}' not found", id)),
+                            None => Err(not_found(&id)),
                         }
                     };
 
@@ -631,25 +695,25 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                             screen_watch = None;
                             Response::Ok
                         }
-                        Some(id) => match state.lock().await.agents.get(&id) {
-                            Some(agent) => {
+                        Some(id) => match state.lock().await.pty(&id) {
+                            Some(pty) => {
                                 screen_watch = Some(ScreenWatch {
-                                    changes: agent.screen_changes(),
+                                    changes: pty.screen_changes(),
                                     id,
                                     quiet_until: None,
                                     typing_until: None,
-                                    _viewer: viewing.then(|| Viewer::of(agent.viewers())),
+                                    _viewer: viewing.then(|| Viewer::of(pty.viewers())),
                                 });
                                 Response::Ok
                             }
                             None => Response::Error {
-                                message: format!("agent '{}' not found", id),
+                                message: not_found(&id),
                             },
                         },
                     };
                     write_response(&mut writer, &response).await?;
                 } else if let Request::Keys { id, data } = request {
-                    let master = state.lock().await.agents.get(&id).map(|a| a.pty_master());
+                    let master = state.lock().await.pty(&id).map(Pty::master);
                     let response = match master {
                         Some(master) => {
                             // Off the runtime: a PTY whose agent reads nothing blocks.
@@ -669,12 +733,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                 Response::Ok
                             } else {
                                 Response::Error {
-                                    message: format!("could not type into agent '{id}'"),
+                                    message: format!("could not type into '{id}'"),
                                 }
                             }
                         }
                         None => Response::Error {
-                            message: format!("agent '{}' not found", id),
+                            message: not_found(&id),
                         },
                     };
                     write_response(&mut writer, &response).await?;
@@ -941,12 +1005,12 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::AdoptWorktree { dir, name, join } => {
             handle_adopt_worktree(state, dir, name, join).await
         }
-        Request::Screen { id, from } => match state.lock().await.agents.get(&id) {
-            Some(agent) => Response::Screen {
-                screen: agent.screen(from),
+        Request::Screen { id, from } => match state.lock().await.pty(&id) {
+            Some(pty) => Response::Screen {
+                screen: pty.screen(from),
             },
             None => Response::Error {
-                message: format!("agent '{}' not found", id),
+                message: not_found(&id),
             },
         },
         Request::WatchScreen { .. } => Response::Error {
@@ -1038,6 +1102,25 @@ async fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response
         Request::ResolveTarget { target, from } => {
             handle_resolve_target(state, &target, from.as_deref()).await
         }
+        Request::OpenShell { on, env, wrapper } => {
+            handle_open_shell(state, on, crate::agent::Launch { env, wrapper }).await
+        }
+        Request::ListShells => {
+            let mut state = state.lock().await;
+            state.reap_shells();
+            Response::Shells {
+                shells: state.shells_in_order(),
+            }
+        }
+        Request::CloseShell { id } => handle_close_shell(state, &id).await,
+    }
+}
+
+/// The error for an id that is no running agent's or open shell's.
+fn not_found(id: &str) -> String {
+    match shell::is_shell_id(id) {
+        true => format!("shell '{id}' not found"),
+        false => format!("agent '{id}' not found"),
     }
 }
 
@@ -1113,7 +1196,7 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         id
     });
 
-    if state.agents.contains_key(&id) {
+    if state.agents.contains_key(&id) || state.shells.contains_key(&id) {
         return Response::Error {
             message: format!("agent '{}' already exists", id),
         };
@@ -1291,6 +1374,11 @@ async fn handle_list(state: &Arc<Mutex<DaemonState>>) -> Response {
 
 async fn handle_kill(state: &Arc<Mutex<DaemonState>>, id: &str) -> Response {
     let mut state = state.lock().await;
+    if state.shells.contains_key(id) {
+        return Response::Error {
+            message: format!("'{id}' is a shell, not an agent: close it (CloseShell)"),
+        };
+    }
 
     match state.agents.remove(id) {
         Some(agent) => {
@@ -1310,10 +1398,10 @@ async fn handle_kill(state: &Arc<Mutex<DaemonState>>, id: &str) -> Response {
 
 async fn handle_scrollback(state: &Arc<Mutex<DaemonState>>, id: &str) -> Response {
     let state = state.lock().await;
-    match state.agents.get(id) {
-        Some(agent) => Response::Scrollback { data: agent.text() },
+    match state.pty(id) {
+        Some(pty) => Response::Scrollback { data: pty.text() },
         None => Response::Error {
-            message: format!("agent '{}' not found", id),
+            message: not_found(id),
         },
     }
 }
@@ -1325,13 +1413,13 @@ async fn handle_resize(
     rows: u16,
 ) -> Response {
     let state = state.lock().await;
-    match state.agents.get(id) {
-        Some(agent) => {
-            agent.resize(cols, rows);
+    match state.pty(id) {
+        Some(pty) => {
+            pty.resize(cols, rows);
             Response::Ok
         }
         None => Response::Error {
-            message: format!("agent '{}' not found", id),
+            message: not_found(id),
         },
     }
 }
@@ -1399,20 +1487,24 @@ async fn handle_hook_event(
 async fn handle_shutdown(state: &Arc<Mutex<DaemonState>>) -> Response {
     let mut state = state.lock().await;
 
-    // Remove all agents and kill in background
+    // Remove all agents and shells, and stop them in background
     let agents: Vec<_> = state.agents.drain().collect();
     for (id, agent) in &agents {
         state.agent_gone(id, agent, -1);
     }
     let agents: Vec<_> = agents.into_iter().map(|(_, agent)| agent).collect();
+    let shells: Vec<_> = state.shells.drain().collect();
+    let shells: Vec<_> = shells
+        .into_iter()
+        .map(|(id, shell)| {
+            state.broadcast(Event::ShellClosed { id });
+            shell
+        })
+        .collect();
     state.shutdown = true;
 
-    if !agents.is_empty() {
-        tokio::task::spawn_blocking(move || {
-            for agent in agents {
-                agent.kill_and_drop();
-            }
-        });
+    if !agents.is_empty() || !shells.is_empty() {
+        tokio::task::spawn_blocking(move || stop_all(agents, shells));
     }
 
     info!("shutdown requested");
@@ -1522,11 +1614,21 @@ async fn stop_and_remove(
         refuse_lossy_drop(&checked, delete_branch)?;
     }
 
-    let agents = state.lock().await.take_task_agents(name);
-    let stopped = !agents.is_empty();
-    if stopped {
-        info!(task = %name, "stopping agent of dropped task");
-        blocking(move || agents.into_iter().for_each(Agent::kill_and_drop)).await?;
+    let (agents, shells) = {
+        let mut state = state.lock().await;
+        let members = state.ledger.member_ids(name);
+        (state.take_task_agents(name), state.take_shells_of(&members))
+    };
+    let stopped = Stopped::of(&agents, &shells);
+    if stopped.any() {
+        info!(
+            task = %name,
+            agents = agents.len(),
+            shells = shells.len(),
+            "stopping the agents and closing the shells of dropped task"
+        );
+        // Gone before the worktrees are removed.
+        blocking(move || stop_all(agents, shells)).await?;
         if !force {
             checked = check(dirs).await?;
             refuse_lossy_drop(&checked, delete_branch)?;
@@ -1535,15 +1637,8 @@ async fn stop_and_remove(
 
     blocking(move || worktrees::remove_all(&checked, delete_branch))
         .await?
-        .map_err(|e| {
-            let agent = if stopped {
-                " (its agent was stopped)"
-            } else {
-                ""
-            };
-            Response::Error {
-                message: format!("Task '{name}' kept{agent}: {e}"),
-            }
+        .map_err(|e| Response::Error {
+            message: format!("Task '{name}' kept{}: {e}", stopped.note()),
         })
 }
 
@@ -1686,11 +1781,21 @@ async fn stop_and_remove_member(
     if !force {
         refuse_lossy_drop(&checked, delete_branch)?;
     }
-    let agent = state.lock().await.take_member_agent(&member.id);
-    let stopped = agent.is_some();
-    if let Some(agent) = agent {
-        info!(member = %member.id, "stopping agent of dropped member");
-        blocking(move || agent.kill_and_drop()).await?;
+    let (agents, shells) = {
+        let mut state = state.lock().await;
+        let agent = state.take_member_agent(&member.id);
+        let shells = state.take_shells_of(std::slice::from_ref(&member.id));
+        (Vec::from_iter(agent), shells)
+    };
+    let stopped = Stopped::of(&agents, &shells);
+    if stopped.any() {
+        info!(
+            member = %member.id,
+            shells = shells.len(),
+            "stopping the agent and closing the shells of dropped member"
+        );
+        // Gone before the worktree is removed.
+        blocking(move || stop_all(agents, shells)).await?;
         if !force {
             checked = check(member.dir.clone()).await?;
             refuse_lossy_drop(&checked, delete_branch)?;
@@ -1699,16 +1804,51 @@ async fn stop_and_remove_member(
     let label = label.to_string();
     blocking(move || worktrees::remove_all(&checked, delete_branch))
         .await?
-        .map_err(|e| {
-            let agent = if stopped {
-                " (its agent was stopped)"
-            } else {
-                ""
-            };
-            Response::Error {
-                message: format!("'{label}' kept{agent}: {e}"),
-            }
+        .map_err(|e| Response::Error {
+            message: format!("'{label}' kept{}: {e}", stopped.note()),
         })
+}
+
+/// What a drop stopped before removing worktrees, for its error.
+#[derive(Clone, Copy)]
+struct Stopped {
+    agents: bool,
+    shells: bool,
+}
+
+impl Stopped {
+    fn of(agents: &[Agent], shells: &[Shell]) -> Self {
+        Self {
+            agents: !agents.is_empty(),
+            shells: !shells.is_empty(),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.agents || self.shells
+    }
+
+    fn note(self) -> &'static str {
+        match (self.agents, self.shells) {
+            (false, false) => "",
+            (true, false) => " (its agent was stopped)",
+            (false, true) => " (its shells were closed)",
+            (true, true) => " (its agent was stopped, its shells closed)",
+        }
+    }
+}
+
+/// Stop agents and close shells, all at once, and wait for them.
+/// Blocking: off the async runtime, outside the state lock.
+fn stop_all(agents: Vec<Agent>, shells: Vec<Shell>) {
+    std::thread::scope(|scope| {
+        for agent in agents {
+            scope.spawn(move || agent.kill_and_drop());
+        }
+        for shell in shells {
+            scope.spawn(move || shell.close());
+        }
+    });
 }
 
 impl DaemonState {
@@ -3666,8 +3806,156 @@ async fn handle_resolve_target(
             runs: state.ledger.runs_of(&chat.id),
             chat: Box::new(chat),
         },
+        // After every other kind: a shell's id.
+        Err(_) if state.shells.contains_key(target) => Response::Shell {
+            shell: Box::new(state.shells[target].info(target)),
+        },
         Err(e) => Response::Error {
             message: format!("{e:#}"),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shells (#81): the user's `$SHELL` on a task member's worktree or a
+// repository's main checkout (see `shell.rs`). In memory only.
+// ---------------------------------------------------------------------------
+
+impl DaemonState {
+    /// The open shells, in the order they were opened.
+    fn shells_in_order(&self) -> Vec<tam_proto::ShellInfo> {
+        let mut shells: Vec<(&String, &Shell)> = self.shells.iter().collect();
+        shells.sort_by_key(|(_, shell)| shell.seq());
+        shells
+            .into_iter()
+            .map(|(id, shell)| shell.info(id))
+            .collect()
+    }
+
+    /// Where a shell on task member `target` opens: its worktree, unless
+    /// the worktree is gone or broken, or its task is being dropped.
+    fn member_place(&self, target: &str) -> Result<(Place, PathBuf, String), String> {
+        let (task, member) = self.ledger.resolve(target).map_err(|e| format!("{e:#}"))?;
+        let label = task.member_label(&member);
+        if self.dropping.contains(&task.name) {
+            return Err(format!("task '{}' is being dropped", task.name));
+        }
+        match self.ledger.health(&member.id) {
+            Some(MemberHealth::Gone { .. }) => {
+                return Err(format!(
+                    "the worktree of '{label}' is gone ({})",
+                    member.dir.display()
+                ))
+            }
+            Some(MemberHealth::Broken { problem }) => {
+                return Err(format!("the worktree of '{label}' is broken: {problem}"))
+            }
+            Some(MemberHealth::Ok { .. }) | None => {}
+        }
+        Ok((Place::Member(member.id), member.dir, member.repo))
+    }
+}
+
+/// Open a shell on a member's worktree or a main checkout, numbered in its
+/// place: the highest number open there plus one.
+async fn handle_open_shell(
+    state: &Arc<Mutex<DaemonState>>,
+    on: tam_proto::ShellPlace,
+    launch: crate::agent::Launch,
+) -> Response {
+    let error = |message: String| Response::Error {
+        message: format!("cannot open a shell: {message}"),
+    };
+    let place = match on {
+        tam_proto::ShellPlace::Member(target) => {
+            let state = state.lock().await;
+            return match state.member_place(&target) {
+                Ok(place) => open_shell(state, place, &launch),
+                Err(why) => error(why),
+            };
+        }
+        // Git runs before the lock.
+        tam_proto::ShellPlace::Checkout(dir) => match run_git(move || main_checkout(&dir)).await {
+            Ok(dir) => {
+                let repo = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.display().to_string());
+                (Place::Checkout(dir.clone()), dir, repo)
+            }
+            Err(e) => return error(format!("{e:#}")),
+        },
+    };
+    open_shell(state.lock().await, place, &launch)
+}
+
+/// Open the shell, in one hold of the lock: its task cannot be claimed by a
+/// drop in between, nor its number taken.
+fn open_shell(
+    mut state: tokio::sync::MutexGuard<'_, DaemonState>,
+    (place, dir, repo): (Place, PathBuf, String),
+    launch: &crate::agent::Launch,
+) -> Response {
+    // A shell that exited no longer holds its number.
+    state.reap_shells();
+    let number = shell::next_number(
+        state
+            .shells
+            .values()
+            .filter(|s| *s.place() == place)
+            .map(Shell::number),
+    );
+    let id = shell::new_id(|id| state.shells.contains_key(id) || state.agents.contains_key(id));
+    let seq = state.next_shell;
+    let opening = shell::Opening {
+        place,
+        dir,
+        repo,
+        number,
+        seq,
+    };
+    match Shell::open(opening, launch) {
+        Ok(opened) => {
+            let info = opened.info(&id);
+            info!(
+                id = %id,
+                member = ?info.member,
+                dir = %info.dir.display(),
+                number,
+                "shell opened"
+            );
+            state.next_shell += 1;
+            state.shells.insert(id, opened);
+            state.broadcast(Event::ShellOpened {
+                shell: info.clone(),
+            });
+            Response::Shell {
+                shell: Box::new(info),
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("cannot open a shell: {e:#}"),
+        },
+    }
+}
+
+/// Close a shell: take it out of the table (clients are told), hang it up
+/// and wait for it outside the lock. Replies the shell as it was.
+async fn handle_close_shell(state: &Arc<Mutex<DaemonState>>, id: &str) -> Response {
+    let (shell, info) = {
+        let mut state = state.lock().await;
+        let Some(shell) = state.shells.remove(id) else {
+            return Response::Error {
+                message: not_found(id),
+            };
+        };
+        let info = shell.info(id);
+        state.broadcast(Event::ShellClosed { id: id.to_string() });
+        (shell, info)
+    };
+    info!(id = %id, "closing shell");
+    let _ = tokio::task::spawn_blocking(move || shell.close()).await;
+    Response::Shell {
+        shell: Box::new(info),
     }
 }

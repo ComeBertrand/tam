@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Protocol version. Increment on any breaking wire format change.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// What an agent is doing right now.
 /// Agents that exit (successfully or with error) are cleaned up immediately —
@@ -390,6 +390,56 @@ pub struct SessionInfo {
     pub modified_at: u64,
 }
 
+/// A shell: the user's `$SHELL` on a PTY the daemon runs, in a task
+/// member's worktree or a repository's main checkout. Not an agent: no
+/// state, hooks, runs or messages, and nothing of it in the ledger (a
+/// daemon restart closes it). Its screen, keys, attach and size go through
+/// the requests an agent's do, with its id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellInfo {
+    /// `sh-` and 8 hex digits.
+    pub id: String,
+    /// The task member whose worktree it runs in: it stays the member's
+    /// when the member moves to another task (merge, split). `None` on a
+    /// main checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// Where it runs: the member's worktree, or the main checkout.
+    pub dir: PathBuf,
+    /// Repository name (the directory name of its main checkout).
+    pub repo: String,
+    /// Its number among the shells of its place (a member, a main
+    /// checkout): the highest one open there when it opened, plus one; 1
+    /// when none was. It never changes: `Shell #3` stays `Shell #3`.
+    pub number: u32,
+    /// Pid of its process (of the wrapper, which should `exec` the shell).
+    pub pid: u32,
+    /// Unix timestamp (seconds) of when it was opened.
+    pub opened_at: u64,
+    /// Clients attached to it, or typing into it (`WatchScreen.viewing`).
+    #[serde(default)]
+    pub viewers: usize,
+}
+
+impl ShellInfo {
+    /// How to name it to the user: `Shell #3`.
+    pub fn name(&self) -> String {
+        format!("Shell #{}", self.number)
+    }
+}
+
+/// Where a shell opens (`Request::OpenShell`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellPlace {
+    /// A task member's worktree: what `ResolveMember` takes as a target (a
+    /// member id, a task name for its only member, `<task>/<member>`).
+    Member(String),
+    /// A repository's main checkout (an absolute path, not a linked
+    /// worktree nor a directory inside the checkout).
+    Checkout(PathBuf),
+}
+
 /// A new task member's worktree: one the client created (`CreateTask`), or
 /// one for the daemon to create (`CreateMembers`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,17 +574,20 @@ pub enum Request {
     Kill {
         id: String,
     },
+    /// Relay an agent's or a shell's terminal on this connection, at this
+    /// size: replies `Attached`, then raw bytes both ways.
     Attach {
         id: String,
         cols: u16,
         rows: u16,
     },
-    /// The text of an agent's terminal, without formatting: its history,
-    /// then its screen. Replies `Scrollback`.
+    /// The text of an agent's (or a shell's) terminal, without formatting:
+    /// its history, then its screen. Replies `Scrollback`.
     Scrollback {
         id: String,
     },
-    /// Resize an agent's PTY (e.g. when a viewer's terminal changes size).
+    /// Resize an agent's (or a shell's) PTY (e.g. when a viewer's terminal
+    /// changes size).
     Resize {
         id: String,
         cols: u16,
@@ -665,7 +718,7 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         join: Option<String>,
     },
-    /// An agent's terminal screen. Replies `Screen`.
+    /// An agent's (or a shell's) terminal screen. Replies `Screen`.
     Screen {
         id: String,
         /// Scroll back: the line to show first (see `ScreenInfo`), clamped
@@ -674,8 +727,8 @@ pub enum Request {
         from: Option<u64>,
     },
     /// Receive `ScreenUpdated` events on this connection when this agent's
-    /// screen changes, in place of the agent watched so far; `None` stops
-    /// them. They stop too when the agent exits. Replies `Ok`.
+    /// (or shell's) screen changes, in place of the one watched so far;
+    /// `None` stops them. They stop too when it exits. Replies `Ok`.
     WatchScreen {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -686,10 +739,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         viewing: bool,
     },
-    /// Type into an agent's terminal: `data` is written to its PTY as it
-    /// is (keys as a terminal sends them). Replies `Ok`. For a while after,
-    /// the screen this connection watches is reported sooner (typing shows
-    /// at once).
+    /// Type into an agent's (or a shell's) terminal: `data` is written to
+    /// its PTY as it is (keys as a terminal sends them). Replies `Ok`. For
+    /// a while after, the screen this connection watches is reported
+    /// sooner (typing shows at once).
     Keys {
         id: String,
         data: String,
@@ -893,13 +946,39 @@ pub enum Request {
     },
     /// Find the task member or chat a user named, as `SendMessage` finds
     /// its recipient: what `ResolveMember` takes, then a chat's id, then a
-    /// chat's name. A target naming a task (or `<task>/…` of one) never
-    /// reaches a chat. Replies `Member` or `Chat`.
+    /// chat's name; then an open shell's id. A target naming a task (or
+    /// `<task>/…` of one) never reaches a chat or a shell. Replies
+    /// `Member`, `Chat` or `Shell`.
     ResolveTarget {
         target: String,
         /// The caller's agent id (`$TAM_AGENT_ID`), as for `ResolveMember`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
+    },
+    /// Open a shell on a task member's worktree or a repository's main
+    /// checkout: `$SHELL` of `env` (of the daemon's environment when
+    /// empty), else `/bin/sh`, through `wrapper`. Refused for a member
+    /// whose worktree is gone or broken, or whose task is being dropped.
+    /// Replies `Shell`; pushes `ShellOpened`.
+    OpenShell {
+        on: ShellPlace,
+        /// The client's environment: the shell runs with exactly this,
+        /// without `TAM_AGENT_ID` and `TAM_SOCKET` (what is typed there is
+        /// the user's, not an agent's). Empty: the daemon's. Never kept.
+        #[serde(default, skip_serializing_if = "AgentEnv::is_empty")]
+        env: AgentEnv,
+        /// As `RunAgent`'s: run in the shell's directory with `env`, given
+        /// the shell as trailing arguments; it should `exec` it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wrapper: Vec<String>,
+    },
+    /// The open shells, in the order they were opened. Replies `Shells`.
+    ListShells,
+    /// Close a shell: hang it up (SIGHUP: an interactive shell hangs up its
+    /// jobs), kill its process group if it is still there, and wait for
+    /// it. Replies `Shell`, the shell as it was; pushes `ShellClosed`.
+    CloseShell {
+        id: String,
     },
 }
 
@@ -1184,6 +1263,15 @@ pub enum Response {
     Sessions {
         sessions: Vec<SessionInfo>,
     },
+    /// One shell (`OpenShell`, `CloseShell`, `ResolveTarget`).
+    Shell {
+        /// Boxed: keeps `Response` small.
+        shell: Box<ShellInfo>,
+    },
+    /// The open shells, in the order they were opened (`ListShells`).
+    Shells {
+        shells: Vec<ShellInfo>,
+    },
 }
 
 /// Daemon -> Client pushed event (unsolicited).
@@ -1243,6 +1331,14 @@ pub enum Event {
         chat: ChatInfo,
     },
     ChatClosed {
+        id: String,
+    },
+    ShellOpened {
+        shell: ShellInfo,
+    },
+    /// A shell is gone: it exited, was closed, or went with its member's
+    /// drop or the daemon's shutdown.
+    ShellClosed {
         id: String,
     },
 }
@@ -2748,6 +2844,107 @@ mod tests {
                 ),
                 "{json}"
             );
+        }
+    }
+
+    fn sample_shell() -> ShellInfo {
+        ShellInfo {
+            id: "sh-0000abcd".into(),
+            member: Some("m-1".into()),
+            dir: PathBuf::from("/w/api--fix"),
+            repo: "api".into(),
+            number: 3,
+            pid: 42,
+            opened_at: 100,
+            viewers: 0,
+        }
+    }
+
+    #[test]
+    fn shell_wire_format() {
+        let shell = sample_shell();
+        assert_eq!(shell.name(), "Shell #3");
+        let json = serde_json::to_string(&shell).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"sh-0000abcd","member":"m-1","dir":"/w/api--fix","repo":"api","number":3,"pid":42,"opened_at":100,"viewers":0}"#
+        );
+        assert_eq!(serde_json::from_str::<ShellInfo>(&json).unwrap(), shell);
+        // On a main checkout: no member.
+        let checkout = ShellInfo {
+            member: None,
+            ..sample_shell()
+        };
+        let json = serde_json::to_string(&checkout).unwrap();
+        assert!(!json.contains("member"), "{json}");
+        assert_eq!(serde_json::from_str::<ShellInfo>(&json).unwrap(), checkout);
+
+        for (request, json) in [
+            (
+                Request::OpenShell {
+                    on: ShellPlace::Member("fix/api".into()),
+                    env: AgentEnv::default(),
+                    wrapper: Vec::new(),
+                },
+                r#"{"type":"open_shell","on":{"member":"fix/api"}}"#,
+            ),
+            (
+                Request::OpenShell {
+                    on: ShellPlace::Checkout(PathBuf::from("/src/api")),
+                    env: AgentEnv(BTreeMap::from([("SHELL".into(), "zsh".into())])),
+                    wrapper: vec!["direnv".into(), "exec".into(), ".".into()],
+                },
+                r#"{"type":"open_shell","on":{"checkout":"/src/api"},"env":{"SHELL":"zsh"},"wrapper":["direnv","exec","."]}"#,
+            ),
+            (Request::ListShells, r#"{"type":"list_shells"}"#),
+            (
+                Request::CloseShell {
+                    id: "sh-0000abcd".into(),
+                },
+                r#"{"type":"close_shell","id":"sh-0000abcd"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&request).unwrap(), json);
+            let back: Request = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    /// `ServerMessage` is untagged and tries `Response` first: shell events
+    /// must not decode as a response, nor shell responses as events.
+    #[test]
+    fn shell_events_and_responses_are_told_apart() {
+        for event in [
+            Event::ShellOpened {
+                shell: sample_shell(),
+            },
+            Event::ShellClosed {
+                id: "sh-0000abcd".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+                ServerMessage::Event(back) => {
+                    assert_eq!(serde_json::to_string(&back).unwrap(), json)
+                }
+                other => panic!("{json} decoded as {other:?}"),
+            }
+        }
+        for resp in [
+            Response::Shell {
+                shell: Box::new(sample_shell()),
+            },
+            Response::Shells {
+                shells: vec![sample_shell()],
+            },
+        ] {
+            let json = serde_json::to_string(&resp).unwrap();
+            match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+                ServerMessage::Response(back) => {
+                    assert_eq!(serde_json::to_string(&back).unwrap(), json)
+                }
+                other => panic!("{json} decoded as {other:?}"),
+            }
         }
     }
 }

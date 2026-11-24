@@ -657,12 +657,23 @@ fn handle_terminal_key(key: KeyEvent, app: &mut App) -> Action {
 }
 
 /// The pane scrolls: `j`/`k` (`↓`/`↑`) a line, `g`/`G` (`home`/`end`) to
-/// the oldest line kept or the live screen; ctrl-] gives the keyboard back
-/// to the list, on the live screen. Any other key does nothing: neither the
-/// agent's nor the list's.
+/// the oldest line kept or the live screen; `enter` types into the agent,
+/// at the live screen; ctrl-] gives the keyboard back to the list, on the
+/// live screen. Any other key does nothing: neither the agent's nor the
+/// list's (`shift-enter` is no attach).
 fn handle_scroll_key(key: KeyEvent, app: &mut App) -> Action {
     if keys::is_leave(key) {
         app.leave_pane();
+        return Action::None;
+    }
+    // Typing, at the live screen at once (the event loop fetches it when
+    // `peek.from` changed), not at the first key.
+    if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        if let Mode::Scroll { agent } = &app.mode {
+            let agent = agent.clone();
+            app.mode = Mode::Terminal { agent };
+            app.peek.from = None;
+        }
         return Action::None;
     }
     match key.code {
@@ -2431,7 +2442,7 @@ mod tests {
             Some(Scroll::Live)
         );
         // Every other key does nothing: neither the agent's (nothing typed)
-        // nor the list's (`d` would drop, `q` quit, enter type).
+        // nor the list's (`d` would drop, `q` quit, shift-enter attach).
         for (code, modifiers) in [
             (KeyCode::Char('q'), none),
             (KeyCode::Char('d'), none),
@@ -2439,7 +2450,7 @@ mod tests {
             (KeyCode::Char('l'), none),
             (KeyCode::Char('v'), none),
             (KeyCode::Char('c'), KeyModifiers::CONTROL),
-            (KeyCode::Enter, none),
+            (KeyCode::Enter, shift),
             (KeyCode::Esc, none),
         ] {
             assert!(
@@ -2547,6 +2558,36 @@ mod tests {
         ));
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.starting, None);
+    }
+
+    #[test]
+    fn enter_while_scrolling_types_at_the_live_screen() {
+        use tam_proto::AgentState::Working;
+        let config = Config::default();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let mut app = two_member_app(&[("m-1", Working)]);
+        app.selected = app.tasks.iter().position(|t| t.name == "feat").unwrap();
+        app.sync_focus();
+        // Scrolling (`v`), scrolled back: enter types into the agent, at
+        // the live screen, in one key.
+        handle_key_event(press('v'), &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Scroll { agent } if agent == "m-1"));
+        app.peek.from = Some(4);
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "m-1"));
+        assert_eq!(app.peek.from, None);
+
+        // Typing, scrolled back with the wheel: enter is the agent's, as
+        // every key is (the event loop brings the live screen back).
+        app.peek.from = Some(4);
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::Keys(ref bytes) if bytes == b"\r"
+        ));
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "m-1"));
     }
 
     #[test]

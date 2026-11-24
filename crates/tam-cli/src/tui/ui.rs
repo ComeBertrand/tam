@@ -80,6 +80,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         | Mode::Answer(_) => {}
         Mode::Help => render_help_popup(frame, app),
         Mode::ConfirmCloseChat { label, .. } => render_close_chat_popup(frame, label),
+        Mode::ConfirmCloseShell { label, .. } => render_close_shell_popup(frame, label),
         Mode::RenameChat { name, title, .. } => {
             render_rename_chat_popup(frame, name, title.as_deref());
         }
@@ -91,7 +92,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_enter_path_popup(frame, path);
         }
         Mode::ConfirmDropTask { name, member } => {
-            render_confirm_drop_popup(frame, name, member.as_ref());
+            let shells = drop_closes(app, name, member.as_ref());
+            render_confirm_drop_popup(frame, name, member.as_ref(), shells.as_deref());
         }
         Mode::ConfirmForceDrop {
             name,
@@ -111,10 +113,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             in_place,
             member,
         } => {
+            let mut lines = lines.clone();
+            lines.extend(drop_closes(app, name, member.as_ref()));
             render_repair_or_drop_popup(
                 frame,
                 name,
-                lines,
+                &lines,
                 *repairable,
                 *in_place,
                 member.as_ref(),
@@ -291,7 +295,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 ]);
                 hints
             }
-            Mode::ConfirmCloseChat { .. } => vec![
+            Mode::ConfirmCloseChat { .. } | Mode::ConfirmCloseShell { .. } => vec![
                 Span::styled(" y", Style::new().bold()),
                 Span::raw("/"),
                 Span::styled("enter", Style::new().bold()),
@@ -315,10 +319,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(" any", Style::new().bold()),
                 Span::raw(":close"),
             ],
-            Mode::Terminal { .. } => vec![
+            Mode::Terminal { ref agent } => vec![
                 Span::styled(" ctrl-]", Style::new().bold()),
                 Span::raw(":back to the list  "),
-                Span::raw("every other key goes to the agent"),
+                Span::raw(match app.shells.iter().any(|s| s.id == *agent) {
+                    true => "every other key goes to the shell",
+                    false => "every other key goes to the agent",
+                }),
             ],
             Mode::Scroll { .. } => vec![
                 Span::styled(" j/k", Style::new().bold()),
@@ -403,18 +410,27 @@ type Hint<'a> = (&'a str, String, u8);
 fn normal_hints(app: &App) -> Vec<Hint<'_>> {
     let selected = app.selected_task();
     let chat = app.selected_chat();
+    let shell = app.selected_shell();
     let agent = app.focused().and_then(|f| f.agent());
     let has_agent = agent.is_some();
+    // An agent's terminal, or a shell's.
+    let terminal = has_agent || shell.is_some();
     let asks = agent.is_some_and(|a| a.detail.ask.is_some());
     let free = |key: char| app.key_taken(key).is_none();
     let mut hints = Vec::new();
     if asks {
         hints.push(("a", "answer".into(), 0));
     }
-    if has_agent {
+    if terminal {
         hints.push(("enter", "type".into(), 0));
         hints.push(("f", "full screen".into(), 3));
-        hints.push(("s", "stop".into(), 1));
+    }
+    if shell.is_some() {
+        hints.push(("d", "close".into(), 1));
+    } else if has_agent {
+        if free('x') {
+            hints.push(("x", "stop".into(), 1));
+        }
     } else if chat.is_some() {
         hints.push(("enter", "resume".into(), 0));
     } else if selected.is_some() {
@@ -436,7 +452,7 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         if selected.is_some_and(|t| t.members.len() > 1) {
             hints.push(("h/l", "member".into(), 1));
         }
-        if has_agent && free('v') {
+        if terminal && free('v') {
             hints.push(("v", "scroll".into(), 3));
         }
         if peek.from.is_some() {
@@ -452,10 +468,15 @@ fn normal_hints(app: &App) -> Vec<Hint<'_>> {
         let drop = if gone { "recreate/drop" } else { "drop" };
         hints.push(("d", drop.into(), 1));
     }
+    if free('!') && app.selected_entry().is_some() {
+        hints.push(("!", "shell here".into(), 3));
+    }
     hints.push(("n", "new task".into(), 2));
     if free('c') {
         hints.push(("c", "new chat".into(), 2));
     }
+    // The first to go when the footer is short.
+    hints.push(("s", "new shell".into(), 6));
     hints.push(("/", "filter".into(), 3));
     let order = match app.order {
         Order::Repo => "attention first",
@@ -1048,7 +1069,15 @@ fn render_enter_path_popup(frame: &mut Frame, path: &TextInput) {
 fn render_help_popup(frame: &mut Frame, app: &App) {
     let entry = |key: &str, what: &str| (key.to_string(), what.to_string());
     let mut sections: Vec<(&str, Vec<(String, String)>)> = vec![
-        ("Task or chat", item_help(app)),
+        ("Task, chat or shell", item_help(app)),
+        (
+            "Pane",
+            vec![
+                entry("h/l ←/→", "another member"),
+                scroll_help(app),
+                entry("home/end", "oldest line / live"),
+            ],
+        ),
         (
             "List",
             vec![
@@ -1057,14 +1086,6 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
                 entry("t", "by repo / attention"),
                 entry("T", "next theme"),
                 entry("click", "select (wheel: move)"),
-            ],
-        ),
-        (
-            "Pane",
-            vec![
-                entry("h/l ←/→", "another member"),
-                scroll_help(app),
-                entry("home/end", "oldest line / live"),
             ],
         ),
         (
@@ -1179,25 +1200,30 @@ fn scroll_help(app: &App) -> (String, String) {
 
 fn item_help(app: &App) -> Vec<(String, String)> {
     let entry = |key: &str, what: &str| (key.to_string(), what.to_string());
+    let yielding = |key: char, what: &str| match app.key_taken(key) {
+        None => (key.to_string(), what.to_string()),
+        // The custom commands' section says by which.
+        Some(_) => (format!("({key})"), format!("{what}: taken")),
+    };
     let mut keys = vec![
         entry("j/k ↑/↓", "select"),
         entry("enter", "type (ctrl-] back)"),
         entry("f", "full screen (⇧enter)"),
         entry("r/R", "run (R: new session)"),
-        entry("s", "stop the agent"),
+        yielding('x', "stop / close a shell"),
         entry("a", "answer what it asks"),
-        entry("d", "drop / close a chat"),
+        entry("d", "drop / close a chat or shell"),
+        yielding('!', "a shell here"),
+        yielding('p', "keep a chat, or not"),
+        yielding('N', "name a chat"),
     ];
-    for (key, what) in [('p', "keep a chat, or not"), ('N', "name a chat")] {
-        keys.push(match app.key_taken(key) {
-            None => (key.to_string(), what.to_string()),
-            // The custom commands' section says by which.
-            Some(_) => (format!("({key})"), format!("{what}: taken")),
-        });
-    }
     match app.key_taken('c') {
-        None => keys.push(entry("n/c", "new task / chat")),
-        Some(_) => keys.extend([entry("n", "new task"), entry("(c)", "new chat: taken")]),
+        None => keys.push(entry("n/c/s", "new task / chat / shell")),
+        Some(_) => keys.extend([
+            entry("n", "new task"),
+            entry("(c)", "new chat: taken"),
+            entry("s", "new shell"),
+        ]),
     }
     keys
 }
@@ -1242,6 +1268,75 @@ fn render_close_chat_popup(frame: &mut Frame, label: &str) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Asks to close a shell (`label`: `Shell #3 of <where it runs>`): what
+/// closing does.
+fn render_close_shell_popup(frame: &mut Frame, label: &str) {
+    let red = |key: &'static str| Span::styled(key, Style::new().bold().fg(theme::get().bad));
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("Close "),
+            Span::styled(label, Style::new().bold()),
+            Span::raw("?"),
+        ]),
+        Line::raw("It hangs up: what runs in it stops, and its screen goes."),
+        Line::raw("Nothing on disk changes."),
+        Line::raw(""),
+        Line::from(vec![
+            red("y"),
+            Span::raw(" close · "),
+            Span::styled("n", Style::new().bold()),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    let content_width = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (content_width as u16 + 8).max(30);
+    let height = lines.len() as u16 + 4;
+    let area = frame
+        .area()
+        .centered(Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(theme::get().popup())
+        .border_style(Style::new().fg(theme::get().bad))
+        .title(" Close Shell ")
+        .title_style(Style::new().bold().fg(theme::get().bad))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// What a drop of task `name` (or of `member` alone) closes of its shells,
+/// when it has any.
+fn drop_closes(app: &App, name: &str, member: Option<&MemberChoice>) -> Option<String> {
+    let shells = |count: usize| match count {
+        1 => "1 shell".to_string(),
+        n => format!("{n} shells"),
+    };
+    let task = app.tasks.iter().find(|t| t.name == name)?;
+    let count: usize = task
+        .members
+        .iter()
+        .map(|m| app.member_shells(m.id()).len())
+        .sum();
+    if count == 0 {
+        return None;
+    }
+    let what = match count {
+        1 => "Its shell closes with it".to_string(),
+        n => format!("Its {n} shells close with it"),
+    };
+    Some(match member {
+        None => format!("{what}."),
+        Some(m) => match app.member_shells(&m.id).len() {
+            0 => format!("{what}, none with {} alone.", m.label),
+            n => format!("{what}, {} with {} alone.", shells(n), m.label),
+        },
+    })
+}
+
 /// A chat's name to type; empty, it shows Claude's `title` again.
 fn render_rename_chat_popup(frame: &mut Frame, name: &TextInput, title: Option<&str>) {
     // 2 content rows + 2 border + 2 vertical padding = 6
@@ -1275,8 +1370,13 @@ fn render_rename_chat_popup(frame: &mut Frame, name: &TextInput, title: Option<&
 }
 
 /// Asks to drop a task, or (with `member`, the focused member of a task
-/// with several) that member alone.
-fn render_confirm_drop_popup(frame: &mut Frame, name: &str, member: Option<&MemberChoice>) {
+/// with several) that member alone; `shells` says which shells close.
+fn render_confirm_drop_popup(
+    frame: &mut Frame,
+    name: &str,
+    member: Option<&MemberChoice>,
+    shells: Option<&str>,
+) {
     let red = |key: &'static str| Span::styled(key, Style::new().bold().fg(theme::get().bad));
     let mut lines = match member {
         None => vec![Line::from(vec![
@@ -1300,6 +1400,9 @@ fn render_confirm_drop_popup(frame: &mut Frame, name: &str, member: Option<&Memb
             ]),
         ],
     };
+    if let Some(shells) = shells {
+        lines.insert(1, Line::raw(shells));
+    }
     lines.push(Line::from(vec![
         red("y"),
         Span::raw(if member.is_some() {
@@ -1867,7 +1970,7 @@ mod tests {
     use crate::tui::branch::{BranchState, Observation};
     use crate::tui::input::TextInput;
     use tam_proto::{
-        AgentInfo, ChatInfo, MemberHealth, MemberInfo, MessageInfo, RunInfo, TaskInfo,
+        AgentInfo, ChatInfo, MemberHealth, MemberInfo, MessageInfo, RunInfo, ShellInfo, TaskInfo,
     };
 
     fn member_info(id: &str, name: &str) -> MemberInfo {
@@ -3201,16 +3304,17 @@ mod tests {
         select_chat(&mut app, "c-0000cccc");
         let s = screen(&mut app, 160, 30);
         let footer = s.lines().last().unwrap();
-        for hint in ["enter:type", "s:stop", "p:unkeep"] {
+        for hint in ["enter:type", "x:stop", "p:unkeep"] {
             assert!(footer.contains(hint), "{hint}: {footer}");
         }
-        // A key a custom command took: its command's, in the help too.
+        // A key a custom command took: its command's, in the help too
+        // (wide enough for every hint).
         app.commands = vec![crate::config::CustomCommand {
             name: "notes".into(),
             key: "N".into(),
             command: "true".into(),
         }];
-        let s = screen(&mut app, 160, 30);
+        let s = screen(&mut app, 180, 30);
         let footer = s.lines().last().unwrap();
         assert!(
             !footer.contains("N:rename") && footer.contains("N:notes"),
@@ -3311,6 +3415,355 @@ mod tests {
         assert!(s.contains("Name: dashboard"), "{s}");
         assert!(s.contains("empty: Claude's title, Chat design"), "{s}");
         assert!(cursor.is_some());
+    }
+
+    // -- Shells -------------------------------------------------------------
+
+    /// A shell in the worktree of `member` (of `app`).
+    fn worktree_shell(app: &App, id: &str, member: &str, number: u32) -> ShellInfo {
+        let (_, member) = app.find_member(member).unwrap();
+        ShellInfo {
+            id: id.into(),
+            member: Some(member.id().into()),
+            dir: member.info.dir.clone(),
+            repo: member.info.repo.clone(),
+            number,
+            pid: 1,
+            opened_at: crate::task::now() - 600,
+            viewers: 0,
+        }
+    }
+
+    /// A shell on the main checkout of `repo`.
+    fn checkout_shell(id: &str, repo: &str, number: u32) -> ShellInfo {
+        ShellInfo {
+            id: id.into(),
+            member: None,
+            dir: format!("/src/{repo}").into(),
+            repo: repo.into(),
+            number,
+            pid: 1,
+            opened_at: crate::task::now() - 600,
+            viewers: 0,
+        }
+    }
+
+    /// The chats' dashboard with shells: #1 and #3 in the worktree of
+    /// fix-allotment-rounding, #1 below each member of unit-pricing, and
+    /// three on main checkouts, in the order they were opened.
+    fn shell_dashboard() -> App {
+        let mut app = chat_dashboard();
+        let shells = vec![
+            checkout_shell("sh-0000000a", "backend", 1),
+            worktree_shell(&app, "sh-00000011", "m-1", 1),
+            checkout_shell("sh-0000000b", "frontend", 1),
+            worktree_shell(&app, "sh-00000013", "m-1", 3),
+            worktree_shell(&app, "sh-00000041", "m-4", 1),
+            checkout_shell("sh-0000000c", "backend", 2),
+            worktree_shell(&app, "sh-00000051", "m-5", 1),
+        ];
+        app.set_shells(shells);
+        app
+    }
+
+    fn select_shell(app: &mut App, id: &str) {
+        app.selected = app
+            .visible_entries()
+            .iter()
+            .position(|e| e.pick() == Pick::Shell(id.into()))
+            .unwrap();
+        app.sync_focus();
+    }
+
+    #[test]
+    fn shells_hang_below_their_task_and_have_a_section() {
+        let mut app = shell_dashboard();
+        app.selected = 0;
+        let s = screen(&mut app, 80, 50);
+        show("shells 80x50", &s);
+        // Never counted, never in "need you".
+        assert!(s.contains(" tam  4 chats  7 tasks  5 need you "), "{s}");
+        let rows: Vec<&str> = s.lines().skip(2).collect();
+        let at = |text: &str| rows.iter().position(|r| r.contains(text)).unwrap();
+        // After the chats, the shells on main checkouts: their name and
+        // repository, no status, time or context; in the order opened.
+        assert_eq!(rows[5].trim_end_matches([' ', '─']), " shells", "{s}");
+        let section: Vec<(&str, &str)> = rows[6..9]
+            .iter()
+            .map(|r| {
+                let (name, repo) = r.trim().split_once("  ").unwrap();
+                (name, repo.trim())
+            })
+            .collect();
+        assert_eq!(
+            section,
+            [
+                ("Shell #1", "backend"),
+                ("Shell #1", "frontend"),
+                ("Shell #2", "backend")
+            ],
+            "{s}"
+        );
+        assert!(rows[6].starts_with(&" ".repeat(17)), "{s}");
+        assert_eq!(rows[9].trim_end_matches([' ', '─']), " backend", "{s}");
+        // On a branch below a task with one member, by number.
+        let task = at("fix-allotment-rounding");
+        assert_eq!(
+            rows[task + 1].trim_end(),
+            format!("{}├ Shell #1", " ".repeat(18))
+        );
+        assert_eq!(
+            rows[task + 2].trim_end(),
+            format!("{}└ Shell #3", " ".repeat(18))
+        );
+        assert!(rows[task + 3].contains("perf"), "{s}");
+        // Below their member in a task with several, the task's branch
+        // going on past a member that is not the last.
+        let task = at("unit-pricing");
+        assert!(rows[task + 1].contains(" ├ backend"), "{s}");
+        assert_eq!(
+            rows[task + 2].trim_end(),
+            format!("{}│ └ Shell #1", " ".repeat(18))
+        );
+        assert!(rows[task + 3].contains(" └ frontend"), "{s}");
+        assert_eq!(
+            rows[task + 4].trim_end(),
+            format!("{}  └ Shell #1", " ".repeat(18))
+        );
+        // The branches in the rules' colour, a section's repository dim.
+        let t = theme::get();
+        let branch = cells_of(&mut app, 80, 50, "│ └ Shell #1");
+        assert_eq!(branch[0].1, t.subtle);
+        assert_eq!(branch[2].1, t.subtle);
+        assert_eq!(branch[4].1, Color::Reset);
+        let repo = cells_of(&mut app, 80, 50, "frontend  ");
+        assert_eq!(repo[0].1, t.muted, "{repo:?}");
+
+        // Wide: no note on a shell's row.
+        let s = screen(&mut app, 120, 50);
+        let row = s.lines().find(|l| l.contains("└ Shell #3")).unwrap();
+        assert_eq!(row.trim(), "└ Shell #3", "{s}");
+    }
+
+    #[test]
+    fn attention_first_keeps_shells_below_their_task_and_the_others_last() {
+        let mut app = shell_dashboard();
+        app.toggle_order();
+        let s = screen(&mut app, 100, 50);
+        show("shells attention 100x50", &s);
+        assert!(!s.contains(" shells ─"), "{s}");
+        let rows: Vec<&str> = s
+            .lines()
+            .skip(2)
+            .take_while(|l| !l.contains('╭'))
+            .map(|l| l.trim_start_matches('▌'))
+            .collect();
+        // Wherever its task sorts.
+        assert!(rows[1].trim_start().starts_with("▲ block"), "{s}");
+        assert!(rows[2].trim_start().starts_with("├ Shell #1"), "{s}");
+        assert!(rows[3].trim_start().starts_with("└ Shell #3"), "{s}");
+        assert!(rows[4].trim_start().starts_with("unit-pricing"), "{s}");
+        assert!(rows[6].trim_start().starts_with("│ └ Shell #1"), "{s}");
+        assert!(rows[8].trim_start().starts_with("└ Shell #1"), "{s}");
+        // Those on main checkouts last, in the order opened: their
+        // repository in REPO, `shell` where a task has its branch.
+        let last: Vec<String> = rows[rows.len() - 3..]
+            .iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(
+            last,
+            [
+                "Shell #1 backend shell",
+                "Shell #1 frontend shell",
+                "Shell #2 backend shell"
+            ],
+            "{s}"
+        );
+        assert!(rows[rows.len() - 4].contains("old-banner"), "{s}");
+    }
+
+    #[test]
+    fn the_filter_shows_a_shell_with_its_task_or_by_its_repository() {
+        let mut app = shell_dashboard();
+        app.filter_active = true;
+        app.filter = TextInput::from("rounding");
+        let s = screen(&mut app, 80, 40);
+        show("shells filter rounding", &s);
+        // With its task.
+        assert!(s.contains("├ Shell #1") && s.contains("└ Shell #3"), "{s}");
+        assert!(!s.contains(" shells ─"), "{s}");
+        // A repository: the shells on its main checkout, and the tasks in
+        // it with theirs.
+        app.filter = TextInput::from("frontend");
+        let s = screen(&mut app, 80, 40);
+        show("shells filter frontend", &s);
+        let section: Vec<&str> = s
+            .lines()
+            .skip_while(|l| !l.contains(" shells ─"))
+            .skip(1)
+            .take_while(|l| !l.contains('─'))
+            .collect();
+        assert_eq!(section.len(), 1, "{s}");
+        assert!(
+            section[0].contains("Shell #1") && section[0].contains("frontend"),
+            "{s}"
+        );
+        assert!(s.contains("  └ Shell #1"), "{s}");
+        assert!(!s.contains("Shell #3"), "{s}");
+    }
+
+    #[test]
+    fn a_shell_s_pane_is_its_screen_named_after_where_it_runs() {
+        let mut app = shell_dashboard();
+        for (id, title) in [
+            ("sh-00000013", "╭ Shell #3 · fix-allotment-rounding ─"),
+            ("sh-00000041", "╭ Shell #1 · unit-pricing/backend ─"),
+            ("sh-0000000b", "╭ Shell #1 · frontend ─"),
+        ] {
+            select_shell(&mut app, id);
+            app.peek = agent_screen(id, &["$ cargo test", "running 12 tests"]);
+            assert_eq!(app.peek_agent().as_deref(), Some(id));
+            let s = screen(&mut app, 100, 40);
+            show(id, &s);
+            assert!(s.contains(title), "{s}");
+            assert!(s.contains("$ cargo test"), "{s}");
+            // No marked member: the keys act on the shell.
+            assert!(!s.contains('▸'), "{s}");
+        }
+        // Typed into: the keys go to the shell.
+        app.mode = Mode::Terminal {
+            agent: "sh-0000000b".into(),
+        };
+        let s = screen(&mut app, 120, 40);
+        let footer = s.lines().last().unwrap();
+        assert!(
+            footer.contains("every other key goes to the shell"),
+            "{footer}"
+        );
+        assert!(s.contains("typing · ctrl-] back to the list"), "{s}");
+    }
+
+    #[test]
+    fn the_shell_dialogs_and_what_a_drop_closes() {
+        let mut app = shell_dashboard();
+        app.mode = Mode::ConfirmCloseShell {
+            id: "sh-00000013".into(),
+            label: "Shell #3 of fix-allotment-rounding".into(),
+        };
+        let s = screen(&mut app, 100, 30);
+        show("close shell", &s);
+        assert!(
+            s.contains("Close Shell #3 of fix-allotment-rounding?"),
+            "{s}"
+        );
+        assert!(s.contains("Nothing on disk changes."), "{s}");
+        assert!(s.contains("y/enter:close"), "{s}");
+
+        // A drop says how many shells it closes.
+        let drop = |app: &mut App, name: &str, member: Option<(&str, &str)>| {
+            app.mode = Mode::ConfirmDropTask {
+                name: name.into(),
+                member: member.map(|(id, label)| MemberChoice {
+                    id: id.into(),
+                    label: label.into(),
+                }),
+            };
+            screen(app, 100, 30)
+        };
+        let s = drop(&mut app, "fix-allotment-rounding", None);
+        show("drop with shells", &s);
+        assert!(s.contains("Its 2 shells close with it."), "{s}");
+        let s = drop(
+            &mut app,
+            "unit-pricing",
+            Some(("m-5", "unit-pricing/frontend")),
+        );
+        show("drop a member with shells", &s);
+        assert!(
+            s.contains("Its 2 shells close with it, 1 shell with unit-pricing/frontend alone."),
+            "{s}"
+        );
+        let s = drop(&mut app, "perf", None);
+        assert!(!s.contains("close with it"), "{s}");
+        // A gone worktree's shell too.
+        let shell = worktree_shell(&app, "sh-00000071", "m-7", 1);
+        app.upsert_shell(shell);
+        app.mode = Mode::ConfirmRepairOrDrop {
+            name: "old-banner".into(),
+            lines: vec!["worktree /w/frontend--old-banner is gone".into()],
+            repairable: true,
+            in_place: false,
+            member: None,
+        };
+        let s = screen(&mut app, 100, 30);
+        show("gone with a shell", &s);
+        assert!(s.contains("Its shell closes with it."), "{s}");
+    }
+
+    #[test]
+    fn the_footer_and_help_have_a_shell_s_keys() {
+        let mut app = shell_dashboard();
+        select_shell(&mut app, "sh-00000013");
+        let s = screen(&mut app, 180, 30);
+        let footer = s.lines().last().unwrap();
+        for hint in [
+            "enter:type",
+            "f:full screen",
+            "d:close",
+            "v:scroll",
+            "!:shell here",
+            "s:new shell",
+        ] {
+            assert!(footer.contains(hint), "{hint}: {footer}");
+        }
+        for hint in ["x:stop", "r:run", "d:drop", "a:answer", "p:keep", "h/l"] {
+            assert!(!footer.contains(hint), "{hint}: {footer}");
+        }
+        // On a task, stop is `x`.
+        select(&mut app, "perf");
+        let s = screen(&mut app, 180, 30);
+        let footer = s.lines().last().unwrap();
+        assert!(
+            footer.contains("x:stop") && !footer.contains("s:stop"),
+            "{footer}"
+        );
+        app.mode = Mode::Help;
+        let s = screen(&mut app, 100, 40);
+        show("help with shells", &s);
+        for text in [
+            "Task, chat or shell",
+            "x         stop / close a shell",
+            "d         drop / close a chat or shell",
+            "!         a shell here",
+            "n/c/s     new task / chat / shell",
+        ] {
+            assert!(s.contains(text), "{text}: {s}");
+        }
+
+        // `!` and `x` taken by custom commands: theirs, in the help too.
+        let command = |key: &str, name: &str| crate::config::CustomCommand {
+            name: name.into(),
+            key: key.into(),
+            command: "true".into(),
+        };
+        app.commands = vec![command("!", "htop"), command("x", "explore")];
+        app.mode = Mode::Normal;
+        let s = screen(&mut app, 180, 30);
+        let footer = s.lines().last().unwrap();
+        assert!(
+            !footer.contains("x:stop") && !footer.contains("!:shell here"),
+            "{footer}"
+        );
+        assert!(
+            footer.contains("!:htop") && footer.contains("x:explore"),
+            "{footer}"
+        );
+        app.mode = Mode::Help;
+        let s = screen(&mut app, 100, 40);
+        show("help, ! and x taken", &s);
+        assert!(s.contains("(x)       stop / close a shell: taken"), "{s}");
+        assert!(s.contains("(!)       a shell here: taken"), "{s}");
     }
 
     // -- Help, filter, prompts -------------------------------------------
@@ -3509,6 +3962,10 @@ mod tests {
                     id: "c-1".into(),
                     label: "a chat".into(),
                 },
+                Mode::ConfirmCloseShell {
+                    id: "sh-00000013".into(),
+                    label: "Shell #3 of fix-allotment-rounding".into(),
+                },
                 Mode::RenameChat {
                     id: "c-1".into(),
                     label: "a chat".into(),
@@ -3566,6 +4023,18 @@ mod tests {
                 for mode in modes() {
                     let mut app = chat_dashboard();
                     select_chat(&mut app, chat);
+                    let mut app = with_pane(app);
+                    app.mode = mode;
+                    screen(&mut app, width, height);
+                }
+            }
+        }
+        // On a shell in a worktree and on one on a main checkout.
+        for shell in ["sh-00000041", "sh-0000000c"] {
+            for (width, height) in [(1, 1), (10, 3), (24, 6), (40, 10), (80, 24), (250, 70)] {
+                for mode in modes() {
+                    let mut app = shell_dashboard();
+                    select_shell(&mut app, shell);
                     let mut app = with_pane(app);
                     app.mode = mode;
                     screen(&mut app, width, height);

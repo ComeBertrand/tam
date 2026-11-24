@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 
-use tam_proto::{AgentInfo, ChatInfo, MessageInfo, RunInfo, SessionInfo, TaskInfo};
+use tam_proto::{AgentInfo, ChatInfo, MessageInfo, RunInfo, SessionInfo, ShellInfo, TaskInfo};
 
 use crate::chat::Chat;
 use crate::config::CustomCommand;
@@ -88,6 +88,11 @@ pub enum Mode {
         id: String,
         label: String,
     },
+    /// Asks to close a shell (`label`: `Shell #3 of <where it runs>`).
+    ConfirmCloseShell {
+        id: String,
+        label: String,
+    },
     /// A chat's name; empty: Claude's title (`title`) again.
     RenameChat {
         id: String,
@@ -114,6 +119,8 @@ pub enum Purpose {
     Task,
     /// A new chat: one repository.
     Chat,
+    /// A new shell on a repository's main checkout: one repository.
+    Shell,
 }
 
 /// The id of the session list's first item: a new session.
@@ -182,7 +189,7 @@ pub enum Row<'a> {
     /// The repositories of the tasks below it.
     Group(&'a Task),
     /// A task: the row of its only member, or the head of its members'
-    /// rows. The only rows that can be selected.
+    /// rows. Selected, as chats and shells are.
     Task(&'a Task),
     /// A member of a task with several, below the task's row.
     Member {
@@ -190,39 +197,58 @@ pub enum Row<'a> {
         member: &'a Member,
         last: bool,
     },
+    /// The header of the section of the shells on main checkouts.
+    Shells,
+    /// A shell: a row of that section (`tree` `None`), or a row on a branch
+    /// below its task or member, for a shell in a worktree. Selected like a
+    /// task.
+    Shell {
+        shell: &'a ShellInfo,
+        tree: Option<Branch>,
+    },
 }
 
-/// What the list shows and the selection lands on: a chat or a task.
+/// Where the row of a shell in a worktree hangs below its task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Branch {
+    /// The last of its member's shells.
+    pub last: bool,
+    /// Below a member's row, in a task with several: whether that member is
+    /// the task's last (the task's branch goes no further). `None`: below
+    /// the task's own row.
+    pub member_last: Option<bool>,
+}
+
+/// What the list shows and the selection lands on: a chat, a task or a
+/// shell.
 #[derive(Debug, Clone, Copy)]
 pub enum Entry<'a> {
     Chat(&'a Chat),
     Task(&'a Task),
+    Shell(&'a ShellInfo),
 }
 
 impl Entry<'_> {
-    /// Which entry it is, to find it again (a chat by id, a task by name:
-    /// never by label, which changes).
+    /// Which entry it is, to find it again (a chat or a shell by id, a task
+    /// by name: never by label, which changes).
     pub fn pick(&self) -> Pick {
         match self {
             Entry::Chat(chat) => Pick::Chat(chat.info.id.clone()),
             Entry::Task(task) => Pick::Task(task.name.clone()),
-        }
-    }
-
-    pub fn status(&self) -> TaskStatus {
-        match self {
-            Entry::Chat(chat) => chat.status(),
-            Entry::Task(task) => task.status(),
+            Entry::Shell(shell) => Pick::Shell(shell.id.clone()),
         }
     }
 
     /// Where attention order puts it: the most urgent first, then by name.
+    /// Shells have no status: they are never sorted (see
+    /// [`App::visible_entries`]).
     fn urgency(&self) -> (u8, String) {
-        let name = match self {
-            Entry::Chat(chat) => chat.info.label(),
-            Entry::Task(task) => task.name.clone(),
+        let (status, name) = match self {
+            Entry::Chat(chat) => (chat.status(), chat.info.label()),
+            Entry::Task(task) => (task.status(), task.name.clone()),
+            Entry::Shell(shell) => (TaskStatus::Idle, shell.name()),
         };
-        (self.status().sort_priority(), name.to_lowercase())
+        (status.sort_priority(), name.to_lowercase())
     }
 }
 
@@ -233,56 +259,105 @@ pub enum Pick {
     Chat(String),
     /// A task, by name.
     Task(String),
+    /// A shell, by id.
+    Shell(String),
 }
 
 /// What member actions (enter, attach, stop, answer, custom commands) apply
-/// to, the one the pane shows: a member of the selected task, or the
-/// selected chat.
+/// to, the one the pane shows: a member of the selected task, the selected
+/// chat, or the selected shell.
 #[derive(Debug, Clone, Copy)]
 pub enum Focused<'a> {
     Member(&'a Task, &'a Member),
     Chat(&'a Chat),
+    /// A shell, and the member whose worktree it runs in (`None` on a main
+    /// checkout).
+    Shell(&'a ShellInfo, Option<(&'a Task, &'a Member)>),
 }
 
 impl<'a> Focused<'a> {
-    /// Its agent's id (a member's or chat's id).
+    /// Its agent's id (a member's or chat's id), or the shell's id.
     pub fn id(&self) -> &'a str {
         match self {
             Focused::Member(_, member) => member.id(),
             Focused::Chat(chat) => &chat.info.id,
+            Focused::Shell(shell, _) => &shell.id,
         }
     }
 
-    /// How to name it to the user.
+    /// How to name it to the user: a shell with where it runs (`Shell #3 ·
+    /// fix-api`).
     pub fn label(&self) -> String {
         match self {
             Focused::Member(task, member) => task.member_label(member),
             Focused::Chat(chat) => chat.info.label(),
+            Focused::Shell(shell, member) => {
+                format!("{} · {}", shell.name(), shell_place(shell, *member))
+            }
         }
     }
 
-    /// Its running agent.
+    /// Its running agent (a shell has none).
     pub fn agent(&self) -> Option<&'a AgentInfo> {
         match self {
             Focused::Member(_, member) => member.agent_info.as_ref(),
             Focused::Chat(chat) => chat.agent.as_ref(),
+            Focused::Shell(..) => None,
+        }
+    }
+
+    /// The terminal the pane shows, which `enter`, `f` and `v` act on, by
+    /// id: its running agent's, or the shell.
+    pub fn terminal(&self) -> Option<&'a str> {
+        match self {
+            Focused::Shell(shell, _) => Some(&shell.id),
+            _ => self.agent().map(|agent| agent.id.as_str()),
         }
     }
 
     pub fn chat(&self) -> Option<&'a Chat> {
         match self {
             Focused::Chat(chat) => Some(chat),
-            Focused::Member(..) => None,
+            Focused::Member(..) | Focused::Shell(..) => None,
         }
     }
 
-    /// What its custom commands' `{task}` and `{dir}` stand for: its task's
-    /// name and its worktree, or a chat's label and its main checkout.
-    pub fn task_and_dir(&self) -> (String, &'a std::path::Path) {
-        match self {
-            Focused::Member(task, member) => (task.name.clone(), member.info.dir.as_path()),
-            Focused::Chat(chat) => (chat.info.label(), chat.info.dir.as_path()),
+    /// What its custom commands' `{task}`, `{id}`, `{dir}` and
+    /// `{provider}` stand for: its task's name, its id, its worktree and
+    /// its agent's provider; a chat's label, id and main checkout. A shell
+    /// in a worktree gives its member's; one on a main checkout its name,
+    /// its id and the checkout.
+    pub fn command_values(&self) -> (String, &'a str, &'a std::path::Path, String) {
+        let provider = |agent: Option<&AgentInfo>| agent.map(|a| a.provider.clone());
+        match *self {
+            Focused::Member(task, member) => (
+                task.name.clone(),
+                member.id(),
+                member.info.dir.as_path(),
+                provider(member.agent_info.as_ref()).unwrap_or_default(),
+            ),
+            Focused::Chat(chat) => (
+                chat.info.label(),
+                &chat.info.id,
+                chat.info.dir.as_path(),
+                provider(chat.agent.as_ref()).unwrap_or_default(),
+            ),
+            Focused::Shell(_, Some((task, member))) => {
+                Focused::Member(task, member).command_values()
+            }
+            Focused::Shell(shell, None) => {
+                (shell.name(), &shell.id, shell.dir.as_path(), String::new())
+            }
         }
+    }
+}
+
+/// Where a shell runs, as the user knows it: its member's label (the task's
+/// name, or `<task>/<member>`), else its repository.
+pub fn shell_place(shell: &ShellInfo, member: Option<(&Task, &Member)>) -> String {
+    match member {
+        Some((task, member)) => task.member_label(member),
+        None => shell.repo.clone(),
     }
 }
 
@@ -464,6 +539,8 @@ pub struct App {
     pub tasks: Vec<Task>,
     /// In creation order.
     pub chats: Vec<Chat>,
+    /// In opening order (the daemon's `ListShells`).
+    pub shells: Vec<ShellInfo>,
     /// Index in [`App::visible_entries`].
     pub selected: usize,
     pub status: Option<(String, Instant)>,
@@ -509,6 +586,7 @@ impl App {
         Self {
             tasks: Vec::new(),
             chats: Vec::new(),
+            shells: Vec::new(),
             selected: 0,
             status: None,
             mode: Mode::Normal,
@@ -546,6 +624,13 @@ impl App {
         self.reselect(prev);
     }
 
+    /// Replace the shells (in opening order), preserving selection.
+    pub fn set_shells(&mut self, shells: Vec<ShellInfo>) {
+        let prev = self.pick();
+        self.shells = shells;
+        self.reselect(prev);
+    }
+
     fn sort_tasks(&mut self) {
         match self.order {
             Order::Repo => self.tasks.sort_by_key(|t| {
@@ -573,24 +658,37 @@ impl App {
     }
 
     /// The list's rows: grouped by repository, the chats' section (a header
-    /// row, a row per chat), then a header row before each repository's
-    /// tasks; attention first, chats and tasks in one list. Below a task
-    /// with several members, a row per member.
+    /// row, a row per chat), the section of the shells on main checkouts
+    /// (the same), then a header row before each repository's tasks;
+    /// attention first, chats and tasks in one list, then the shells on
+    /// main checkouts. Below a task with several members, a row per member;
+    /// below a member (or a task of one), a row per shell in its worktree.
     pub fn rows(&self) -> Vec<Row<'_>> {
+        let grouped = self.order == Order::Repo;
         let mut rows = Vec::new();
         let mut group: Option<String> = None;
+        let mut shells_header = false;
         for entry in self.visible_entries() {
             let task = match entry {
                 Entry::Chat(chat) => {
-                    if self.order == Order::Repo && rows.is_empty() {
+                    if grouped && rows.is_empty() {
                         rows.push(Row::Chats);
                     }
                     rows.push(Row::Chat(chat));
                     continue;
                 }
+                // On its task's branch (below).
+                Entry::Shell(shell) if shell.member.is_some() => continue,
+                Entry::Shell(shell) => {
+                    if grouped && !std::mem::replace(&mut shells_header, true) {
+                        rows.push(Row::Shells);
+                    }
+                    rows.push(Row::Shell { shell, tree: None });
+                    continue;
+                }
                 Entry::Task(task) => task,
             };
-            if self.order == Order::Repo {
+            if grouped {
                 let name = repo_group(task);
                 if group.as_ref() != Some(&name) {
                     rows.push(Row::Group(task));
@@ -598,35 +696,86 @@ impl App {
                 }
             }
             rows.push(Row::Task(task));
-            if task.members.len() > 1 {
-                let count = task.members.len();
-                rows.extend(
-                    task.members
-                        .iter()
-                        .enumerate()
-                        .map(|(i, member)| Row::Member {
-                            task,
-                            member,
-                            last: i + 1 == count,
-                        }),
-                );
+            let count = task.members.len();
+            let several = count > 1;
+            for (i, member) in task.members.iter().enumerate() {
+                let last = i + 1 == count;
+                if several {
+                    rows.push(Row::Member { task, member, last });
+                }
+                let shells = self.member_shells(member.id());
+                let n = shells.len();
+                rows.extend(shells.into_iter().enumerate().map(|(j, shell)| Row::Shell {
+                    shell,
+                    tree: Some(Branch {
+                        last: j + 1 == n,
+                        member_last: several.then_some(last),
+                    }),
+                }));
             }
         }
         rows
     }
 
     /// What the list shows, in its order: grouped by repository, the chats
-    /// (in creation order) then the tasks; attention first, both in one
-    /// list, the most urgent first.
+    /// (in creation order), the shells on main checkouts (in opening
+    /// order), then the tasks; attention first, chats and tasks in one list,
+    /// the most urgent first, then the shells on main checkouts. A shell in
+    /// a worktree follows its task, wherever the task is: its members'
+    /// shells, in join order, each one's by number. Shells have no status:
+    /// never sorted.
     pub fn visible_entries(&self) -> Vec<Entry<'_>> {
         let chats = self.visible_chats().into_iter().map(Entry::Chat);
         let tasks = self.visible_tasks().into_iter().map(Entry::Task);
-        let mut entries: Vec<Entry> = chats.chain(tasks).collect();
+        let mut heads: Vec<Entry> = chats.chain(tasks).collect();
         if self.order == Order::Attention {
             // Stable: chats keep their order, tasks theirs.
-            entries.sort_by_cached_key(Entry::urgency);
+            heads.sort_by_cached_key(Entry::urgency);
         }
+        let mut checkouts = Some(self.visible_checkout_shells());
+        let mut entries = Vec::with_capacity(heads.len() + self.shells.len());
+        for head in heads {
+            let Entry::Task(task) = head else {
+                entries.push(head);
+                continue;
+            };
+            // Grouped: the shells on main checkouts come before the tasks.
+            if self.order == Order::Repo {
+                entries.extend(checkouts.take().into_iter().flatten().map(Entry::Shell));
+            }
+            entries.push(head);
+            for member in &task.members {
+                entries.extend(
+                    self.member_shells(member.id())
+                        .into_iter()
+                        .map(Entry::Shell),
+                );
+            }
+        }
+        entries.extend(checkouts.into_iter().flatten().map(Entry::Shell));
         entries
+    }
+
+    /// The shells in a member's worktree, by number.
+    pub fn member_shells(&self, member: &str) -> Vec<&ShellInfo> {
+        let mut shells: Vec<&ShellInfo> = self
+            .shells
+            .iter()
+            .filter(|s| s.member.as_deref() == Some(member))
+            .collect();
+        shells.sort_by_key(|s| s.number);
+        shells
+    }
+
+    /// The shells on main checkouts the filter matches (by repository), in
+    /// opening order. (A shell in a worktree shows with its task.)
+    fn visible_checkout_shells(&self) -> Vec<&ShellInfo> {
+        let query = self.filter.value();
+        self.shells
+            .iter()
+            .filter(|s| s.member.is_none())
+            .filter(|s| query.is_empty() || fuzzy(query, &s.repo).is_some())
+            .collect()
     }
 
     /// The tasks the filter matches (by name, or a member's name,
@@ -744,19 +893,27 @@ impl App {
         self.visible_entries().get(self.selected).copied()
     }
 
-    /// The selected task (`None` when a chat is selected).
+    /// The selected task (`None` when a chat or a shell is selected).
     pub fn selected_task(&self) -> Option<&Task> {
         match self.selected_entry()? {
             Entry::Task(task) => Some(task),
-            Entry::Chat(_) => None,
+            Entry::Chat(_) | Entry::Shell(_) => None,
         }
     }
 
-    /// The selected chat (`None` when a task is selected).
+    /// The selected chat (`None` when a task or a shell is selected).
     pub fn selected_chat(&self) -> Option<&Chat> {
         match self.selected_entry()? {
             Entry::Chat(chat) => Some(chat),
-            Entry::Task(_) => None,
+            Entry::Task(_) | Entry::Shell(_) => None,
+        }
+    }
+
+    /// The selected shell (`None` when a task or a chat is selected).
+    pub fn selected_shell(&self) -> Option<&ShellInfo> {
+        match self.selected_entry()? {
+            Entry::Shell(shell) => Some(shell),
+            Entry::Task(_) | Entry::Chat(_) => None,
         }
     }
 
@@ -830,6 +987,71 @@ impl App {
             self.starting = None;
         }
         self.reselect(prev);
+    }
+
+    /// Add a shell (last: shells are in opening order), or take the
+    /// daemon's latest view of it.
+    pub fn upsert_shell(&mut self, shell: ShellInfo) {
+        let prev = self.pick();
+        match self.shells.iter_mut().find(|s| s.id == shell.id) {
+            Some(known) => *known = shell,
+            None => self.shells.push(shell),
+        }
+        self.reselect(prev);
+    }
+
+    /// A shell is gone (it exited, was closed, or went with its member).
+    /// The pane gives back the keyboard it had for it (see
+    /// [`App::stop_typing`]). Selected, the selection goes to its task, its
+    /// member focused, for a shell in a worktree; to the entry now in its
+    /// place for one on a main checkout, as for a closed chat.
+    pub fn remove_shell(&mut self, id: &str) {
+        let Some(pos) = self.shells.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let prev = self.pick();
+        let shell = self.shells.remove(pos);
+        if self.mode.pane_agent() == Some(id) {
+            self.stop_typing("the shell closed");
+        }
+        let focus = (prev == Some(Pick::Shell(shell.id)))
+            .then(|| shell.member.as_deref().and_then(|m| self.find_member(m)))
+            .flatten()
+            .map(|(task, member)| Focus {
+                task: task.name.clone(),
+                member: member.id().to_string(),
+            });
+        match focus {
+            Some(focus) if self.visible_tasks().iter().any(|t| t.name == focus.task) => {
+                self.select(&Pick::Task(focus.task.clone()));
+                self.focus = Some(focus);
+            }
+            _ => self.reselect(prev),
+        }
+    }
+
+    /// A shell just opened from the dashboard: listed, selected (the filter
+    /// emptied if it would hide it), and given the keyboard.
+    pub fn take_shell(&mut self, shell: ShellInfo) {
+        let id = shell.id.clone();
+        self.upsert_shell(shell);
+        let pick = Pick::Shell(id.clone());
+        if !self.visible_entries().iter().any(|e| e.pick() == pick) {
+            self.filter.clear();
+            self.filter_active = false;
+        }
+        self.select(&pick);
+        // Not shown (its member is in no task we know of yet): the pane
+        // would show something else.
+        if self.pick() == Some(pick) {
+            self.mode = Mode::Terminal { agent: id };
+        }
+    }
+
+    /// Where a shell runs, as the user knows it (see [`shell_place`]).
+    pub fn shell_place(&self, shell: &ShellInfo) -> String {
+        let member = shell.member.as_deref().and_then(|m| self.find_member(m));
+        shell_place(shell, member)
     }
 
     /// Keep the selection on this entry if it is still visible.
@@ -952,10 +1174,12 @@ impl App {
         self.status.as_ref().map(|(msg, _)| msg.as_str())
     }
 
-    /// The agent the preview pane should show: the focused member's or
-    /// chat's.
+    /// The terminal the preview pane should show: the focused member's or
+    /// chat's agent, or the selected shell (by its id).
     pub fn peek_agent(&self) -> Option<String> {
-        self.focused().and_then(|f| f.agent()).map(|a| a.id.clone())
+        self.focused()
+            .and_then(|f| f.terminal())
+            .map(str::to_string)
     }
 
     /// The preview pane shows another agent than the one it should.
@@ -1050,11 +1274,15 @@ impl App {
     }
 
     /// What the detail pane shows and member actions apply to: the selected
-    /// chat, or the member focused in the selected task, else the one that
-    /// most needs the user.
+    /// chat or shell, or the member focused in the selected task, else the
+    /// one that most needs the user.
     pub fn focused(&self) -> Option<Focused<'_>> {
         let task = match self.selected_entry()? {
             Entry::Chat(chat) => return Some(Focused::Chat(chat)),
+            Entry::Shell(shell) => {
+                let member = shell.member.as_deref().and_then(|m| self.find_member(m));
+                return Some(Focused::Shell(shell, member));
+            }
             Entry::Task(task) => task,
         };
         let focused = self
@@ -1068,11 +1296,12 @@ impl App {
         ))
     }
 
-    /// The focused member of the selected task (`None` on a chat).
+    /// The focused member of the selected task (`None` on a chat or a
+    /// shell).
     pub fn focused_member(&self) -> Option<(&Task, &Member)> {
         match self.focused()? {
             Focused::Member(task, member) => Some((task, member)),
-            Focused::Chat(_) => None,
+            Focused::Chat(_) | Focused::Shell(..) => None,
         }
     }
 
@@ -1133,6 +1362,8 @@ impl App {
         };
         let ours = |id: &str| match &detail.of {
             Pick::Chat(chat) => chat == id,
+            // A shell gets no messages.
+            Pick::Shell(_) => false,
             Pick::Task(name) => self
                 .tasks
                 .iter()

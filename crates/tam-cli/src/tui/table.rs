@@ -1,19 +1,21 @@
-//! The list: the chats' section, then a row per task under a header row per
-//! repository (or chats and tasks together, the most urgent first), and a
-//! row per member below a task with several. Its columns fit the width: the
-//! least useful go first when it is narrow.
+//! The list: the chats' section, the section of the shells on main
+//! checkouts, then a row per task under a header row per repository (or
+//! chats and tasks together, the most urgent first, those shells last), a
+//! row per member below a task with several, and a row per shell in a
+//! worktree below its member. Its columns fit the width: the least useful
+//! go first when it is narrow.
 
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, HighlightSpacing, Row as TableRow, Table, TableState};
 use ratatui::Frame;
-use tam_proto::{AgentInfo, AgentState};
+use tam_proto::{AgentInfo, AgentState, ShellInfo};
 
 use crate::chat::{Chat, Closes};
 use crate::task::{Member, Task, TaskStatus};
 
-use super::app::{self, App, Order, Pick, Row};
+use super::app::{self, App, Branch, Order, Pick, Row};
 use super::branch::Observation;
 use super::fuzzy;
 use super::theme;
@@ -93,8 +95,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         cols.push(Col::Note);
     }
     let cell = |row: &Row, col| match *row {
-        Row::Group(_) | Row::Chats => Line::default(),
+        Row::Group(_) | Row::Chats | Row::Shells => Line::default(),
         Row::Chat(chat) => chat_cell(col, chat, app, now),
+        Row::Shell { shell, tree } => shell_cell(col, shell, tree, app),
         Row::Task(task) => task_cell(col, task, app, now),
         Row::Member { task, member, last } => {
             let marked = focused.as_deref() == Some(member.id());
@@ -123,6 +126,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|(row, cells)| match row {
             Row::Group(task) => header_row(app::repo_group(task), width, cols.len(), app),
             Row::Chats => header_row("chats".into(), width, cols.len(), app),
+            Row::Shells => header_row("shells".into(), width, cols.len(), app),
             // The name cut before its mark, never the mark.
             Row::Chat(chat) => TableRow::new(cols.iter().zip(cells).map(|(&col, line)| {
                 Cell::from(match col {
@@ -151,23 +155,24 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     // The selected entry's rows, from its group's header when it is the
-    // first in it.
+    // first in it, to a task's last member or shell.
     let selected_row = rows.iter().position(|r| match (r, &selected) {
         (Row::Task(t), Some(Pick::Task(name))) => t.name == *name,
         (Row::Chat(c), Some(Pick::Chat(id))) => c.info.id == *id,
+        (Row::Shell { shell, .. }, Some(Pick::Shell(id))) => shell.id == *id,
         _ => false,
     });
     let block = selected_row.map(|i| {
-        let start = if i > 0 && matches!(rows[i - 1], Row::Group(_) | Row::Chats) {
-            i - 1
-        } else {
-            i
+        let header = i > 0 && matches!(rows[i - 1], Row::Group(_) | Row::Chats | Row::Shells);
+        let start = if header { i - 1 } else { i };
+        let below = match rows[i] {
+            Row::Task(_) => rows[i + 1..]
+                .iter()
+                .take_while(|r| matches!(r, Row::Member { .. } | Row::Shell { tree: Some(_), .. }))
+                .count(),
+            _ => 0,
         };
-        let members = rows[i + 1..]
-            .iter()
-            .take_while(|r| matches!(r, Row::Member { .. }))
-            .count();
-        (start, i, i + 1 + members)
+        (start, i, i + 1 + below)
     });
     let height = area.height.saturating_sub(1) as usize;
     let mut offset = app.table_offset.min(rows.len().saturating_sub(height));
@@ -182,15 +187,22 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     // For the mouse: the entry (its index among the visible ones) and the
     // member each row is about.
     let mut index = 0;
+    let mut task = 0;
     let row_tasks: Vec<Option<(usize, Option<String>)>> = rows
         .iter()
         .map(|row| match row {
-            Row::Group(_) | Row::Chats => None,
-            Row::Task(_) | Row::Chat(_) => {
+            Row::Group(_) | Row::Chats | Row::Shells => None,
+            Row::Task(_) => {
+                task = index;
+                index += 1;
+                Some((task, None))
+            }
+            Row::Chat(_) | Row::Shell { .. } => {
                 index += 1;
                 Some((index - 1, None))
             }
-            Row::Member { member, .. } => Some((index - 1, Some(member.id().to_string()))),
+            // Its task's: the shells between members are entries too.
+            Row::Member { member, .. } => Some((task, Some(member.id().to_string()))),
         })
         .collect();
     drop(rows);
@@ -225,8 +237,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 }
 
-/// A section's header row: its name (the repositories, or `chats`), and a
-/// rule to the list's edge.
+/// A section's header row: its name (the repositories, `chats` or
+/// `shells`), and a rule to the list's edge.
 fn header_row(name: String, width: u16, cols: usize, app: &App) -> TableRow<'static> {
     let t = theme::get();
     let rule = (width as usize).saturating_sub(Span::raw(name.as_str()).width() + 1);
@@ -419,6 +431,41 @@ fn chat_cell(col: Col, chat: &Chat, app: &App, now: u64) -> Line<'static> {
             (None, None) => Line::default(),
         },
     }
+}
+
+/// A shell's cells: its name alone (no status, time or context: a shell has
+/// none), on a branch below its member for one in a worktree. One on a main
+/// checkout has its repository where a task has its branch (in the REPO
+/// column attention first, the branch's then saying `shell`), as a chat.
+fn shell_cell(col: Col, shell: &ShellInfo, tree: Option<Branch>, app: &App) -> Line<'static> {
+    let t = theme::get();
+    let dim = Style::new().fg(t.muted);
+    let Some(tree) = tree else {
+        return match col {
+            Col::Task => Line::raw(shell.name()),
+            Col::Repo => Line::raw(shell.repo.clone()),
+            Col::Branch => match app.order {
+                Order::Repo => Line::styled(shell.repo.clone(), dim),
+                Order::Attention => Line::styled("shell", dim),
+            },
+            _ => Line::default(),
+        };
+    };
+    if col != Col::Task {
+        return Line::default();
+    }
+    // The task's branch going on past the member's row (in a task with
+    // several), then the shell's own, as a member's.
+    let trunk = match tree.member_last {
+        None => "",
+        Some(false) => " │",
+        Some(true) => "  ",
+    };
+    let fork = if tree.last { "└" } else { "├" };
+    Line::from(vec![
+        Span::styled(format!("{trunk} {fork}"), Style::new().fg(t.subtle)),
+        Span::raw(format!(" {}", shell.name())),
+    ])
 }
 
 /// A chat's name (the user's, else Claude's title, else its id, dimmed),

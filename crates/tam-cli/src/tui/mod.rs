@@ -23,7 +23,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tam_proto::ServerMessage;
+use tam_proto::{ServerMessage, ShellInfo, ShellPlace};
 
 use crate::chat::{self as chats, Chat, Closes};
 use crate::client::{self, Client, DropOutcome};
@@ -62,6 +62,15 @@ enum Action {
     },
     /// Close a chat.
     CloseChat {
+        id: String,
+        label: String,
+    },
+    /// Open a shell there, select it and type into it.
+    OpenShell {
+        on: ShellPlace,
+    },
+    /// Close a shell (`label`: `Shell #3 of <where it runs>`).
+    CloseShell {
         id: String,
         label: String,
     },
@@ -158,7 +167,7 @@ pub async fn run() -> Result<()> {
     // Subscribe before the snapshot: a change racing it is applied after.
     client.subscribe().await?;
 
-    let (tasks, chats) = build_lists(&mut client).await?;
+    let (tasks, chats, shells) = build_lists(&mut client).await?;
 
     let mut stdout = std::io::stdout();
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
@@ -179,8 +188,9 @@ pub async fn run() -> Result<()> {
     theme::set(config.theme.as_deref(), config.animate);
     let mut app = App::new();
     app.commands = config.commands.clone();
-    // Chats first: the selection starts on the list's top entry.
+    // In the list's order: the selection starts on its top entry.
     app.set_chats(chats);
+    app.set_shells(shells);
     app.set_tasks(tasks);
 
     let result = run_loop(&mut terminal, &mut app, &mut client, &config).await;
@@ -461,6 +471,17 @@ async fn run_loop(
                     close_chat(client, app, &id, &label).await;
                     screen_moved = true;
                 }
+                Action::OpenShell { on } => {
+                    open_shell(client, app, on).await;
+                    screen_moved = true;
+                    // As for the enter that gives the pane the keyboard:
+                    // the keys queued behind it are dropped.
+                    break;
+                }
+                Action::CloseShell { id, label } => {
+                    close_shell(client, app, &id, &label).await;
+                    screen_moved = true;
+                }
                 Action::KeepChat { id, label, keep } => {
                     keep_chat(client, app, &id, &label, keep).await;
                 }
@@ -614,6 +635,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         Mode::Terminal { .. } => handle_terminal_key(key, app),
         Mode::Scroll { .. } => handle_scroll_key(key, app),
         Mode::ConfirmCloseChat { .. } => handle_close_chat_key(key, app),
+        Mode::ConfirmCloseShell { .. } => handle_close_shell_key(key, app),
         Mode::RenameChat { .. } => handle_rename_chat_key(key, app),
     }
 }
@@ -698,6 +720,8 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
     let chat = app
         .selected_chat()
         .map(|c| (c.info.clone(), c.agent.is_some()));
+    // On a shell, `x` and `d` ask to close it.
+    let close_shell = app.selected_shell().map(|s| close_shell_dialog(app, s));
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Action::Quit,
         // They scrolled the pane by pages once: never the letters' own keys
@@ -705,16 +729,16 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         (KeyCode::Char('u' | 'b' | 'd' | 'f'), KeyModifiers::CONTROL) => Action::None,
         (KeyCode::Char('j') | KeyCode::Down, _) => Action::SelectNext,
         (KeyCode::Char('k') | KeyCode::Up, _) => Action::SelectPrev,
-        // The agent's terminal on the whole screen; a chat's agent started
-        // first. (shift-enter where the terminal tells it from enter: see
-        // `keyboard_protocol`.)
+        // The agent's (or shell's) terminal on the whole screen; a chat's
+        // agent started first. (shift-enter where the terminal tells it
+        // from enter: see `keyboard_protocol`.)
         (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => full_screen(app),
         (KeyCode::Char('f'), _) => full_screen(app),
         (KeyCode::Enter, _) => match app.focused() {
-            // The pane takes the keyboard.
-            Some(focused) if focused.agent().is_some() => {
+            // The pane takes the keyboard: an agent's, or a shell's.
+            Some(focused) if focused.terminal().is_some() => {
                 app.mode = Mode::Terminal {
-                    agent: focused.id().to_string(),
+                    agent: focused.terminal().unwrap_or_default().to_string(),
                 };
                 Action::None
             }
@@ -747,6 +771,24 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
         }
         (KeyCode::Char('n'), _) => Action::PickProject(Purpose::Task),
         (KeyCode::Char('c'), _) => Action::PickProject(Purpose::Chat),
+        // A shell on a repository's main checkout.
+        (KeyCode::Char('s'), _) => Action::PickProject(Purpose::Shell),
+        // A shell here: in the focused member's worktree, a chat's main
+        // checkout, or where the selected shell runs.
+        (KeyCode::Char('!'), _) => match shell_here(app) {
+            Some(on) => Action::OpenShell { on },
+            None => {
+                app.set_status(
+                    "No task or chat selected: s opens a shell on a repository".into(),
+                    Duration::from_secs(3),
+                );
+                Action::None
+            }
+        },
+        (KeyCode::Char('x' | 'd'), _) if close_shell.is_some() => {
+            app.mode = close_shell.expect("a shell");
+            Action::None
+        }
         // A chat is its session: enter resumes it.
         (KeyCode::Char('r' | 'R'), _) if chat.as_ref().is_some_and(|(_, running)| !running) => {
             app.set_status(
@@ -767,7 +809,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
             },
             _ => Action::None,
         },
-        (KeyCode::Char('s'), _) => match app.focused() {
+        (KeyCode::Char('x'), _) => match app.focused() {
             Some(focused) if focused.agent().is_some() => Action::StopAgent {
                 id: focused.id().to_string(),
                 label: focused.label(),
@@ -866,12 +908,12 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, config: &Config) -> Action {
     }
 }
 
-/// `f` (or shift-enter): attach to the focused agent on the whole screen,
-/// starting a chat's first.
+/// `f` (or shift-enter): attach to the focused agent (or the selected
+/// shell) on the whole screen, starting a chat's first.
 fn full_screen(app: &App) -> Action {
     match app.focused() {
-        Some(focused) if focused.agent().is_some() => Action::Attach {
-            id: focused.id().to_string(),
+        Some(focused) if focused.terminal().is_some() => Action::Attach {
+            id: focused.terminal().unwrap_or_default().to_string(),
             label: focused.label(),
         },
         Some(Focused::Chat(chat)) => Action::Resume {
@@ -883,22 +925,53 @@ fn full_screen(app: &App) -> Action {
     }
 }
 
-/// A custom command on the focused member or chat (nothing without one).
+/// A custom command on the focused member, chat or shell (nothing without
+/// one; see `Focused::command_values`).
 fn custom_command(app: &App, cmd: &CustomCommand) -> Action {
     let Some(focused) = app.focused() else {
         return Action::None;
     };
-    let (task, dir) = focused.task_and_dir();
+    let (task, id, dir, provider) = focused.command_values();
     Action::CustomCommand {
         name: cmd.name.clone(),
         command: cmd.command.clone(),
         task,
-        id: focused.id().to_string(),
+        id: id.to_string(),
         dir: dir.to_path_buf(),
-        provider: focused
-            .agent()
-            .map(|a| a.provider.clone())
-            .unwrap_or_default(),
+        provider,
+    }
+}
+
+/// Where `!` opens a shell: in the focused member's worktree; on a chat, its
+/// main checkout; on a shell, where it runs (another one there).
+fn shell_here(app: &App) -> Option<ShellPlace> {
+    Some(match app.focused()? {
+        Focused::Member(_, member) => ShellPlace::Member(member.id().to_string()),
+        Focused::Chat(chat) => ShellPlace::Checkout(chat.info.dir.clone()),
+        Focused::Shell(shell, _) => match &shell.member {
+            Some(member) => ShellPlace::Member(member.clone()),
+            None => ShellPlace::Checkout(shell.dir.clone()),
+        },
+    })
+}
+
+/// Asks to close `shell`, naming where it runs.
+fn close_shell_dialog(app: &App, shell: &ShellInfo) -> Mode {
+    Mode::ConfirmCloseShell {
+        id: shell.id.clone(),
+        label: format!("{} of {}", shell.name(), app.shell_place(shell)),
+    }
+}
+
+/// `y`/enter: close the shell; anything else cancels.
+fn handle_close_shell_key(key: KeyEvent, app: &mut App) -> Action {
+    let Mode::ConfirmCloseShell { id, label } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return Action::None;
+    };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => Action::CloseShell { id, label },
+        _ => Action::None,
     }
 }
 
@@ -1027,6 +1100,11 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
                     }
                 }
                 (Ok(root), Purpose::Chat) => return Action::ChatHistory { dir: root },
+                (Ok(root), Purpose::Shell) => {
+                    return Action::OpenShell {
+                        on: ShellPlace::Checkout(root),
+                    }
+                }
                 (Err(e), _) => app.set_status(e, Duration::from_secs(5)),
             }
         }
@@ -1220,7 +1298,8 @@ fn selected_member(app: &App) -> Option<(&Task, &crate::task::Member)> {
 /// shown now (the dialog keeps it: the one it answers), or why there is
 /// none to answer from here.
 fn open_answer(app: &mut App) {
-    let Some(focused) = app.focused() else {
+    // A shell asks nothing.
+    let Some(focused) = app.focused().filter(|f| !matches!(f, Focused::Shell(..))) else {
         return;
     };
     let label = focused.label();
@@ -1346,6 +1425,7 @@ fn start_pick_project(app: &mut App, purpose: Purpose) {
     let title = match purpose {
         Purpose::Task => "Pick project",
         Purpose::Chat => "New chat · pick a repository",
+        Purpose::Shell => "New shell · pick a repository",
     };
     let mut picker = PickerState::new(title, items);
     picker.loading = true;
@@ -1381,8 +1461,8 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
         return Action::None;
     };
     let purpose = *purpose;
-    // A chat: the highlighted repository.
-    let ids = if picker.marked.is_empty() || purpose == Purpose::Chat {
+    // A chat or a shell: the highlighted repository.
+    let ids = if picker.marked.is_empty() || purpose != Purpose::Task {
         match picker.selected_item() {
             Some(item) => vec![item.id.clone()],
             None => return Action::None,
@@ -1413,11 +1493,18 @@ fn handle_picker_enter(app: &mut App, _config: &Config) -> Action {
             }
         }
     }
-    if purpose == Purpose::Chat {
-        return match roots.pop() {
-            Some(dir) => Action::ChatHistory { dir },
-            None => Action::None,
-        };
+    match purpose {
+        Purpose::Chat => {
+            return roots
+                .pop()
+                .map_or(Action::None, |dir| Action::ChatHistory { dir })
+        }
+        Purpose::Shell => {
+            return roots.pop().map_or(Action::None, |dir| Action::OpenShell {
+                on: ShellPlace::Checkout(dir),
+            })
+        }
+        Purpose::Task => {}
     }
     app.mode = Mode::NewTaskEnterName {
         project_dirs: roots,
@@ -1498,6 +1585,11 @@ async fn refresh_detail(client: &mut Client, app: &mut App) {
     let (runs, of) = match &pick {
         Pick::Task(name) => (client.get_task(name).await.map(|(_, runs)| runs), name),
         Pick::Chat(id) => (client.get_chat(id).await.map(|(_, runs)| runs), id),
+        // A shell has neither.
+        Pick::Shell(_) => {
+            app.detail = Some(TaskDetail::of(pick));
+            return;
+        }
     };
     let messages = match client
         .send(tam_proto::Request::ListMessages {
@@ -1610,10 +1702,14 @@ async fn attach(
     // The dashboard reads nothing while attached.
     unwatch_screen(client, app).await;
     input.pause().await;
-    // An agent just started may not be in the list yet: it is Claude.
-    let provider = app
-        .find_agent(id)
-        .map_or_else(|| "claude".to_string(), |a| a.provider.clone());
+    // An agent just started may not be in the list yet: it is Claude. A
+    // shell has none.
+    let provider = match app.shells.iter().any(|s| s.id == id) {
+        true => String::new(),
+        false => app
+            .find_agent(id)
+            .map_or_else(|| "claude".to_string(), |a| a.provider.clone()),
+    };
     let attached = attach_agent(terminal, app, id, label, &provider).await;
     mouse_capture(true);
     bracketed_paste(true);
@@ -1735,6 +1831,44 @@ async fn close_chat(client: &mut Client, app: &mut App, id: &str, label: &str) {
             format!("Closed '{label}': c makes it again from its repository's history"),
             Duration::from_secs(5),
         ),
+        Err(e) => {
+            app.mode = Mode::Notice {
+                title: "Close Failed".into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
+        }
+    }
+}
+
+/// Open a shell `on` a member's worktree or a main checkout, and type into
+/// it (see `App::take_shell`); a notice says why it did not open.
+async fn open_shell(client: &mut Client, app: &mut App, on: ShellPlace) {
+    match client.open_shell(on).await {
+        Ok(shell) => {
+            let what = format!(
+                "Opened {} in {}: typing into it",
+                shell.name(),
+                app.shell_place(&shell)
+            );
+            app.take_shell(shell);
+            app.set_status(what, Duration::from_secs(3));
+        }
+        Err(e) => {
+            app.mode = Mode::Notice {
+                title: "No Shell".into(),
+                lines: format!("{e:#}").lines().map(str::to_string).collect(),
+            };
+        }
+    }
+}
+
+/// Close a shell (the daemon hangs it up and waits for it to go).
+async fn close_shell(client: &mut Client, app: &mut App, id: &str, label: &str) {
+    match client.close_shell(id).await {
+        Ok(_) => {
+            app.remove_shell(id);
+            app.set_status(format!("Closed {label}"), Duration::from_secs(3));
+        }
         Err(e) => {
             app.mode = Mode::Notice {
                 title: "Close Failed".into(),
@@ -1917,9 +2051,13 @@ fn redraw_status_bar(
     let _ = out.flush();
 }
 
-/// Scroll region above the bottom row, then the bar itself on the bottom row.
+/// Scroll region above the bottom row, then the bar itself on the bottom row
+/// (a shell's names no provider).
 fn status_bar_seq(name: &str, provider: &str, cols: u16, rows: u16) -> String {
-    let bar = format!(" tam > {name} ({provider})");
+    let bar = match provider {
+        "" => format!(" tam > {name}"),
+        _ => format!(" tam > {name} ({provider})"),
+    };
     let hint = "ctrl-]: detach ";
     let cols = cols as usize;
     let padding = cols.saturating_sub(bar.chars().count() + hint.len());
@@ -2064,17 +2202,23 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
         tam_proto::Event::ChatClosed { id } => {
             app.remove_chat(&id);
         }
-        // Shells in the dashboard: #82.
-        tam_proto::Event::ShellOpened { .. } | tam_proto::Event::ShellClosed { .. } => {}
+        tam_proto::Event::ShellOpened { shell } => {
+            app.upsert_shell(shell);
+        }
+        tam_proto::Event::ShellClosed { id } => {
+            app.remove_shell(&id);
+        }
     }
 }
 
-/// The tasks and the chats, with their running agents.
-async fn build_lists(client: &mut Client) -> Result<(Vec<Task>, Vec<Chat>)> {
+/// The tasks and the chats, with their running agents, and the shells.
+async fn build_lists(client: &mut Client) -> Result<(Vec<Task>, Vec<Chat>, Vec<ShellInfo>)> {
     // Fresh worktree health; the daemon pushes its changes from then on.
     let infos = client.reconcile().await?;
     let chats = client.list_chats().await?;
     let agents = client.list_agents().await.unwrap_or_default();
+    // A daemon older than shells has none.
+    let shells = client.list_shells().await.unwrap_or_default();
 
     let tasks = infos
         .into_iter()
@@ -2084,7 +2228,7 @@ async fn build_lists(client: &mut Client) -> Result<(Vec<Task>, Vec<Chat>)> {
         .into_iter()
         .map(|info| Chat::new(info, &agents))
         .collect();
-    Ok((tasks, chats))
+    Ok((tasks, chats, shells))
 }
 
 /// Recreate the task's gone worktrees that can be (running the project's
@@ -2935,7 +3079,7 @@ mod tests {
         app.update_state("m-2", Ready);
         app.cycle_member(1);
         assert!(matches!(
-            handle_normal_key(press('s'), &mut app, &config),
+            handle_normal_key(press('x'), &mut app, &config),
             Action::StopAgent { ref id, ref label } if id == "m-2" && label == "feat/web"
         ));
     }
@@ -3326,7 +3470,7 @@ mod tests {
                 if agent == "c-1" && ask == "ask-9" && label == "Running chat"
         ));
         assert!(matches!(
-            handle_key_event(press('s'), &mut app, &config),
+            handle_key_event(press('x'), &mut app, &config),
             Action::StopAgent { id, .. } if id == "c-1"
         ));
 
@@ -3760,6 +3904,511 @@ mod tests {
         assert!(matches!(
             handle_key_event(press('c'), &mut app, &config),
             Action::CustomCommand { name, .. } if name == "code"
+        ));
+    }
+
+    // -- Shells -------------------------------------------------------------
+
+    /// Shell `id`, number `number`, in the worktree of `member` (`m-1`:
+    /// feat/app, `m-2`: feat/web), else on the main checkout of api.
+    fn shell(id: &str, member: Option<&str>, number: u32) -> ShellInfo {
+        let (dir, repo) = match member {
+            Some("m-1") => ("/w/app--feat", "app"),
+            Some("m-2") => ("/w/web--feat", "web"),
+            Some(other) => panic!("no member {other}"),
+            None => ("/src/api", "api"),
+        };
+        ShellInfo {
+            id: id.into(),
+            member: member.map(str::to_string),
+            dir: dir.into(),
+            repo: repo.into(),
+            number,
+            pid: 1,
+            opened_at: task::now(),
+            viewers: 0,
+        }
+    }
+
+    /// `chat_app` with shells: #1 and #2 in feat/app's worktree, #1 in
+    /// feat/web's and #1 on api's main checkout (the chats'). The list:
+    /// c-1, c-2, sh-c1, feat, sh-a1, sh-a2, sh-w1, other.
+    fn shell_app() -> App {
+        let mut app = chat_app();
+        app.set_shells(vec![
+            shell("sh-a1", Some("m-1"), 1),
+            shell("sh-c1", None, 1),
+            shell("sh-a2", Some("m-1"), 2),
+            shell("sh-w1", Some("m-2"), 1),
+        ]);
+        app
+    }
+
+    fn shell_pick(id: &str) -> Pick {
+        Pick::Shell(id.into())
+    }
+
+    #[test]
+    fn shells_are_entries_of_the_list() {
+        let config = Config::default();
+        let mut app = shell_app();
+        let order: Vec<Pick> = app.visible_entries().iter().map(|e| e.pick()).collect();
+        assert_eq!(
+            order,
+            [
+                Pick::Chat("c-1".into()),
+                Pick::Chat("c-2".into()),
+                shell_pick("sh-c1"),
+                Pick::Task("feat".into()),
+                shell_pick("sh-a1"),
+                shell_pick("sh-a2"),
+                shell_pick("sh-w1"),
+                Pick::Task("other".into()),
+            ]
+        );
+        // j/k go through them.
+        select(&mut app, Pick::Chat("c-2".into()));
+        for pick in [
+            shell_pick("sh-c1"),
+            Pick::Task("feat".into()),
+            shell_pick("sh-a1"),
+        ] {
+            assert!(matches!(
+                handle_key_event(press('j'), &mut app, &config),
+                Action::SelectNext
+            ));
+            app.select_next();
+            app.sync_focus();
+            assert_eq!(selected(&app), Some(pick));
+        }
+        // A shell is what the pane shows; members keep ←/→ (nothing here).
+        assert_eq!(app.peek_agent().as_deref(), Some("sh-a1"));
+        assert!(app.focused_member().is_none());
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_key_event(right, &mut app, &config);
+        assert_eq!(selected(&app), Some(shell_pick("sh-a1")));
+        assert_eq!(app.peek_agent().as_deref(), Some("sh-a1"));
+
+        // The mouse: each row's entry, a member's row its task's.
+        draw(&mut app, 80, 40);
+        let member = |m: &str| Some(m.to_string());
+        assert_eq!(
+            app.hits.rows[..14],
+            [
+                None,            // chats
+                Some((0, None)), // c-1
+                Some((1, None)), // c-2
+                None,            // shells
+                Some((2, None)), // sh-c1
+                None,            // app + web
+                Some((3, None)), // feat
+                Some((3, member("m-1"))),
+                Some((4, None)), // sh-a1
+                Some((5, None)), // sh-a2
+                Some((3, member("m-2"))),
+                Some((6, None)), // sh-w1
+                None,            // lib
+                Some((7, None)), // other
+            ]
+        );
+        let list = app.hits.list;
+        let click = |row: u16| mouse(MouseEventKind::Down(MouseButton::Left), 3, list.y + row);
+        handle_mouse(click(11), &mut app);
+        assert_eq!(selected(&app), Some(shell_pick("sh-w1")));
+        handle_mouse(click(10), &mut app);
+        assert_eq!(selected(&app), Some(Pick::Task("feat".into())));
+        assert_eq!(app.focused().map(|f| f.id()), Some("m-2"));
+
+        // Opened and closed elsewhere: the daemon's events.
+        apply_event(
+            &mut app,
+            tam_proto::Event::ShellOpened {
+                shell: shell("sh-w2", Some("m-2"), 2),
+            },
+        );
+        let at = |app: &App, id: &str| {
+            app.visible_entries()
+                .iter()
+                .position(|e| e.pick() == shell_pick(id))
+        };
+        assert_eq!(at(&app, "sh-w2"), Some(7));
+        // Its reply and its event: one shell.
+        apply_event(
+            &mut app,
+            tam_proto::Event::ShellOpened {
+                shell: shell("sh-w2", Some("m-2"), 2),
+            },
+        );
+        assert_eq!(app.shells.len(), 5);
+        apply_event(
+            &mut app,
+            tam_proto::Event::ShellClosed { id: "sh-w2".into() },
+        );
+        assert_eq!(at(&app, "sh-w2"), None);
+        assert_eq!(selected(&app), Some(Pick::Task("feat".into())));
+    }
+
+    #[test]
+    fn bang_opens_a_shell_where_the_selection_is() {
+        let config = Config::default();
+        let mut app = shell_app();
+        let bang = |app: &mut App| match handle_key_event(press('!'), app, &config) {
+            Action::OpenShell { on } => Some(on),
+            _ => None,
+        };
+        let api = ShellPlace::Checkout("/src/api".into());
+        // A chat: its main checkout.
+        assert_eq!(bang(&mut app), Some(api.clone()));
+        // A task: the focused member's worktree.
+        select(&mut app, Pick::Task("feat".into()));
+        assert_eq!(bang(&mut app), Some(ShellPlace::Member("m-1".into())));
+        app.cycle_member(1);
+        assert_eq!(bang(&mut app), Some(ShellPlace::Member("m-2".into())));
+        // A shell: another one there.
+        select(&mut app, shell_pick("sh-a2"));
+        assert_eq!(bang(&mut app), Some(ShellPlace::Member("m-1".into())));
+        select(&mut app, shell_pick("sh-w1"));
+        assert_eq!(bang(&mut app), Some(ShellPlace::Member("m-2".into())));
+        select(&mut app, shell_pick("sh-c1"));
+        assert_eq!(bang(&mut app), Some(api));
+        // Nothing selected: nothing, and how to open one elsewhere.
+        let mut empty = App::new();
+        assert_eq!(bang(&mut empty), None);
+        assert!(empty.status_message().unwrap().contains("s opens a shell"));
+
+        // The daemon's reply: listed, selected, typed into at once.
+        select(&mut app, Pick::Task("other".into()));
+        app.take_shell(shell("sh-w2", Some("m-2"), 2));
+        assert_eq!(selected(&app), Some(shell_pick("sh-w2")));
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "sh-w2"));
+        app.check_typing();
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "sh-w2"));
+        // A filter that would hide it is emptied.
+        app.mode = Mode::Normal;
+        app.filter = TextInput::from("other");
+        app.filter_active = true;
+        app.take_shell(shell("sh-c2", None, 2));
+        assert!(app.filter.is_empty() && !app.filter_active);
+        assert_eq!(selected(&app), Some(shell_pick("sh-c2")));
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "sh-c2"));
+    }
+
+    #[test]
+    fn s_picks_a_repository_for_a_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = tam_worktree::git::command()
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let (api, web) = (tmp.path().join("api"), tmp.path().join("web"));
+        for repo in [&api, &web] {
+            std::fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "i",
+                ],
+            );
+        }
+        let web_wt = tmp.path().join("web--x");
+        git(
+            &web,
+            &["worktree", "add", "-q", "-b", "x", web_wt.to_str().unwrap()],
+        );
+        let config = Config::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = shell_app();
+
+        // `s` no longer stops: on a task with a running agent too.
+        select(&mut app, Pick::Task("feat".into()));
+        assert!(matches!(
+            handle_key_event(press('s'), &mut app, &config),
+            Action::PickProject(Purpose::Shell)
+        ));
+        start_pick_project(&mut app, Purpose::Shell);
+        let Mode::PickProject(picker, Purpose::Shell) = &mut app.mode else {
+            panic!("not picking");
+        };
+        assert_eq!(picker.title, "New shell · pick a repository");
+        let item = |display: &str, id: &std::path::Path| PickerItem {
+            display: display.into(),
+            id: id.to_str().unwrap().into(),
+        };
+        picker.set_items(vec![
+            PickerItem {
+                display: "enter path...".into(),
+                id: "__enter_path__".into(),
+            },
+            item("api", &api),
+            item("x @web", &web_wt),
+        ]);
+        // One repository: tab picks nothing; a worktree stands for its
+        // repository's main checkout.
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        handle_key_event(key(KeyCode::Tab), &mut app, &config);
+        let Mode::PickProject(picker, _) = &app.mode else {
+            panic!("still picking");
+        };
+        assert!(picker.marked.is_empty());
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        let web_root = std::fs::canonicalize(&web).unwrap();
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::OpenShell { on: ShellPlace::Checkout(dir) } if dir == web_root
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // Or a path typed.
+        start_pick_project(&mut app, Purpose::Shell);
+        handle_key_event(key(KeyCode::Down), &mut app, &config);
+        handle_key_event(key(KeyCode::Enter), &mut app, &config);
+        assert!(matches!(app.mode, Mode::SpawnEnterPath(_, Purpose::Shell)));
+        paste_into_prompt(api.to_str().unwrap(), &mut app, &config);
+        let api_root = std::fs::canonicalize(&api).unwrap();
+        assert!(matches!(
+            handle_key_event(key(KeyCode::Enter), &mut app, &config),
+            Action::OpenShell { on: ShellPlace::Checkout(dir) } if dir == api_root
+        ));
+    }
+
+    #[test]
+    fn x_stops_and_x_or_d_close_a_shell_once_confirmed() {
+        let config = Config::default();
+        let mut app = shell_app();
+        // Stop: on a chat and on a task.
+        assert!(matches!(
+            handle_key_event(press('x'), &mut app, &config),
+            Action::StopAgent { id, .. } if id == "c-1"
+        ));
+        select(&mut app, Pick::Task("feat".into()));
+        assert!(matches!(
+            handle_key_event(press('x'), &mut app, &config),
+            Action::StopAgent { id, label } if id == "m-1" && label == "feat/app"
+        ));
+        // Nothing runs: nothing to stop.
+        select(&mut app, Pick::Chat("c-2".into()));
+        assert!(matches!(
+            handle_key_event(press('x'), &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // A shell: closed once confirmed, `x` or `d`.
+        select(&mut app, shell_pick("sh-a2"));
+        for (close, confirm) in [
+            ('x', press('n')),
+            ('d', KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        ] {
+            handle_key_event(press(close), &mut app, &config);
+            assert!(matches!(
+                &app.mode,
+                Mode::ConfirmCloseShell { id, label } if id == "sh-a2" && label == "Shell #2 of feat/app"
+            ));
+            assert!(matches!(
+                handle_key_event(confirm, &mut app, &config),
+                Action::None
+            ));
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+        for (close, confirm) in [
+            ('x', press('y')),
+            ('d', KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ] {
+            handle_key_event(press(close), &mut app, &config);
+            assert!(matches!(
+                handle_key_event(confirm, &mut app, &config),
+                Action::CloseShell { id, .. } if id == "sh-a2"
+            ));
+        }
+        select(&mut app, shell_pick("sh-c1"));
+        handle_key_event(press('d'), &mut app, &config);
+        assert!(matches!(
+            &app.mode,
+            Mode::ConfirmCloseShell { label, .. } if label == "Shell #1 of api"
+        ));
+        app.mode = Mode::Normal;
+
+        // What a shell does not have: no run, answer, keep or name.
+        select(&mut app, shell_pick("sh-a1"));
+        for c in ['r', 'R', 'a', 'p', 'N'] {
+            assert!(
+                matches!(handle_key_event(press(c), &mut app, &config), Action::None),
+                "{c}"
+            );
+            assert!(matches!(app.mode, Mode::Normal), "{c}");
+            assert!(app.status_message().is_none(), "{c}");
+        }
+    }
+
+    #[test]
+    fn enter_and_f_on_a_shell_type_and_attach() {
+        let config = Config::default();
+        let mut app = shell_app();
+        select(&mut app, shell_pick("sh-w1"));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key_event(enter, &mut app, &config),
+            Action::None
+        ));
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "sh-w1"));
+        app.check_typing();
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "sh-w1"));
+        // Every key is the shell's.
+        assert!(matches!(
+            handle_key_event(press('d'), &mut app, &config),
+            Action::Keys(bytes) if bytes == b"d"
+        ));
+        let leave = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL);
+        handle_key_event(leave, &mut app, &config);
+        assert!(matches!(app.mode, Mode::Normal));
+        // On the whole screen.
+        for key in [
+            press('f'),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        ] {
+            assert!(matches!(
+                handle_key_event(key, &mut app, &config),
+                Action::Attach { id, label } if id == "sh-w1" && label == "Shell #1 · feat/web"
+            ));
+        }
+        // Scrolled.
+        handle_key_event(press('v'), &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Scroll { agent } if agent == "sh-w1"));
+    }
+
+    #[test]
+    fn a_shell_that_closes_gives_back_the_selection_and_the_keyboard() {
+        use tam_proto::AgentState::Blocked;
+        let config = Config::default();
+        let closed = |app: &mut App, id: &str| {
+            apply_event(app, tam_proto::Event::ShellClosed { id: id.into() });
+            app.sync_focus();
+            app.check_typing();
+        };
+        let mut app = shell_app();
+        // feat/web more urgent than feat/app.
+        app.update_agent(agent_info("m-2", Blocked));
+
+        // Selected: its task, its member shown (not the most urgent one).
+        select(&mut app, shell_pick("sh-a2"));
+        closed(&mut app, "sh-a2");
+        assert_eq!(selected(&app), Some(Pick::Task("feat".into())));
+        assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
+
+        // Typed into: back to the list, even with its member's agent to
+        // show, and the keys still coming are dropped.
+        select(&mut app, shell_pick("sh-a1"));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key_event(enter, &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "sh-a1"));
+        closed(&mut app, "sh-a1");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status_message().unwrap().contains("the shell closed"));
+        assert_eq!(selected(&app), Some(Pick::Task("feat".into())));
+        assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
+        let before = app.selected;
+        for c in ['j', 'd', 'q'] {
+            assert!(matches!(
+                handle_key_event(press(c), &mut app, &config),
+                Action::None
+            ));
+        }
+        assert_eq!(app.selected, before);
+        assert!(matches!(app.mode, Mode::Normal));
+        app.dropping_keys_until = None;
+
+        // On a main checkout: the entry now in its place.
+        select(&mut app, shell_pick("sh-c1"));
+        closed(&mut app, "sh-c1");
+        assert_eq!(selected(&app), Some(Pick::Task("feat".into())));
+
+        // Not selected: the selection stays.
+        select(&mut app, Pick::Chat("c-2".into()));
+        closed(&mut app, "sh-w1");
+        assert_eq!(selected(&app), Some(Pick::Chat("c-2".into())));
+        assert!(app.shells.is_empty());
+    }
+
+    #[test]
+    fn a_shell_s_status_bar_names_no_provider() {
+        let agent = status_bar_seq("feat", "claude", 80, 24);
+        assert!(agent.contains(" tam > feat (claude) "), "{agent:?}");
+        let shell = status_bar_seq("Shell #1 · feat", "", 80, 24);
+        assert!(shell.contains(" tam > Shell #1 · feat "), "{shell:?}");
+        assert!(!shell.contains("()"), "{shell:?}");
+    }
+
+    #[test]
+    fn custom_commands_on_shells_and_the_keys_they_took() {
+        let command = |key: &str| CustomCommand {
+            name: format!("cmd {key}"),
+            key: key.into(),
+            command: "true".into(),
+        };
+        let config = Config {
+            commands: vec![command("o"), command("!"), command("x")],
+            ..Config::default()
+        };
+        let mut app = shell_app();
+        app.commands = config.commands.clone();
+        let run = |app: &mut App, c| match handle_key_event(press(c), app, &config) {
+            Action::CustomCommand {
+                name,
+                task,
+                id,
+                dir,
+                provider,
+                ..
+            } => (name, task, id, dir, provider),
+            _ => panic!("no command"),
+        };
+        // In a worktree: its member's task, id and worktree.
+        select(&mut app, shell_pick("sh-a2"));
+        assert_eq!(
+            run(&mut app, 'o'),
+            (
+                "cmd o".into(),
+                "feat".into(),
+                "m-1".into(),
+                PathBuf::from("/w/app--feat"),
+                "claude".into()
+            )
+        );
+        // On a main checkout: its name, its id and the checkout.
+        select(&mut app, shell_pick("sh-c1"));
+        assert_eq!(
+            run(&mut app, 'o'),
+            (
+                "cmd o".into(),
+                "Shell #1".into(),
+                "sh-c1".into(),
+                PathBuf::from("/src/api"),
+                String::new()
+            )
+        );
+        // `!` and `x` are the commands', on a shell and on a task.
+        assert_eq!(run(&mut app, '!').0, "cmd !");
+        assert_eq!(run(&mut app, 'x').0, "cmd x");
+        select(&mut app, Pick::Task("feat".into()));
+        assert_eq!(run(&mut app, 'x').0, "cmd x");
+        // Typed with shift, as `!` is on most keyboards.
+        let shifted = KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT);
+        assert!(matches!(
+            handle_key_event(shifted, &mut app, &config),
+            Action::CustomCommand { name, .. } if name == "cmd !"
         ));
     }
 

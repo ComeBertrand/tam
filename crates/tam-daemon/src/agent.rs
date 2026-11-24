@@ -1,23 +1,16 @@
-use std::ffi::{OsStr, OsString};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
-use nix::pty::{openpty, Winsize};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
-use tam_proto::{AgentEnv, AgentInfo, AgentResponse, AgentState, Ask, ScreenInfo};
+use anyhow::Result;
+use tam_proto::{AgentInfo, AgentResponse, AgentState, Ask, ScreenInfo};
 use tokio::sync::{broadcast, watch};
-use tracing::error;
 
 use crate::provider::{HookData, HookResult, Provider};
-use crate::terminal::{self, Terminal};
+pub use crate::pty::Launch;
+use crate::pty::Pty;
 
 /// Lightweight metadata for context refresh — collected under lock, IO done outside.
 pub struct ContextRefreshJob {
@@ -30,22 +23,12 @@ pub struct ContextRefreshJob {
 }
 
 pub struct Agent {
+    /// The process on its PTY, and its screen.
+    pty: Pty,
     provider: Arc<dyn Provider>,
     dir: PathBuf,
     /// Stored state — used as fallback when provider doesn't do output detection (e.g. Claude with hooks).
     state: AgentState,
-    child: Child,
-    pty_master: Arc<OwnedFd>,
-    /// The screen of the PTY, at its size. Locked by the reader while it
-    /// takes in and relays a chunk of output.
-    terminal: Arc<Mutex<Terminal>>,
-    /// Bumped on every change of the screen.
-    screen_changed: watch::Sender<()>,
-    output_tx: broadcast::Sender<Vec<u8>>,
-    viewers: Arc<AtomicUsize>,
-    started_at: Instant,
-    /// Updated by the PTY reader thread on every output chunk.
-    last_output_at: Arc<Mutex<Instant>>,
     /// Last state reported via events. Used to detect transitions.
     reported_state: AgentState,
     /// When the agent entered `reported_state`.
@@ -58,76 +41,9 @@ pub struct Agent {
     owner: Option<String>,
     /// What the agent's hooks reported (session, pending action, …).
     hook_data: HookData,
-    _reader_handle: JoinHandle<()>,
     /// Other members' worktrees the agent was given read access to when
     /// it started (see `provider::TaskAccess`).
     readable: Vec<PathBuf>,
-}
-
-/// What the client starting an agent has it run in (`Request::RunAgent`).
-/// Held until the process starts, never kept: the environment holds secrets.
-#[derive(Default)]
-pub struct Launch {
-    /// The agent's whole environment, the client's. Empty: the daemon's.
-    pub env: AgentEnv,
-    /// Command the agent's command is given to as trailing arguments, in
-    /// the worktree (`direnv exec .`: the worktree's dev environment). It
-    /// should `exec` the agent, which then keeps its pid. Empty: none.
-    pub wrapper: Vec<String>,
-}
-
-/// `TERM` of an agent whose caller has none (a script, cron): the agent's
-/// terminal is a PTY, drawn by tam's screen and the viewers' terminals.
-const FALLBACK_TERM: &str = "xterm-256color";
-
-impl Launch {
-    /// `cmd` given to the wrapper, if any, which runs where `cmd` would,
-    /// with what the provider set on it.
-    fn wrap(&self, cmd: Command) -> Command {
-        let Some((program, args)) = self.wrapper.split_first() else {
-            return cmd;
-        };
-        let mut wrapped = Command::new(program);
-        wrapped
-            .args(args)
-            .arg(cmd.get_program())
-            .args(cmd.get_args());
-        if let Some(dir) = cmd.get_current_dir() {
-            wrapped.current_dir(dir);
-        }
-        for (key, val) in cmd.get_envs() {
-            match val {
-                Some(val) => wrapped.env(key, val),
-                None => wrapped.env_remove(key),
-            };
-        }
-        wrapped
-    }
-
-    /// Run `cmd` (in `dir`) with the client's environment instead of the
-    /// daemon's, keeping what the provider set on it. The program is looked
-    /// up on the client's `PATH`.
-    fn apply(&self, cmd: &mut Command, dir: &Path) {
-        if !self.env.is_empty() {
-            let set: Vec<(OsString, Option<OsString>)> = cmd
-                .get_envs()
-                .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
-                .collect();
-            cmd.env_clear().envs(&self.env.0);
-            let term = self.env.0.get("TERM").map(String::as_str);
-            if matches!(term, None | Some("" | "dumb")) {
-                cmd.env("TERM", FALLBACK_TERM);
-            }
-            for (key, val) in set {
-                match val {
-                    Some(val) => cmd.env(key, val),
-                    None => cmd.env_remove(key),
-                };
-            }
-        }
-        // Not the directory of the shell the environment comes from.
-        cmd.env("PWD", dir);
-    }
 }
 
 impl Agent {
@@ -143,154 +59,45 @@ impl Agent {
         env_vars: &[(&str, &str)],
         launch: &Launch,
     ) -> Result<Self> {
-        // Verify directory exists
-        anyhow::ensure!(dir.is_dir(), "directory does not exist: {}", dir.display());
-
-        let mut cmd = launch.wrap(provider.build_command(dir, args, resume_session, prompt));
-        launch.apply(&mut cmd, dir);
+        let mut cmd = provider.build_command(dir, args, resume_session, prompt);
         for (key, val) in env_vars {
             cmd.env(key, val);
         }
-
-        // Create PTY pair, at the terminal's size: a PTY without one
-        // reports 0×0 and each program falls back on its own default.
-        let size = Winsize {
-            ws_row: terminal::DEFAULT_ROWS,
-            ws_col: terminal::DEFAULT_COLS,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let pty = openpty(&size, None).context("failed to create PTY")?;
-        let master = pty.master;
-        let slave = pty.slave;
-
-        // Grab raw fd before slave is consumed (valid in child after fork)
-        let slave_raw_fd = slave.as_raw_fd();
-
-        // Create stdio from slave PTY
-        let stdin_fd = slave.try_clone().context("failed to clone slave fd")?;
-        let stdout_fd = slave.try_clone().context("failed to clone slave fd")?;
-        let stderr_fd = slave; // consumes original
-
-        let child = unsafe {
-            cmd.stdin(Stdio::from(stdin_fd))
-                .stdout(Stdio::from(stdout_fd))
-                .stderr(Stdio::from(stderr_fd))
-                .pre_exec(move || {
-                    // Create new session so the agent is detached from our terminal
-                    nix::unistd::setsid()
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                    // Set the slave PTY as the controlling terminal
-                    if libc::ioctl(slave_raw_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                })
-                .spawn()
-                .with_context(|| match launch.wrapper.first() {
-                    Some(wrapper) => format!(
-                        "failed to spawn '{}' through '{}' in {}",
-                        provider.name(),
-                        wrapper,
-                        dir.display()
-                    ),
-                    None => {
-                        format!("failed to spawn '{}' in {}", provider.name(), dir.display())
-                    }
-                })?
-        };
-
-        let master = Arc::new(master);
-        let terminal = Arc::new(Mutex::new(Terminal::new(
-            terminal::DEFAULT_COLS,
-            terminal::DEFAULT_ROWS,
-        )));
-        let (screen_changed, _) = watch::channel(());
-        let (output_tx, _) = broadcast::channel(64);
-        let last_output_at = Arc::new(Mutex::new(Instant::now()));
-
-        // Spawn a reader thread that drains PTY output into the terminal +
-        // broadcast
-        let reader_handle = {
-            let reader = PtyReader {
-                terminal: terminal.clone(),
-                screen_changed: screen_changed.clone(),
-                output_tx: output_tx.clone(),
-                last_output_at: last_output_at.clone(),
-            };
-            let master = master.clone();
-            std::thread::Builder::new()
-                .name("pty-reader".to_string())
-                .spawn(move || reader.run(master.as_raw_fd()))
-                .context("failed to spawn PTY reader thread")?
-        };
-
+        let pty = Pty::spawn(cmd, dir, launch, provider.name())?;
         Ok(Self {
+            pty,
             provider,
             dir: dir.to_path_buf(),
             state: AgentState::Working,
-            child,
-            pty_master: master,
-            terminal,
-            screen_changed,
-            output_tx,
-            viewers: Arc::new(AtomicUsize::new(0)),
-            started_at: Instant::now(),
-            last_output_at,
             reported_state: AgentState::Working,
             reported_since: SystemTime::now(),
             context_percent: None,
             owner: None,
             hook_data: HookData::default(),
-            _reader_handle: reader_handle,
             readable: Vec::new(),
         })
+    }
+
+    /// The agent's process on its PTY, and its screen.
+    pub fn pty(&self) -> &Pty {
+        &self.pty
     }
 
     /// Check if the child process has exited. Returns Some(exit_code) if so.
     /// Agents that exit are cleaned up by the daemon — exit is an event, not a state.
     pub fn check_exited(&mut self) -> Option<i32> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
-            Ok(None) => None,
-            Err(_) => Some(-1),
-        }
+        self.pty.check_exited()
     }
 
     /// Send SIGTERM, wait briefly, then SIGKILL if needed.
-    pub fn kill(&mut self) -> Result<()> {
-        let pid = Pid::from_raw(self.child.id() as i32);
-
-        // Try graceful shutdown first
-        let _ = kill(pid, Signal::SIGTERM);
-
-        // Wait up to 200ms for graceful exit
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return Ok(());
-            }
-        }
-
-        // Force kill
-        let _ = kill(pid, Signal::SIGKILL);
-
-        // Wait up to 2s for forced exit (handles slow process cleanup)
-        for _ in 0..200 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return Ok(());
-            }
-        }
-
-        error!(pid = %self.child.id(), "process did not exit after SIGKILL, abandoning");
-        Ok(())
+    pub fn kill(&mut self) {
+        self.pty.kill();
     }
 
     /// Kill the agent and drop it. Intended for use in background tasks
     /// where ownership is transferred (e.g. `spawn_blocking`).
     pub fn kill_and_drop(mut self) {
-        let _ = self.kill();
+        self.kill();
     }
 
     /// Bind the agent to a task member or a chat.
@@ -315,7 +122,7 @@ impl Agent {
     }
 
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.pty.pid()
     }
 
     pub fn provider_name(&self) -> &str {
@@ -385,7 +192,7 @@ impl Agent {
     /// Compute current state: ask the provider first (output heuristic),
     /// fall back to the stored state (set by hooks or default).
     pub fn current_state(&self) -> AgentState {
-        let idle_duration = self.last_output_at.lock().unwrap().elapsed();
+        let idle_duration = self.pty.silent_for();
         if let Some(state) = self.provider.detect_state_from_output(&[], idle_duration) {
             return state;
         }
@@ -411,9 +218,9 @@ impl Agent {
             provider: self.provider.name().to_string(),
             dir: self.dir.clone(),
             state,
-            pid: Some(self.child.id()),
-            uptime_secs: self.started_at.elapsed().as_secs(),
-            viewers: self.viewers.load(Ordering::Relaxed),
+            pid: Some(self.pty.pid()),
+            uptime_secs: self.pty.uptime().as_secs(),
+            viewers: self.pty.viewers().load(Ordering::Relaxed),
             context_percent: self.context_percent,
             task: None,
             detail: Box::new(self.hook_data.detail.clone()),
@@ -431,7 +238,7 @@ impl Agent {
     pub fn context_refresh_job(&self, id: &str) -> ContextRefreshJob {
         ContextRefreshJob {
             id: id.to_string(),
-            pid: self.child.id(),
+            pid: self.pty.pid(),
             dir: self.dir.clone(),
             provider: self.provider.name().to_string(),
             transcript: self.hook_data.transcript_path.clone(),
@@ -451,64 +258,38 @@ impl Agent {
 
     /// Get the viewer count handle for increment/decrement by attach sessions.
     pub fn viewers(&self) -> Arc<AtomicUsize> {
-        self.viewers.clone()
+        self.pty.viewers()
     }
 
-    /// For a viewer attaching (its terminal at the PTY's size): what to
-    /// show it first, the terminal's state (see `Terminal::replay`), and
-    /// the live PTY output after it. Taken under the terminal's lock: each
-    /// byte of output is in exactly one of them.
+    /// See [`Pty::attach_output`].
     pub fn attach_output(&self) -> (Vec<u8>, broadcast::Receiver<Vec<u8>>) {
-        let terminal = lock(&self.terminal);
-        (terminal.replay().into_bytes(), self.output_tx.subscribe())
+        self.pty.attach_output()
     }
 
     /// The text of the agent's terminal: history, then screen.
     pub fn text(&self) -> String {
-        lock(&self.terminal).text()
+        self.pty.text()
     }
 
     /// Get a clone of the PTY master fd (kept alive by Arc).
     pub fn pty_master(&self) -> Arc<OwnedFd> {
-        self.pty_master.clone()
+        self.pty.master()
     }
 
     /// Resize the agent's PTY (at least 1×1) and notify the agent process.
     pub fn resize(&self, cols: u16, rows: u16) {
-        let (cols, rows) = (cols.max(1), rows.max(1));
-        let ws = libc::winsize {
-            ws_col: cols,
-            ws_row: rows,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        {
-            // The terminal first, and no output in between: the agent's
-            // redraw must find it at the new size.
-            let mut terminal = lock(&self.terminal);
-            terminal.resize(cols, rows);
-            unsafe {
-                libc::ioctl(
-                    self.pty_master.as_raw_fd(),
-                    libc::TIOCSWINSZ as libc::c_ulong,
-                    &ws,
-                );
-            }
-        }
-        self.screen_changed.send_replace(());
-        // Notify the agent process of the resize
-        let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGWINCH);
+        self.pty.resize(cols, rows);
     }
 
     /// The agent's screen: live, or scrolled back to line `from`.
     pub fn screen(&self, from: Option<u64>) -> ScreenInfo {
-        lock(&self.terminal).screen(from)
+        self.pty.screen(from)
     }
 
     /// Notified on each change of the agent's screen. Closed once the agent
     /// and its PTY are gone.
     pub fn screen_changes(&self) -> watch::Receiver<()> {
-        self.screen_changed.subscribe()
+        self.pty.screen_changes()
     }
 
     /// Whether messages reach the agent through its inbox hook.
@@ -543,23 +324,7 @@ impl Agent {
         self.hook_data.detail.pending = None;
         self.hook_data.detail.ask = None;
         self.set_state(AgentState::Working);
-        *lock(&self.last_output_at) = Instant::now();
-    }
-}
-
-impl Drop for Agent {
-    /// Never leave the agent's processes behind: every daemon path kills an
-    /// agent before dropping it, but a daemon torn down without that (a
-    /// panic, an in-process test daemon going away) would orphan them. The
-    /// agent leads its own session (`setsid`), so its process group is the
-    /// whole tree it started.
-    fn drop(&mut self) {
-        // `try_wait` keeps the status once reaped: no signal to a reused pid.
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ =
-                nix::sys::signal::killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
-            let _ = self.child.wait();
-        }
+        self.pty.mark_output();
     }
 }
 
@@ -581,54 +346,6 @@ fn silence_fallback(
     match timeout {
         Some(t) if stored == AgentState::Working && silent_for >= t => AgentState::Ready,
         _ => stored,
-    }
-}
-
-/// Lock a mutex, even one a panicking thread left poisoned: the PTY reader
-/// must go on relaying output.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Where the PTY reader takes the agent's output.
-struct PtyReader {
-    terminal: Arc<Mutex<Terminal>>,
-    screen_changed: watch::Sender<()>,
-    output_tx: broadcast::Sender<Vec<u8>>,
-    last_output_at: Arc<Mutex<Instant>>,
-}
-
-impl PtyReader {
-    /// Blocking loop that reads PTY master output, tracks when output last
-    /// arrived, feeds the terminal, and broadcasts it to any attached
-    /// clients. Exits when the PTY slave side is closed
-    /// (agent exits).
-    fn run(self, master_fd: i32) {
-        let mut buf = [0u8; 4096];
-        loop {
-            match nix::unistd::read(master_fd, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    if let Ok(mut ts) = self.last_output_at.lock() {
-                        *ts = Instant::now();
-                    }
-                    {
-                        let mut terminal = lock(&self.terminal);
-                        terminal.feed(&data);
-                        // Ignore send errors (no receivers is fine)
-                        let _ = self.output_tx.send(data);
-                    }
-                    self.screen_changed.send_replace(());
-                }
-                Err(nix::errno::Errno::EIO) => break, // PTY closed
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => {
-                    error!("PTY read error: {}", e);
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -660,32 +377,5 @@ mod tests {
             silence_fallback(AgentState::Working, Duration::from_secs(600), None),
             AgentState::Working
         );
-    }
-
-    #[test]
-    fn the_wrapper_runs_the_agents_command_where_it_would_run() {
-        let mut cmd = Command::new("claude");
-        cmd.current_dir("/w/app--feat")
-            .args(["--resume", "s-1", "fix the bug"])
-            .env("FROM_PROVIDER", "1");
-        let launch = Launch {
-            env: AgentEnv::default(),
-            wrapper: vec!["direnv".into(), "exec".into(), ".".into()],
-        };
-        let wrapped = launch.wrap(cmd);
-        assert_eq!(wrapped.get_program(), "direnv");
-        let args: Vec<_> = wrapped.get_args().collect();
-        assert_eq!(
-            args,
-            ["exec", ".", "claude", "--resume", "s-1", "fix the bug"]
-        );
-        assert_eq!(wrapped.get_current_dir(), Some(Path::new("/w/app--feat")));
-        let envs: Vec<_> = wrapped.get_envs().collect();
-        assert_eq!(envs, [(OsStr::new("FROM_PROVIDER"), Some(OsStr::new("1")))]);
-
-        // Without one, the command as it is.
-        let cmd = Launch::default().wrap(Command::new("claude"));
-        assert_eq!(cmd.get_program(), "claude");
-        assert_eq!(cmd.get_args().count(), 0);
     }
 }

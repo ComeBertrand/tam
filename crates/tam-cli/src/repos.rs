@@ -53,6 +53,16 @@ pub fn resolve(
     Ok(roots.into_iter().map(|(_, root)| root).collect())
 }
 
+/// The main checkout of the one repository `repo` names (as `tam new -r`
+/// takes it: a path from the current directory, else a project name), for
+/// `tam chat REPO` and `tam shell -r REPO`.
+pub fn named(repo: &str) -> Result<PathBuf> {
+    let cwd = std::fs::canonicalize(".")?;
+    let wt_config = tam_worktree::config::load_config()?;
+    let roots = resolve(&[repo.to_string()], &cwd, || discover(&wt_config))?;
+    roots.into_iter().next().context("no repository found")
+}
+
 /// The projects `tam ls` and `tam pick` show: git checkouts under the home
 /// directory, as the worktree config's discovery settings find them.
 pub fn discover(config: &tam_worktree::config::Config) -> Result<Vec<PathBuf>> {

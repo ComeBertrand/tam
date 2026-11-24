@@ -456,7 +456,9 @@ adopt). `tam-cli` depends on all three.
   what-it-waits-on column shows only stacked, from 100 columns). The footer keeps the hints that
   fit (`ui::fit_hints`, by priority). `tam ps` (`ps.rs`) prints the same
   rows as text: a row per task, most urgent first, and below a task with
-  several members a row per member (status, worktree, context).
+  several members a row per member (status, worktree, context), below a
+  member (or a task of one) its shells with their ids; the shells on main
+  checkouts in a table after the chats' (see Shells).
 - **Chats in the dashboard (#67, #68)** — `App::chats` (`chat::Chat`: the info
   and its running agent), from `ListChats` at start, then `ChatCreated`/
   `ChatUpdated` (`App::upsert_chat`, keeping the agent) and `ChatClosed`;
@@ -848,8 +850,33 @@ adopt). `tam-cli` depends on all three.
   `DropRefused` reason, and `Dropped` does not count them (a client counts
   its `ShellInfo`s). Lifetime: an open shell keeps the daemon up;
   `Shutdown` closes them. Clients: the dashboard (#82, see Shells in the
-  dashboard); until #83 (`tam shell`, ps, attach, stop), `resolve_target`
-  says an id is a shell's.
+  dashboard) and the CLI (#83, `tam-cli/src/shell.rs`). `tam shell
+  [TARGET] [-r REPO] [-d] [--json]` (`shell::open`) opens one through
+  `Client::open_shell` (as the dashboard: `repos::agent_env`, `[spawn]
+  wrapper` read at each open), on: TARGET resolved by the client
+  (`resolve_target`, as `tam run`: a member, then opened by its id; a
+  chat's main checkout; a shell's id refused); `-r` a main checkout
+  (`repos::named`, shared with `tam chat REPO`); else the member at the
+  cwd, else the main checkout holding it, never a linked worktree no task
+  has (refused, exit 3, naming `tam adopt` and `tam shell -r .`: it would
+  open elsewhere than asked). It attaches when `script::attaching`; else
+  its id alone on stdout, how to attach on stderr; `--json`
+  `schema::ShellDoc` (`shell`: its id). `Target::Shell` (`ResolveTarget`'s
+  `Shell`): `tam attach` and `tam stop` (`CloseShell`, no confirmation: an
+  id is typed on purpose, as `tam stop` of an agent) take it; `run`,
+  `msg` (after `SendMessage` fails), `wait`, `result`, `history`, `drop`,
+  `merge`, `close`, `shell` say it is one (`shell::misnamed`, exit 3, as
+  "is a chat"); a shell-shaped id no longer open is "no open shell". A
+  shell is named by its id in every hint; `shell::named`/`place` (`Shell
+  #3 of fix-api`, the member's label else the repository) and the drop
+  wording (`count`, `closes_with_it`) are the dashboard's too. `tam ps`:
+  main-checkout shells in a table after the chats (`ps::shell_lines`:
+  SHELL, ID, DIR), a worktree's below its member by number (`ps::lines`,
+  `└─ Shell #2 (sh-…)`, nothing else on the row); `ps --json` a `shells`
+  key (`schema::PsShell`, in opening order, `task`/`member` null on a
+  checkout). `tam drop` counts the shells of the members it drops
+  (`ListShells` first) and says so: before `Drop anyway?`, and `Dropped
+  task 'x' and closed its 2 shells`.
 
 ## Build & check
 
@@ -956,7 +983,16 @@ cargo test
   the wrapper only on its `PATH`) in no reply, event, error or file, and no
   shell id in the ledger; a merge keeping a shell and its numbering; the
   daemon kept up by a shell, then shutting down; refusals (gone, broken,
-  being dropped, not a main checkout, no member, a chat).
+  being dropped, not a main checkout, no member, a chat). The CLI's
+  `shells.rs` (one test, the real `tam` with `SHELL=/bin/sh`, a worktree
+  `tam new` made): `tam shell -d --json` from a worktree, on a task, with
+  `-r` (a project name), from a directory in a main checkout (the id on
+  stdout); refused in a worktree no task has, outside any repository, for
+  an unknown task or repository; `ps` (the table, the rows below the
+  task) and `ps --json`; `run`, `msg`, `wait`, `result`, `history`,
+  `drop`, `merge`, `close`, `shell` refusing a shell's id (exit 3, JSON
+  `not_found`); `attach` taking it; `stop` by id, then not found; the
+  wrapper run in the worktree; `tam drop` saying it closed two.
 - The daemon's `xdg.rs`: the worktree config, the notify and autoclean
   settings and the ledger's path follow `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`, else `~/.config` and
   `~/.local/share`, an empty or relative value ignored, a config in

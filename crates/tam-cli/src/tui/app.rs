@@ -353,12 +353,12 @@ impl<'a> Focused<'a> {
 }
 
 /// Where a shell runs, as the user knows it: its member's label (the task's
-/// name, or `<task>/<member>`), else its repository.
+/// name, or `<task>/<member>`), else its repository (`shell::place`).
 pub fn shell_place(shell: &ShellInfo, member: Option<(&Task, &Member)>) -> String {
-    match member {
-        Some((task, member)) => task.member_label(member),
-        None => shell.repo.clone(),
-    }
+    crate::shell::place(
+        shell,
+        member.map(|(task, member)| task.member_label(member)),
+    )
 }
 
 /// A member a drop dialog offers to drop alone.

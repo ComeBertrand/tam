@@ -1,20 +1,24 @@
-//! `tam ps`'s text: the chats first, a row each, with their ids; then a row
-//! per task, and below a task with several members a row per member (its
-//! status, worktree and context), as in the dashboard's list; then what is
-//! wrong with worktrees. `tam ps --json` is `script::ps`.
+//! `tam ps`'s text: the chats first, a row each, with their ids; then the
+//! shells on main checkouts, with their ids; then a row per task, and below
+//! a task with several members a row per member (its status, worktree and
+//! context), and below a member (or a task of one) a row per shell in its
+//! worktree, as in the dashboard's list; then what is wrong with worktrees.
+//! `tam ps --json` is `script::ps`.
 
 use crate::chat::{time_left, Chat, Closes};
 use crate::health;
 use crate::task::{Member, Task};
 use crate::{format_age, shorten_home};
+use tam_proto::ShellInfo;
 
 const HEADER: [&str; 6] = ["STATUS", "TASK", "RUNS", "LAST", "DIR", "CTX"];
 /// The columns aligned to the right: RUNS, LAST, CTX.
 const RIGHT: [bool; 6] = [false, false, true, true, false, true];
 const SPACING: &str = "  ";
 
-/// What `tam ps` prints, line by line, the tasks in the order given.
-pub fn lines(tasks: &[Task]) -> Vec<String> {
+/// What `tam ps` prints, line by line, the tasks in the order given, each
+/// member's shells (of `shells`) below it.
+pub fn lines(tasks: &[Task], shells: &[ShellInfo]) -> Vec<String> {
     if tasks.is_empty() {
         return vec!["No tasks.".into()];
     }
@@ -25,6 +29,7 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
         if let [member] = &task.members[..] {
             let [status, dir, ctx] = member_cells(task, member);
             rows.push([status, task.name.clone(), runs, last, dir, ctx]);
+            rows.extend(shell_rows(shells, member, ""));
             continue;
         }
         // The task's status is its most urgent member's; the rest is each
@@ -47,6 +52,12 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
             let name = format!("{tree} {}", member.info.name);
             let [status, dir, ctx] = member_cells(task, member);
             rows.push([status, name, String::new(), String::new(), dir, ctx]);
+            let indent = if i + 1 == task.members.len() {
+                "   "
+            } else {
+                "│  "
+            };
+            rows.extend(shell_rows(shells, member, indent));
         }
     }
 
@@ -66,6 +77,48 @@ pub fn lines(tasks: &[Task]) -> Vec<String> {
         out.extend(notes);
     }
     out
+}
+
+/// The rows of a member's shells, by number, below its row (`indent`: the
+/// tree drawn so far): `└─ Shell #2 (sh-…)`, its id being how to name it.
+/// No status, time or context: a shell has none.
+fn shell_rows(shells: &[ShellInfo], member: &Member, indent: &str) -> Vec<[String; 6]> {
+    let mut mine: Vec<&ShellInfo> = shells
+        .iter()
+        .filter(|s| s.member.as_deref() == Some(member.id()))
+        .collect();
+    mine.sort_by_key(|s| s.number);
+    let last = mine.len().saturating_sub(1);
+    mine.iter()
+        .enumerate()
+        .map(|(i, shell)| {
+            let tree = if i == last { "└─" } else { "├─" };
+            let mut row: [String; 6] = Default::default();
+            row[1] = format!("{indent}{tree} {} ({})", shell.name(), shell.id);
+            row
+        })
+        .collect()
+}
+
+/// The columns of the table of the shells on main checkouts: named by
+/// their ids, where they run as chats show it.
+const SHELL_HEADER: [&str; 3] = ["SHELL", "ID", "DIR"];
+
+/// The table of the shells on main checkouts (those in a task's worktree
+/// are below its member), in the order given; nothing without them.
+pub fn shell_lines(shells: &[ShellInfo]) -> Vec<String> {
+    let mut rows = vec![SHELL_HEADER.map(String::from)];
+    for shell in shells.iter().filter(|s| s.member.is_none()) {
+        rows.push([
+            shell.name(),
+            shell.id.clone(),
+            shorten_home(&shell.dir.display().to_string()),
+        ]);
+    }
+    if rows.len() == 1 {
+        return Vec::new();
+    }
+    table(&rows, [false; 3])
 }
 
 /// The columns of the chats' table: a chat is shown by its label (its
@@ -228,7 +281,7 @@ mod tests {
                 &agents,
             ),
         ];
-        let lines = lines(&tasks);
+        let lines = lines(&tasks, &[]);
         let shown = lines.join("\n");
         assert_eq!(lines.len(), 5, "{shown}");
         let [header, multi, api, web, single] = &lines[..] else {
@@ -270,7 +323,7 @@ mod tests {
             1,
             &[],
         )];
-        let lines = lines(&tasks);
+        let lines = lines(&tasks, &[]);
         let shown = lines.join("\n");
         assert!(lines[3].starts_with("∅ gone"), "{shown}");
         assert_eq!(lines[4], "", "{shown}");
@@ -282,8 +335,81 @@ mod tests {
 
     #[test]
     fn no_tasks() {
-        assert_eq!(lines(&[]), ["No tasks."]);
+        assert_eq!(lines(&[], &[]), ["No tasks."]);
         assert!(chat_lines(&[]).is_empty());
+        assert!(shell_lines(&[]).is_empty());
+    }
+
+    fn shell(id: &str, member: Option<&str>, number: u32, dir: &str) -> ShellInfo {
+        ShellInfo {
+            id: id.into(),
+            member: member.map(str::to_string),
+            dir: dir.into(),
+            repo: "api".into(),
+            number,
+            pid: 1,
+            opened_at: 0,
+            viewers: 0,
+        }
+    }
+
+    #[test]
+    fn a_members_shells_are_below_it_named_by_their_ids() {
+        let tasks = [
+            task(
+                "both",
+                vec![
+                    member("m-api", "api", "both"),
+                    member("m-web", "web", "both"),
+                ],
+                1,
+                &[],
+            ),
+            task("fix", vec![member("m-fix", "app", "fix")], 1, &[]),
+        ];
+        // Opened in any order; below their member by number.
+        let shells = [
+            shell("sh-0000fix3", Some("m-fix"), 3, "/w/app--fix"),
+            shell("sh-0000api1", Some("m-api"), 1, "/w/api--both"),
+            shell("sh-0000fix1", Some("m-fix"), 1, "/w/app--fix"),
+            shell("sh-0000web1", Some("m-web"), 1, "/w/web--both"),
+            // On a main checkout: in a table of its own.
+            shell("sh-0000main", None, 1, "/src/api"),
+        ];
+        let lines = lines(&tasks, &shells);
+        let shown = lines.join("\n");
+        let [header, both, api, api_shell, web, web_shell, fix, fix1, fix3] = &lines[..] else {
+            panic!("{shown}")
+        };
+        assert!(both.contains("both"), "{shown}");
+        assert!(api.contains("├─ api"), "{shown}");
+        assert!(web.contains("└─ web"), "{shown}");
+        assert!(fix.contains("fix"), "{shown}");
+        // No status, runs, time, directory or context: its name and id.
+        assert_eq!(
+            api_shell.trim_start(),
+            "│  └─ Shell #1 (sh-0000api1)",
+            "{shown}"
+        );
+        assert_eq!(
+            web_shell.trim_start(),
+            "└─ Shell #1 (sh-0000web1)",
+            "{shown}"
+        );
+        assert_eq!(column(web_shell, "└─"), column(web, "└─") + 3, "{shown}");
+        assert_eq!(fix1.trim_start(), "├─ Shell #1 (sh-0000fix1)", "{shown}");
+        assert_eq!(fix3.trim_start(), "└─ Shell #3 (sh-0000fix3)", "{shown}");
+        assert_eq!(column(header, "TASK"), column(fix1, "├─"), "{shown}");
+        assert_eq!(column(header, "TASK"), column(api_shell, "│"), "{shown}");
+        assert!(!shown.contains("sh-0000main"), "{shown}");
+
+        let table = shell_lines(&shells);
+        let shown = table.join("\n");
+        let [header, main] = &table[..] else {
+            panic!("{shown}")
+        };
+        assert_eq!(header, "SHELL     ID           DIR", "{shown}");
+        assert_eq!(main, "Shell #1  sh-0000main  /src/api", "{shown}");
     }
 
     fn chat(id: &str, name: Option<&str>, agents: &[AgentInfo]) -> Chat {

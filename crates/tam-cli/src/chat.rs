@@ -9,10 +9,10 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tam_proto::{AgentInfo, ChatInfo, SessionChoice};
 
-use crate::client::Client;
+use crate::client::{Client, Target};
 use crate::schema::{self, ErrorInfo, Subject, SCHEMA_VERSION};
 use crate::script::{self, ErrorKind};
 use crate::task::{agent_status, TaskStatus};
@@ -166,21 +166,14 @@ pub async fn start(new: NewChat) -> Result<()> {
 /// The main checkout of the repository `repo` names (as `tam new -r` takes
 /// it), or of the current one.
 fn repository(repo: Option<&str>) -> Result<PathBuf> {
-    let cwd = std::fs::canonicalize(".")?;
     match repo {
-        None => crate::repos::main_checkout(&cwd).map_err(|_| {
+        None => crate::repos::main_checkout(&std::fs::canonicalize(".")?).map_err(|_| {
             anyhow::anyhow!(
                 "not inside a git repository: run this from within a project, or name one \
                  (tam chat REPO)"
             )
         }),
-        Some(repo) => {
-            let wt_config = tam_worktree::config::load_config()?;
-            let roots = crate::repos::resolve(&[repo.to_string()], &cwd, || {
-                crate::repos::discover(&wt_config)
-            })?;
-            roots.into_iter().next().context("no repository found")
-        }
+        Some(repo) => crate::repos::named(repo),
     }
 }
 
@@ -246,17 +239,18 @@ pub fn session_gone(e: &anyhow::Error) -> Option<String> {
         .then(|| message.trim_end_matches(": start a new one").to_string())
 }
 
-/// When `name`, which named no task, names a chat: an error saying so,
-/// for the task commands (`drop`, `merge`).
+/// When `name`, which named no task, names a chat or a shell: an error
+/// saying so, for the task commands (`drop`, `merge`).
 pub async fn not_a_task(client: &mut Client, name: &str) -> Option<anyhow::Error> {
     match client.resolve_target(name).await {
-        Ok(crate::client::Target::Chat(chat, _)) => Some(script::error(
+        Ok(Target::Chat(chat, _)) => Some(script::error(
             ErrorKind::NotFound,
             format!(
                 "'{name}' is chat {}, not a task (tam close closes a chat)",
                 chat.id
             ),
         )),
+        Ok(Target::Shell(shell)) => Some(crate::shell::misnamed(&shell, "a task")),
         _ => None,
     }
 }
@@ -301,12 +295,15 @@ async fn find(client: &mut Client, target: &str) -> Result<ChatInfo> {
     match client.get_chat(target).await {
         Ok((chat, _)) => Ok(chat),
         Err(e) if script::kind_of(&e) == ErrorKind::NotFound => {
-            match client.get_task(target).await {
-                Ok(_) => Err(script::error(
+            if client.get_task(target).await.is_ok() {
+                return Err(script::error(
                     ErrorKind::NotFound,
                     format!("'{target}' is a task, not a chat (tam drop drops a task)"),
-                )),
-                Err(_) => Err(e),
+                ));
+            }
+            match client.resolve_target(target).await {
+                Ok(Target::Shell(shell)) => Err(crate::shell::misnamed(&shell, "a chat")),
+                _ => Err(e),
             }
         }
         Err(e) => Err(e),
@@ -534,10 +531,11 @@ mod tests {
         let doc = serde_json::to_value(schema::Ps::new(
             vec![],
             vec![(idle, vec![]), (info(Some("debug")), vec![run])],
+            vec![],
             &[agent],
         ))
         .unwrap();
-        assert_eq!(keys(&doc), ["chats", "schema_version", "tasks"]);
+        assert_eq!(keys(&doc), ["chats", "schema_version", "shells", "tasks"]);
         // The one waiting on the user first.
         let chats = doc["chats"].as_array().unwrap();
         assert_eq!(chats[0]["id"], "c-0000abcd");

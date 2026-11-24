@@ -334,13 +334,16 @@ adopt). `tam-cli` depends on all three.
   the task list, any after its state changes). `h`/`l` like `←`/`→`.
   `v` scrolls the pane (`Mode::Scroll { agent }`, `handle_scroll_key`):
   `j`/`k` (`↓`/`↑`) a line (`Scroll::Down(1)`/`Up(1)`: `Screen { from }`
-  again), `g`/`G` (`home`/`end`) the oldest line kept or live; every
-  other key does nothing (neither the agent's nor the list's). It ends
+  again), `g`/`G` (`home`/`end`) the oldest line kept or live; `enter`
+  types (`Mode::Terminal`), at the live screen at once (`peek.from`
+  cleared), not at the first key; every other key does nothing (neither
+  the agent's nor the list's: `shift-enter` is no attach). It ends
   as typing does (`Mode::pane_agent` names the agent of either): ctrl-]
   or a click in the list (`App::leave_pane`: back to the live screen), or
   unasked through `check_typing`/`stop_typing`, the keys still coming
   dropped (a held `j` would move the selection). Thick border, a chip
-  saying how to leave, the wheel over the list does nothing, and it
+  saying how to leave, both in the theme's `scrolled` colour (typing's
+  are `accent`), the wheel over the list does nothing, and it
   counts as viewing too. No page keys: `pgup`/`pgdn` do nothing, and
   ctrl-u/d/f/b neither (never `d`'s drop or `f`'s attach); the wheel over
   the pane and `home`/`end` scroll in the list's mode too. Member actions
@@ -514,9 +517,13 @@ adopt). `tam-cli` depends on all three.
   clockwise round `ui::border_path` with `theme::rainbow_around`: a
   whole number of turns of the hues round it, so no seam. `T`
   (`Action::NextTheme`, `theme::next`) switches theme while the dashboard
-  runs, never written to the config. Backgrounds only on the header and footer
-  bars, the selected row, chips and dialogs: never behind the agent's screen
-  (`peek.rs` keeps the agent's colours). Dialogs draw over a dimmed dashboard
+  runs, never written to the config. Scrolling the pane (`v`: its thick
+  border, its chip, its title) is `scrolled` (orange, `ANSI`'s yellow:
+  `warn`'s), never typing's `accent`, nor `warn` where the palette has
+  another. Tests draw in another theme on their own thread only
+  (`theme::in_theme`: tests run side by side). Backgrounds only on the
+  header and footer bars, the selected row, chips and dialogs: never
+  behind the agent's screen (`peek.rs` keeps the agent's colours). Dialogs draw over a dimmed dashboard
   (`ui::render`, not the footer: it has their keys). A working agent's mark
   is a spinner (`App::spin`, `None` in tests; the loop ticks every 120 ms
   only while one works). What needs the user (block, question, error, ready) is in

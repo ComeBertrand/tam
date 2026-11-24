@@ -33,6 +33,10 @@ pub struct Theme {
     pub run: Color,
     pub block: Color,
     pub question: Color,
+    /// The pane scrolling (`v`): its thick border, its chip, its title.
+    /// Neither `accent`, typing's, nor `warn` where the palette has another
+    /// yellow or orange.
+    pub scrolled: Color,
     /// Rainbows: the logo, the selection's bar and the spinners cycle
     /// through the hues, rules and the pane's border fade through them
     /// (moving along the rules, clockwise round the border).
@@ -58,6 +62,7 @@ pub static DARK: Theme = Theme {
     run: rgb(0x73daca),
     block: rgb(0xff9e64),
     question: rgb(0xbb9af7),
+    scrolled: rgb(0xff9e64),
     rainbow: false,
 };
 
@@ -77,6 +82,7 @@ pub static UNICORN: Theme = Theme {
     run: rgb(0x8be9fd),
     block: rgb(0xffb86c),
     question: rgb(0xbd93f9),
+    scrolled: rgb(0xffb86c),
     rainbow: true,
 };
 
@@ -95,6 +101,7 @@ pub static ANSI: Theme = Theme {
     run: Color::Blue,
     block: Color::Red,
     question: Color::Magenta,
+    scrolled: Color::Yellow,
     rainbow: false,
 };
 
@@ -106,7 +113,38 @@ static THEME: AtomicUsize = AtomicUsize::new(0);
 
 /// The theme in use.
 pub fn get() -> &'static Theme {
+    #[cfg(test)]
+    if let Some(theme) = TEST_THEME.get() {
+        return theme;
+    }
     THEMES[THEME.load(Ordering::Relaxed)].1
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own theme (see `in_theme`): tests run side by side, one
+    /// thread each, and the others draw in `ANSI`.
+    static TEST_THEME: std::cell::Cell<Option<&'static Theme>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Draw in `theme` on this thread (a test's) until the guard is dropped,
+/// leaving every other test's theme alone.
+#[cfg(test)]
+pub fn in_theme(theme: &'static Theme) -> InTheme {
+    InTheme(TEST_THEME.replace(Some(theme)))
+}
+
+/// See `in_theme`: the theme before, back when dropped.
+#[cfg(test)]
+#[must_use]
+pub struct InTheme(Option<&'static Theme>);
+
+#[cfg(test)]
+impl Drop for InTheme {
+    fn drop(&mut self) {
+        TEST_THEME.set(self.0);
+    }
 }
 
 /// Switch to the next theme (until the dashboard quits: the configured

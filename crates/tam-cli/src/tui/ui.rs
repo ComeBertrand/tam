@@ -325,6 +325,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::raw(":line down/up  "),
                 Span::styled("g/G", Style::new().bold()),
                 Span::raw(":oldest/live  "),
+                Span::styled("enter", Style::new().bold()),
+                Span::raw(":type  "),
                 Span::styled("ctrl-]", Style::new().bold()),
                 Span::raw(":back to the list"),
             ],
@@ -562,9 +564,14 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
         None => format!(" {label} "),
     };
     let t = theme::get();
-    // The pane has the keyboard (typed into, or scrolled): its border says so.
+    // The pane has the keyboard (typed into, or scrolled): its border says
+    // so. Scrolling (`v`) in a colour of its own: never taken for typing.
     let typing = matches!(app.mode, Mode::Terminal { .. });
     let keyboard = app.mode.pane_agent().is_some();
+    let color = match app.mode {
+        Mode::Scroll { .. } => t.scrolled,
+        _ => t.accent,
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(if keyboard {
@@ -572,15 +579,15 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
         } else {
             BorderType::Rounded
         })
-        .border_style(Style::new().fg(if keyboard { t.accent } else { t.subtle }))
-        .title(Line::styled(title, Style::new().fg(t.accent).bold()));
+        .border_style(Style::new().fg(if keyboard { color } else { t.subtle }))
+        .title(Line::styled(title, Style::new().fg(color).bold()));
     let chip = match app.mode {
         Mode::Terminal { .. } => Some(" typing · ctrl-] back to the list "),
         Mode::Scroll { .. } => Some(" scrolling · j/k · ctrl-] back to the list "),
         _ => None,
     };
     if let Some(chip) = chip {
-        block = block.title_top(Line::styled(chip, t.chip(t.accent)).right_aligned());
+        block = block.title_top(Line::styled(chip, t.chip(color)).right_aligned());
     }
     // Not a request it waits on: its screen shows that one.
     let waiting = |state| matches!(state, AgentState::Blocked | AgentState::Question);
@@ -1747,6 +1754,111 @@ mod tests {
         assert!(s.contains("— · 1 line into history"), "{s}");
     }
 
+    #[test]
+    fn scrolling_has_a_colour_of_its_own_in_each_theme() {
+        // Lines 0-9 in history, the live screen (5 rows) shows 10-12.
+        let size = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut vt = vt100::Parser::new(size(5), size(80), 0);
+        vt.process(b"\x1b[?25lline 10\r\nline 11\r\nline 12");
+        let live_screen = tam_proto::ScreenInfo {
+            cols: 80,
+            rows: 5,
+            contents: vt.screen().contents_formatted(),
+            top: 10,
+            oldest: 0,
+            live: 10,
+        };
+        // From line 4.
+        let history = tam_proto::ScreenInfo {
+            top: 4,
+            ..live_screen.clone()
+        };
+        let live = |app: &mut App| {
+            app.peek.from = None;
+            app.peek.set_screen(&live_screen);
+        };
+        let back = |app: &mut App| {
+            app.peek.from = Some(4);
+            app.peek.set_screen(&history);
+        };
+        let mut app = App::new();
+        app.peek = Peek {
+            agent: Some("m-1".into()),
+            ..Default::default()
+        };
+        // The pane's top left corner, and the colours there: the corner's,
+        // the title's first letter (after the corner and a space), and the
+        // typing or scrolling chip's background when there is one.
+        let colours = |app: &mut App| {
+            let backend = ratatui::backend::TestBackend::new(80, 20);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(f, app)).unwrap();
+            let buf = terminal.backend().buffer();
+            let (x, y) = (0..20)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .find(|&(x, y)| matches!(buf[(x, y)].symbol(), "╭" | "┏"))
+                .expect("the pane");
+            let row: String = (0..80).map(|x| buf[(x, y)].symbol()).collect();
+            let chip = row
+                .find(" typing ·")
+                .or_else(|| row.find(" scrolling ·"))
+                .map(|i| buf[(row[..i].chars().count() as u16, y)].bg);
+            (row, buf[(x, y)].fg, buf[(x + 2, y)].fg, chip)
+        };
+
+        for theme in [&theme::ANSI, &theme::DARK, &theme::UNICORN] {
+            let _theme = theme::in_theme(theme);
+            let t = theme::get();
+            assert_ne!(t.scrolled, t.accent);
+            // ANSI has one yellow: `warn`'s.
+            if !std::ptr::eq(theme, &theme::ANSI) {
+                assert_ne!(t.scrolled, t.warn);
+            }
+
+            // Live: the title in the accent colour.
+            app.mode = Mode::Normal;
+            live(&mut app);
+            let (row, _, title, chip) = colours(&mut app);
+            assert!(row.contains("╭ — ─"), "{row}");
+            assert_eq!(title, t.accent, "{row}");
+            assert_eq!(chip, None);
+
+            // Scrolling (`v`): its border, its chip and its title in a
+            // colour of its own, at the live screen and scrolled back.
+            app.mode = Mode::Scroll {
+                agent: "m-1".into(),
+            };
+            let (row, border, title, chip) = colours(&mut app);
+            assert!(row.contains("┏ — ━") && row.contains("scrolling"), "{row}");
+            let scrolling = (border, title, chip);
+            assert_eq!(scrolling, (t.scrolled, t.scrolled, Some(t.scrolled)));
+            back(&mut app);
+            let (row, border, title, chip) = colours(&mut app);
+            assert!(row.contains("┏ — · 6 lines into history"), "{row}");
+            let scrolling = (border, title, chip);
+            assert_eq!(scrolling, (t.scrolled, t.scrolled, Some(t.scrolled)));
+
+            // Scrolled back with the wheel outside `v`: the accent colour,
+            // in the list's mode and typing.
+            app.mode = Mode::Normal;
+            let (row, _, title, _) = colours(&mut app);
+            assert!(row.contains("╭ — · 6 lines into history"), "{row}");
+            assert_eq!(title, t.accent, "{row}");
+            app.mode = Mode::Terminal {
+                agent: "m-1".into(),
+            };
+            let (row, border, title, chip) = colours(&mut app);
+            assert!(row.contains("┏ — · 6 lines into history"), "{row}");
+            assert_eq!((border, title, chip), (t.accent, t.accent, Some(t.accent)));
+
+            // Typing at the live screen: unchanged.
+            live(&mut app);
+            let (row, border, title, chip) = colours(&mut app);
+            assert!(row.contains("┏ — ━"), "{row}");
+            assert_eq!((border, title, chip), (t.accent, t.accent, Some(t.accent)));
+        }
+    }
+
     // -- The triage pane ---------------------------------------------------
 
     use crate::chat::Chat;
@@ -2607,6 +2719,7 @@ mod tests {
         for hint in [
             "j/k:line down/up",
             "g/G:oldest/live",
+            "enter:type",
             "ctrl-]:back to the list",
         ] {
             assert!(footer.contains(hint), "{hint}: {footer}");

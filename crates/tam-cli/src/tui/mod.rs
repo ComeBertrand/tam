@@ -4284,9 +4284,11 @@ mod tests {
                 Action::Attach { id, label } if id == "sh-w1" && label == "Shell #1 · feat/web"
             ));
         }
-        // Scrolled.
+        // Scrolled; enter from there types into it, as into an agent.
         handle_key_event(press('v'), &mut app, &config);
         assert!(matches!(&app.mode, Mode::Scroll { agent } if agent == "sh-w1"));
+        handle_key_event(enter, &mut app, &config);
+        assert!(matches!(&app.mode, Mode::Terminal { agent } if agent == "sh-w1"));
     }
 
     #[test]

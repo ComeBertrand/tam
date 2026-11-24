@@ -8,7 +8,8 @@ use std::path::Path;
 
 use tam_proto::{
     AgentInfo, ChatInfo, MemberInfo, MemberOutcome, MemberState, NewMember, Request, Response,
-    RunInfo, ScreenInfo, ServerMessage, SessionChoice, SessionInfo, TaskInfo, WorktreeReport,
+    RunInfo, ScreenInfo, ServerMessage, SessionChoice, SessionInfo, ShellInfo, ShellPlace,
+    TaskInfo, WorktreeReport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Interest};
@@ -709,6 +710,43 @@ impl Client {
     pub async fn close_chat(&mut self, chat: &str) -> Result<(ChatInfo, Vec<RunInfo>)> {
         let request = Request::CloseChat { chat: chat.into() };
         Ok(chat_reply("CloseChat", self.send(request).await?)?)
+    }
+}
+
+/// Shells (#81): the user's `$SHELL` on a PTY the daemon owns.
+impl Client {
+    /// Open a shell on a task member's worktree or a main checkout: in our
+    /// environment and through `[spawn] wrapper`, as an agent we start
+    /// (`RunAgent`), so that it is the worktree's dev shell.
+    pub async fn open_shell(&mut self, on: ShellPlace) -> Result<ShellInfo> {
+        let request = Request::OpenShell {
+            on,
+            env: crate::repos::agent_env(),
+            wrapper: crate::config::load_config()
+                .context("cannot read tam's config")?
+                .wrapper,
+        };
+        match self.send(request).await? {
+            Response::Shell { shell } => Ok(*shell),
+            other => Err(unexpected("OpenShell", other)),
+        }
+    }
+
+    /// The open shells, in the order they were opened.
+    pub async fn list_shells(&mut self) -> Result<Vec<ShellInfo>> {
+        match self.send(Request::ListShells).await? {
+            Response::Shells { shells } => Ok(shells),
+            other => Err(unexpected("ListShells", other)),
+        }
+    }
+
+    /// Close a shell (hung up, and waited for). Returns it as it was.
+    pub async fn close_shell(&mut self, id: &str) -> Result<ShellInfo> {
+        let request = Request::CloseShell { id: id.into() };
+        match self.send(request).await? {
+            Response::Shell { shell } => Ok(*shell),
+            other => Err(unexpected("CloseShell", other)),
+        }
     }
 }
 

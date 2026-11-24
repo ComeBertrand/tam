@@ -194,7 +194,7 @@ const RESERVED_KEYS: &[char] = &[
 /// after custom commands could have taken them (a config that binds one
 /// keeps working, every command reads it, agents' hooks too). Bound, the
 /// key runs the custom command, and the dashboard's action has no key.
-pub const YIELDING_KEYS: &[char] = &['c', 'p', 'N', 'v'];
+pub const YIELDING_KEYS: &[char] = &['c', 'p', 'N', 'v', '!', 'x'];
 
 fn validate_custom_commands(commands: &[CustomCommand]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();

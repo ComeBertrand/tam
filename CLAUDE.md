@@ -3,7 +3,8 @@
 ## Project
 
 Rust workspace. Terminal agent multiplexer merging yawn (worktree management)
-and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.md`.
+and zinc (agent daemon) into a task-centric tool. The design is below (Key
+architecture patterns); decisions and what is left are in the GitHub issues.
 
 ## Crate structure
 
@@ -290,7 +291,8 @@ adopt). `tam-cli` depends on all three.
   `tam_worktree::xdg` ignores an empty or relative `XDG_*` value, as the
   specification says. Tests write the config once, under `$XDG_CONFIG_HOME`.
 - **The pane** — always shown (`App::peek`, `ui::render_pane`): the screen
-  of the focused member's agent (or the selected chat's), on the whole pane, and nothing said twice
+  of the focused member's agent (or the selected chat's, or the selected
+  shell: see Shells in the dashboard), on the whole pane, and nothing said twice
   (`a` answers a request without attaching). `enter` gives the pane the
   keyboard (`Mode::Terminal { agent }`, drawn as `Normal`): every key but
   ctrl-] (`keys::is_leave`; crossterm reads it as ctrl-5) is encoded as a
@@ -347,8 +349,8 @@ adopt). `tam-cli` depends on all three.
   counts as viewing too. No page keys: `pgup`/`pgdn` do nothing, and
   ctrl-u/d/f/b neither (never `d`'s drop or `f`'s attach); the wheel over
   the pane and `home`/`end` scroll in the list's mode too. Member actions
-  (enter, `s`, `r`, `R`, `a`, custom commands) apply to the focused member
-  or chat (`App::focused`, an `app::Focused`; `focused_member` for
+  (enter, `x`, `r`, `R`, `a`, `!`, custom commands) apply to the focused
+  member, chat or shell (`App::focused`, an `app::Focused`; `focused_member` for
   task-only code): the one the pane shows: the most urgent one when
   the selection landed on the task, pinned while the task stays selected (a
   key never acts on a member the pane did not show), and `←`/`→` move it.
@@ -426,18 +428,23 @@ adopt). `tam-cli` depends on all three.
   (`m`, `M` with its branch; `MemberChoice`), sent by member id: `<task>/<member>`
   could name another task.
 - **Task list** — `tui/table.rs` draws `App::rows`: the chats' section
-  (`Row::Chats`, then a `Row::Chat` each, in creation order), then a header row per
+  (`Row::Chats`, then a `Row::Chat` each, in creation order), the section
+  of the shells on main checkouts (`Row::Shells`, then a `Row::Shell`
+  each), then a header row per
   repository (`app::repo_group`: the set of a task's repositories, `api +
   web`), a row per task, and below a task with several members a row per
   member (`▸` marks `App::focused_member`); such a task's own row has
-  its name only, no status (an agent's, so a member's). Only task and chat
+  its name only, no status (an agent's, so a member's). Below a member (or
+  a task of one), a row per shell in its worktree (see Shells in the
+  dashboard). Task, chat and shell
   rows are selected: `App::selected` indexes `App::visible_entries` (an
   `app::Entry` each), found again after a change by `app::Pick` (a chat's
-  id, a task's name: never a label); `App::table_offset` keeps the
-  scroll between draws so the selected task's member rows (and its group's
+  or shell's id, a task's name: never a label); `App::table_offset` keeps the
+  scroll between draws so the selected task's member and shell rows (and its group's
   header) stay in view. `gg`/`G` select the first/last entry
-  (`App::pending_g`); `j`/`k` go from the chats to the tasks; the
-  dashboard starts on the top entry (`set_chats` before `set_tasks`). `t`
+  (`App::pending_g`); `j`/`k` go from the chats to the tasks, through the
+  shells; the dashboard starts on the top entry (`set_chats`, `set_shells`,
+  then `set_tasks`). `t`
   (`App::toggle_order`, `Order`) switches to attention first: no groups,
   chats and tasks in one list (`Entry::urgency`), a REPO column. Columns: status and time in it
   (`state_since`, else the task's `last_activity`), task, branch
@@ -477,7 +484,7 @@ adopt). `tam-cli` depends on all three.
   `d` asks (`Mode::ConfirmCloseChat`, `y`/`enter`) then `CloseChat`; `p`
   keeps or unkeeps (`KeepChat`; the status line says when it closes then);
   `N` names it (`Mode::RenameChat`, empty: Claude's title again; a refusal
-  opens a notice); `s`, `a` and custom commands as on a task. `c` (#68)
+  opens a notice); `x`, `a` and custom commands as on a task. `c` (#68)
   makes one: the repository picker (`Purpose::Chat`: the highlighted
   repository, a worktree standing for its main checkout; `tab` does
   nothing), then `ChatHistory` (`Action::ChatHistory`, `open_chat_history`)
@@ -498,13 +505,60 @@ adopt). `tam-cli` depends on all three.
   sessions are to be opened from tam. Custom
   commands (`config::CommandValues`): `{task}` the task's name or the
   chat's label, `{id}` the member's or chat's id, `{dir}` the worktree or
-  the main checkout, `{provider}`. `c`, `p`, `N` and `v` came after custom
-  commands could bind them (`config::YIELDING_KEYS`): a config that binds
+  the main checkout, `{provider}`. `c`, `p`, `N`, `v`, `!` and `x` came
+  after custom commands could bind them (`config::YIELDING_KEYS`): a config that binds
   one still loads (every command reads it, hooks too), the key runs the
   custom command (`App::key_taken`, checked first in `handle_normal_key`),
   the footer leaves the dashboard's action out and the help marks it
   taken. The other reserved keys still refuse the config
   (`RESERVED_KEYS`).
+- **Shells in the dashboard (#82)** — `App::shells` (`ShellInfo`s, in
+  opening order), from `ListShells` at start (none from a daemon older than
+  shells), then `ShellOpened` (`App::upsert_shell`: the reply to `OpenShell`
+  and its event are one shell) and `ShellClosed` (`App::remove_shell`). A
+  shell's row (`table::shell_cell`) is `Shell #N` alone: no status, time or
+  context (a shell has none, so never "need you", the spinner or the
+  attention sort), and no mark (its name, its branch or its section tell it
+  apart). A shell in a worktree is a `Row::Shell { tree: Some(app::Branch) }`
+  below its member (`App::member_shells`, by number): below the task's own
+  row for a task of one (` ├`/` └`), below the member's row in a task with
+  several (` │ └` under a member that is not the last, `   └` under the
+  last). It shows with its task, wherever the task sorts or the filter
+  takes it. Those on main checkouts have the section after the chats, in
+  opening order, their repository (dim) where a task has its branch;
+  attention first, they come last, the repository in REPO and `shell` in
+  BRANCH. The filter matches their repository. Each is an `Entry::Shell`
+  (`Pick::Shell(id)`): `visible_entries` puts a worktree's after its task's
+  entry and the others after the chats (last, attention first), so
+  `table::render` maps a member's row to its task's entry past the shells
+  between members. On a shell `App::focused` is `Focused::Shell(shell, its
+  member)`; `Focused::terminal` (an agent's id, else the shell's) is what
+  the pane shows (`peek_agent`, so `WatchScreen`, `Screen`, `Resize` by the
+  shell's id), what `enter` types into (`Mode::Terminal { agent }` then
+  holds the shell's id), what `f`/`shift-enter` attach to (no provider in
+  the status bar) and `v` scrolls. The pane's title is `Shell #3 · fix-api`
+  (its member's label, else its repository). `focused_member` is `None` on a
+  shell: `r`, `R`, `←`/`→` and the drop do nothing there, and `a`, `p`, `N`
+  neither. `!` (`shell_here`) opens a shell in the focused member's
+  worktree, a chat's main checkout, or where the selected shell runs; `s`
+  opens the repository picker (`Purpose::Shell`, as `c`'s), then one on the
+  checkout picked. Both are `Action::OpenShell`: `open_shell` sends
+  `OpenShell` (`Client::open_shell`: `repos::agent_env` and `[spawn]
+  wrapper`, as `run_agent`), then `App::take_shell` lists it, selects it
+  (the filter emptied if it would hide it) and gives it the keyboard, the
+  keys queued behind dropped; a refusal opens a notice. Stop moved from `s`
+  to `x`; on a shell `x` and `d` ask (`Mode::ConfirmCloseShell`: `Shell #3
+  of fix-api`, `y`/`enter`), then `CloseShell`. A shell that closes while
+  selected gives the selection to its task, its member focused (one on a
+  main checkout: the entry now in its place, as a closed chat does); typed
+  into or scrolled, the pane gives the keyboard back first
+  (`stop_typing("the shell closed")`, the keys still coming dropped).
+  Custom commands on a shell in a worktree get its member's `{task}`, `{id}`
+  and `{dir}`; on a main checkout's, its name, its id and the checkout
+  (`Focused::command_values`). The drop dialogs say how many shells a drop
+  closes (`ui::drop_closes`). Footer: `!:shell here`, and `s:new shell`, the
+  first hint to go. `!` and `x` are in `config::YIELDING_KEYS`, `s` stays
+  reserved.
 - **Dashboard colours** — `tui/theme.rs`: colours by role (`theme::get()`),
   never a `Color::` in the drawing code. `DARK` (24-bit) when `COLORTERM`
   says truecolor or `[tui] theme = "dark"`, else `ANSI` (the terminal's 16
@@ -550,8 +604,9 @@ adopt). `tam-cli` depends on all three.
   result, keeping the filter, picks and highlighted item. The picker is
   `Mode::PickProject(picker, Purpose)` (and the path prompt
   `SpawnEnterPath(_, Purpose)`): `n`'s for a task, `c`'s for a chat (see
-  Chats in the dashboard), one mode so that pastes, the mouse and the
-  projects found reach both.
+  Chats in the dashboard), `s`'s for a shell (see Shells in the
+  dashboard), one mode so that pastes, the mouse and the projects found
+  reach all three.
 - **Brief and task directory (#25)** — one brief per task: a reference the
   user gave (URL, ticket id, path; tam never fetches or reads it), recorded
   as `BriefSet` (kept with the task's events, latest only: a re-created
@@ -792,8 +847,8 @@ adopt). `tam-cli` depends on all three.
   and `stop_all` waits for them all before any worktree goes; never a
   `DropRefused` reason, and `Dropped` does not count them (a client counts
   its `ShellInfo`s). Lifetime: an open shell keeps the daemon up;
-  `Shutdown` closes them. Clients until #82 (dashboard) and #83 (`tam
-  shell`, ps, attach, stop): the TUI ignores the events, `resolve_target`
+  `Shutdown` closes them. Clients: the dashboard (#82, see Shells in the
+  dashboard); until #83 (`tam shell`, ps, attach, stop), `resolve_target`
   says an id is a shell's.
 
 ## Build & check
@@ -874,6 +929,18 @@ cargo test
   or creating against a live daemon (the dashboard always starts Claude) is
   not covered by a test: run the dev dashboard by hand in a sandbox (see
   Testing hooks by hand) with a fake `claude` on its `PATH`.
+- The dashboard's shells (synchronous, no daemon): `ui.rs` render tests on
+  `shell_dashboard()` (`chat_dashboard()` plus two shells below a task of
+  one, one below each member of a task with two, three on main checkouts):
+  the rows and their branches, the section, attention first, the filter,
+  the pane's title and screen, the close dialog and what a drop closes, the
+  footer and help (`!` and `x` taken), every mode at any size on a shell;
+  `mod.rs` tests on `shell_app()`: the entries' order, `j`/`k`, the mouse,
+  events, `!` on each kind of row and `App::take_shell`, `s` and its picker,
+  `x` stopping or closing, `d`, the keys that do nothing, `enter`/`f`/`v`, a
+  shell closing while selected and while typed in, custom commands and the
+  keys they took. Opening, typing into and closing one against a live
+  daemon: by hand in a sandbox (see Testing hooks by hand).
 - Shells: the daemon's `shells.rs` (real repositories; `sh`, or scripts
   standing for a shell, on the caller's `PATH`): open on a member and a
   checkout, list order, numbers (#1 closed with #2 open: #3; all closed:

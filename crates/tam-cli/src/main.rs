@@ -35,6 +35,7 @@ mod moves;
 mod msg;
 mod peers;
 mod repos;
+mod shell;
 mod task;
 mod tui;
 
@@ -146,6 +147,9 @@ async fn run(cli: Cli) -> Result<()> {
                         chat::start_detached(&mut client, &chat, start, json).await
                     };
                 }
+                client::Target::Shell(shell) => {
+                    return Err(shell::misnamed(&shell, "a task member or a chat"))
+                }
             };
 
             // The daemon resumes the member's current session by default.
@@ -182,6 +186,7 @@ async fn run(cli: Cli) -> Result<()> {
                         (task.member_label(&member), task, vec![member])
                     }
                     client::Target::Chat(chat, _) => return stop_chat(&mut client, &chat).await,
+                    client::Target::Shell(shell) => return shell::close(&mut client, &shell).await,
                 },
             };
 
@@ -224,6 +229,8 @@ async fn run(cli: Cli) -> Result<()> {
                     let what = format!("chat {}", chat::describe(&chat));
                     (chat.id.clone(), chat.label(), what)
                 }
+                // A shell runs until it exits or is closed: no agent to check.
+                client::Target::Shell(shell) => return shell::attach(&mut client, &shell).await,
             };
             if !client.list_agents().await?.iter().any(|a| a.id == id) {
                 anyhow::bail!("no agent running in {what}");
@@ -238,20 +245,32 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let mut client = client::Client::connect().await?;
             // A task, or one member of a task (TASK/MEMBER).
-            let what = match client.get_task(&name).await {
-                Ok(_) => format!("Task '{name}'"),
+            let (what, members) = match client.get_task(&name).await {
+                Ok((task, _)) => (
+                    format!("Task '{name}'"),
+                    task.members.into_iter().map(|m| m.id).collect(),
+                ),
                 Err(_) => {
                     if let Some(e) = chat::not_a_task(&mut client, &name).await {
                         return Err(e);
                     }
-                    format!("'{name}'")
+                    let member = client.resolve_member(Some(&name), None).await;
+                    let members = member.map(|(_, m, _)| vec![m.id]).unwrap_or_default();
+                    (format!("'{name}'"), members)
                 }
             };
+            // The shells in its worktrees close with it: said, as the
+            // dashboard's drop dialog does.
+            let shells = client.list_shells().await?;
+            let closes = shell::of_members(&shells, &members);
             let mut outcome = client.drop_task(&name, force, branch).await?;
             if let client::DropOutcome::Refused { worktrees } = &outcome {
                 eprintln!("{what} not dropped:");
                 for line in drop_report::lines(worktrees) {
                     eprintln!("  {line}");
+                }
+                if let Some(closes) = shell::closes_with_it(closes) {
+                    eprintln!("{closes}.");
                 }
                 if !confirm("Drop anyway? [y/N] ")? {
                     eprintln!("{what} kept (pass --force to drop anyway).");
@@ -264,7 +283,12 @@ async fn run(cli: Cli) -> Result<()> {
                     for warning in warnings {
                         eprintln!("warning: {warning}");
                     }
-                    println!("Dropped {}", what.replacen("Task", "task", 1));
+                    let closed = match closes {
+                        0 => String::new(),
+                        1 => " and closed its shell".into(),
+                        n => format!(" and closed its {}", shell::count(n)),
+                    };
+                    println!("Dropped {}{closed}", what.replacen("Task", "task", 1));
                 }
                 client::DropOutcome::Refused { .. } => {
                     anyhow::bail!("the daemon refused a forced drop")
@@ -354,9 +378,10 @@ async fn run(cli: Cli) -> Result<()> {
             // Fresh worktree health from the daemon.
             let infos = client.reconcile().await?;
             let chats = client.list_chats().await?;
+            let shells = client.list_shells().await?;
             let agents = client.list_agents().await.unwrap_or_default();
             if json {
-                return script::ps(&mut client, infos, chats, &agents).await;
+                return script::ps(&mut client, infos, chats, shells, &agents).await;
             }
 
             let mut tasks: Vec<task::Task> = infos
@@ -372,14 +397,17 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|info| chat::Chat::new(info, &agents))
                 .collect();
             chats.sort_by_key(|c| c.status().sort_priority());
-            let chat_lines = ps::chat_lines(&chats);
-            if !chat_lines.is_empty() {
-                for line in chat_lines {
-                    println!("{line}");
+            // Then the shells on main checkouts; those in a task's worktree
+            // are below its member.
+            for table in [ps::chat_lines(&chats), ps::shell_lines(&shells)] {
+                if !table.is_empty() {
+                    for line in table {
+                        println!("{line}");
+                    }
+                    println!();
                 }
-                println!();
             }
-            for line in ps::lines(&tasks) {
+            for line in ps::lines(&tasks, &shells) {
                 println!("{line}");
             }
         }
@@ -570,6 +598,20 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Split { member, name, json } => {
             moves::split(&member, name.as_deref(), json).await?
         }
+        Commands::Shell {
+            target,
+            repo,
+            detach,
+            json,
+        } => {
+            shell::open(shell::NewShell {
+                target,
+                repo,
+                detach,
+                json,
+            })
+            .await?
+        }
     }
 
     Ok(())
@@ -632,9 +674,10 @@ async fn resolve_member(
     }
 }
 
-/// Find the member or chat a command acts on: named (what `resolve_member`
-/// takes, then a chat's id or name), else the member whose worktree contains
-/// the current directory (never a chat).
+/// Find the member, chat or shell a command acts on: named (what
+/// `resolve_member` takes, then a chat's id or name, then a shell's id), else
+/// the member whose worktree contains the current directory (never a chat
+/// nor a shell).
 async fn resolve_target(client: &mut client::Client, name: Option<&str>) -> Result<client::Target> {
     match name {
         Some(name) => client.resolve_target(name).await,

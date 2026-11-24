@@ -275,10 +275,11 @@ async fn a_task_driven_without_a_terminal() {
     let ps = json(&out);
     assert_eq!(
         keys(&ps),
-        BTreeSet::from(["schema_version", "tasks", "chats"])
+        BTreeSet::from(["schema_version", "tasks", "chats", "shells"])
     );
     assert_eq!(ps["schema_version"], 1);
     assert_eq!(ps["chats"], serde_json::json!([]));
+    assert_eq!(ps["shells"], serde_json::json!([]));
     let task = &ps["tasks"][0];
     assert_eq!(
         keys(task),

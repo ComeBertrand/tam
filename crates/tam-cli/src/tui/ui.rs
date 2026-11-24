@@ -1311,28 +1311,18 @@ fn render_close_shell_popup(frame: &mut Frame, label: &str) {
 /// What a drop of task `name` (or of `member` alone) closes of its shells,
 /// when it has any.
 fn drop_closes(app: &App, name: &str, member: Option<&MemberChoice>) -> Option<String> {
-    let shells = |count: usize| match count {
-        1 => "1 shell".to_string(),
-        n => format!("{n} shells"),
-    };
     let task = app.tasks.iter().find(|t| t.name == name)?;
     let count: usize = task
         .members
         .iter()
         .map(|m| app.member_shells(m.id()).len())
         .sum();
-    if count == 0 {
-        return None;
-    }
-    let what = match count {
-        1 => "Its shell closes with it".to_string(),
-        n => format!("Its {n} shells close with it"),
-    };
+    let what = crate::shell::closes_with_it(count)?;
     Some(match member {
         None => format!("{what}."),
         Some(m) => match app.member_shells(&m.id).len() {
             0 => format!("{what}, none with {} alone.", m.label),
-            n => format!("{what}, {} with {} alone.", shells(n), m.label),
+            n => format!("{what}, {} with {} alone.", crate::shell::count(n), m.label),
         },
     })
 }

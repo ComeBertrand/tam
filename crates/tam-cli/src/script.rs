@@ -1,13 +1,14 @@
 //! The non-interactive CLI, what agents and scripts rely on: exit statuses,
 //! errors as JSON with `--json`, starting agents without attaching, `tam ps
-//! --json`, `tam wait` and `tam result`. The documents are in `schema.rs`.
+//! --json`, `tam wait` and `tam result` (`tam shell -d` is in `shell.rs`).
+//! The documents are in `schema.rs`.
 
 use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde::Serialize;
-use tam_proto::{AgentInfo, ChatInfo, MemberInfo, MemberOutcome, MemberState, TaskInfo};
+use tam_proto::{AgentInfo, ChatInfo, MemberInfo, MemberOutcome, MemberState, ShellInfo, TaskInfo};
 
 use crate::cli::{Commands, Until};
 use crate::client::{Client, Target};
@@ -120,7 +121,8 @@ pub fn json_output(command: &Commands) -> bool {
         | Commands::Chat { json, .. }
         | Commands::Close { json, .. }
         | Commands::Rename { json, .. }
-        | Commands::Keep { json, .. } => *json,
+        | Commands::Keep { json, .. }
+        | Commands::Shell { json, .. } => *json,
         _ => false,
     }
 }
@@ -244,6 +246,7 @@ pub async fn ps(
     client: &mut Client,
     infos: Vec<TaskInfo>,
     chats: Vec<ChatInfo>,
+    shells: Vec<ShellInfo>,
     agents: &[AgentInfo],
 ) -> Result<()> {
     let mut tasks = Vec::with_capacity(infos.len());
@@ -267,7 +270,7 @@ pub async fn ps(
         };
         with_runs.push((chat, runs));
     }
-    print_json(&schema::Ps::new(tasks, with_runs, agents))
+    print_json(&schema::Ps::new(tasks, with_runs, shells, agents))
 }
 
 /// The agents a command acts on: those of a task's members, or a chat's.
@@ -306,6 +309,9 @@ async fn agents_of(client: &mut Client, name: Option<&str>) -> Result<Agents> {
     Ok(match crate::resolve_target(client, name).await? {
         Target::Member(task, member) => Agents::Task(task, vec![member]),
         Target::Chat(chat, _) => Agents::Chat(chat),
+        Target::Shell(shell) => {
+            return Err(crate::shell::misnamed(&shell, "a task member or a chat"))
+        }
     })
 }
 

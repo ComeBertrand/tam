@@ -52,7 +52,17 @@ pub async fn send(
     };
     let (message, pending) = match client.send(request).await? {
         Response::Sent { message, pending } => (*message, pending),
-        other => return Err(unexpected("SendMessage", other)),
+        other => {
+            let err = unexpected("SendMessage", other);
+            // The daemon looks for a task member or a chat: say when the
+            // name was a shell's.
+            return Err(match client.resolve_target(target).await {
+                Ok(Target::Shell(shell)) => {
+                    crate::shell::misnamed(&shell, "a task member or a chat")
+                }
+                _ => err,
+            });
+        }
     };
     let status = match pending {
         Some(_) if delivered_soon(&mut client, &message.id).await => None,
@@ -141,6 +151,9 @@ pub async fn history(task: Option<String>, json: bool) -> Result<()> {
                     History::Task(task, runs)
                 }
                 Target::Chat(chat, runs) => History::Chat(chat, runs),
+                Target::Shell(shell) => {
+                    return Err(crate::shell::misnamed(&shell, "a task or a chat"))
+                }
             },
         },
         None => {

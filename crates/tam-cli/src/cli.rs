@@ -106,17 +106,20 @@ pub enum Commands {
     },
 
     /// Stop the agents of a task (or of one member: TASK/MEMBER), or a
-    /// chat's agent (the chat stays: tam run resumes it)
+    /// chat's agent (the chat stays: tam run resumes it); or close a shell
+    ///
+    /// Closing a shell hangs it up: what runs in it stops. Nothing on disk
+    /// changes.
     Stop {
-        /// Task name, TASK/MEMBER, or a chat's id or name (resolved from
-        /// current directory if omitted)
+        /// Task name, TASK/MEMBER, a chat's id or name, or a shell's id
+        /// (resolved from current directory if omitted)
         name: Option<String>,
     },
 
-    /// Attach to a running agent
+    /// Attach to a running agent, or to a shell
     Attach {
-        /// Task name, TASK/MEMBER, or a chat's id or name (resolved from
-        /// current directory if omitted)
+        /// Task name, TASK/MEMBER, a chat's id or name, or a shell's id
+        /// (resolved from current directory if omitted)
         name: Option<String>,
     },
 
@@ -162,7 +165,7 @@ pub enum Commands {
         name: String,
     },
 
-    /// List chats and tasks with computed status
+    /// List chats, shells and tasks, the tasks with computed status
     Ps {
         /// Output as JSON
         #[arg(long)]
@@ -497,6 +500,34 @@ pub enum Commands {
         off: bool,
 
         /// Output as JSON (see README, Scripting)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Open a shell in a task's worktree or on a repository's main
+    /// checkout, then attach
+    ///
+    /// Your $SHELL, run by the daemon in your environment, through [spawn]
+    /// wrapper: it keeps running once you detach (ctrl-]), until it exits
+    /// or tam stop closes it; dropping its task closes it too. It is named
+    /// by its id (tam attach ID, tam stop ID), and tam ps lists it.
+    Shell {
+        /// Task name, TASK/MEMBER or member id (its worktree), or a chat's
+        /// id or name (its main checkout). Default: the task whose worktree
+        /// holds the current directory, else the main checkout holding it
+        #[arg(conflicts_with = "repo")]
+        target: Option<String>,
+
+        /// Open it on a repository's main checkout instead: a path to it (or
+        /// to any directory in it), or its name as tam ls shows it
+        #[arg(short, long, value_name = "REPO")]
+        repo: Option<String>,
+
+        /// Don't attach: print its id (never attaches without a terminal)
+        #[arg(short, long)]
+        detach: bool,
+
+        /// Print a JSON receipt instead of attaching (see README, Scripting)
         #[arg(long)]
         json: bool,
     },

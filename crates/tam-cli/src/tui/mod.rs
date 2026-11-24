@@ -959,7 +959,7 @@ fn shell_here(app: &App) -> Option<ShellPlace> {
 fn close_shell_dialog(app: &App, shell: &ShellInfo) -> Mode {
     Mode::ConfirmCloseShell {
         id: shell.id.clone(),
-        label: format!("{} of {}", shell.name(), app.shell_place(shell)),
+        label: crate::shell::named(shell, &app.shell_place(shell)),
     }
 }
 

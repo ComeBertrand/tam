@@ -614,13 +614,17 @@ pub enum Target {
     Member(TaskInfo, MemberInfo),
     /// A chat, with its runs.
     Chat(ChatInfo, Vec<RunInfo>),
+    /// An open shell (by its id only): `tam attach` and `tam stop` take
+    /// one, the other commands say it is a shell (`shell::misnamed`).
+    Shell(ShellInfo),
 }
 
 /// Chats (#66): finding them by name, and their requests.
 impl Client {
-    /// Find the task member or chat `target` names, as `tam msg` finds its
-    /// recipient: a task name, `<task>/<member>`, a member id, from an agent
-    /// tam started a peer's short name; then a chat's id, then its name.
+    /// Find the task member, chat or shell `target` names, as `tam msg`
+    /// finds its recipient: a task name, `<task>/<member>`, a member id,
+    /// from an agent tam started a peer's short name; then a chat's id, then
+    /// its name; then an open shell's id.
     pub async fn resolve_target(&mut self, target: &str) -> Result<Target> {
         let request = Request::ResolveTarget {
             target: target.into(),
@@ -631,12 +635,19 @@ impl Client {
         match self.send(request).await? {
             Response::Member { task, member, .. } => Ok(Target::Member(task, *member)),
             Response::Chat { chat, runs } => Ok(Target::Chat(*chat, runs)),
-            // No command takes a shell yet (#83).
-            Response::Shell { shell } => Err(anyhow::anyhow!(
-                "'{}' is a shell ({}), not a task member or a chat",
-                shell.id,
-                shell.name()
-            )),
+            Response::Shell { shell } => Ok(Target::Shell(*shell)),
+            // A shell's id no longer open: it exited, or was closed.
+            Response::Error { message }
+                if tam_daemon::shell::is_shell_id(target) && !is_unknown_request(&message) =>
+            {
+                Err(script::error(
+                    ErrorKind::NotFound,
+                    format!(
+                        "no open shell '{target}': it exited or was closed (tam ps lists the \
+                         open shells)"
+                    ),
+                ))
+            }
             other => Err(not_found("ResolveTarget", other)),
         }
     }

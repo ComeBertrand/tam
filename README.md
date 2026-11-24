@@ -79,7 +79,7 @@ tam
 - **Messages** — `tam msg` sends a message to a running session without attaching, from you or from another agent, and can wait for the reply
 - **Peers** — an agent knows the other members of its task (their names, repositories and worktrees) and reaches them with `tam msg`; `tam peers` shows what their agents are doing
 - **Chats** — `tam chat` (or `c` in the dashboard) starts a Claude session on a repository's main checkout, new or from the repository's Claude history, listed by `tam ps` and the dashboard and reached by `tam attach`, `tam msg`, `tam wait`… like a task, then closed when done
-- **Shells** — `!` in the dashboard opens your shell in a task's worktree (`s`: on a repository's main checkout), kept running by the daemon: its screen in the pane, typed into or attached like an agent's, closed with its task
+- **Shells** — `tam shell` (or `!` in the dashboard) opens your shell in a task's worktree (`-r`, or `s`: on a repository's main checkout), kept running by the daemon: its screen in the pane, typed into or attached like an agent's, closed with its task
 - **Merge and split** — `tam merge` makes tasks started separately one task, so their running agents become peers; `tam split` moves a member back out. Nothing stops or moves on disk
 - **Custom TUI commands** — bind keys to shell commands (open editor, run tests, etc.)
 
@@ -123,7 +123,7 @@ tam split TASK/MEMBER [NAME]   Move one member out into a task of its own (defau
 NAME is a task name, or TASK/MEMBER for one member of the task.
 ```
 
-`tam drop` checks first: it refuses when uncommitted changes would be lost, or, with `-b`, commits that no other branch, tag or remote branch holds. It lists them and, on a terminal, asks before going on. If a worktree cannot be removed, the task is kept.
+`tam drop` checks first: it refuses when uncommitted changes would be lost, or, with `-b`, commits that no other branch, tag or remote branch holds. It lists them and, on a terminal, asks before going on. If a worktree cannot be removed, the task is kept. The shells open in its worktrees (see Shells) are closed first, never a reason to refuse: `tam drop` says how many.
 
 The daemon checks every task's worktree against git (`git worktree list`) when it starts and every 10 seconds. A worktree deleted outside tam (`rm -rf`, `git worktree remove`) shows as `gone` in `tam ps` and the dashboard, with what can be done. `tam repair` recreates it on its branch: only if the branch still exists, is checked out nowhere else, and git's leftover registration of the directory (if any) has no staged changes. `tam drop` forgets the task. A worktree switched to another branch is not gone; `tam ps` notes the switch. TAM only looks: nothing is recreated or removed unless you ask.
 
@@ -162,11 +162,29 @@ A name means a task before it means a chat. `tam attach`, `tam stop`, `tam run`,
 
 From inside a chat, its agent uses `tam` as any shell does: `tam new` starts a task from it, `tam msg` reaches a task's member, and the reply comes back to the chat.
 
+### Shells
+
+```
+tam shell [NAME]               Open a shell in the task's worktree (default: where you are) and attach
+tam shell -r REPO              ... on the repository's main checkout instead
+tam shell -d                   Don't attach: print its id (--json: print a receipt)
+
+tam attach SHELL               Attach to the shell
+tam stop SHELL                 Close it: what runs in it stops
+
+SHELL is a shell's id (sh-…), as tam ps shows it.
+```
+
+A shell is your `$SHELL`, run by the daemon in a task's worktree or on a repository's main checkout: it keeps running once you detach (`ctrl-]`), until it exits (`exit`, `ctrl-d`) or `tam stop` closes it, and dropping its task (or its member) closes it too, as `tam drop` says. It runs in the environment you ran `tam shell` from, through `[spawn] wrapper` as an agent does (see The agent), without `TAM_AGENT_ID`: what you type there is yours, `tam msg` from it comes from you. A daemon restart closes every shell. Shells are named `Shell #1`, `Shell #2`… in each place (the number after the highest one open there), and by their id on the command line.
+
+NAME is what `tam run` takes (a task, `TASK/MEMBER`, a member id), or a chat (its main checkout); REPO what `tam chat` takes (a path, or a project name as `tam ls` shows it; from a worktree, its main checkout). With neither, the shell opens in the task worktree you are in, else on the main checkout you are in; in a worktree no task has, `tam shell` refuses (`tam adopt` makes it a task's, `tam shell -r .` opens one on its main checkout). Without a terminal, or with `-d`, it opens the shell and prints its id alone on stdout (how to attach goes to stderr). `tam ps` lists the shells on main checkouts in a table of their own after the chats, and a task's shells below its row (below its member's, in a task with several), each with its id. The commands that act on agents or tasks (`run`, `msg`, `wait`, `result`, `history`, `drop`, `merge`, `close`) say when a name is a shell's id. The dashboard has them too (see TUI).
+
 ### Observing
 
 ```
-tam ps                         Chats, then the task table with computed status,
-                               a row per member of a task with several
+tam ps                         Chats, shells on main checkouts, then the task table
+                               with computed status, a row per member of a task
+                               with several, and its shells below it
 tam ps --json                  Machine-readable output
 
 tam ls                         Discover projects and worktrees
@@ -215,8 +233,9 @@ tam run NAME -p TEXT -d --json Start the agent on a prompt, print a receipt
 tam wait NAME                  Wait until the task's agents stop working; print their states
 tam wait NAME -u ready -t 30m  ... until they wait for input, for at most 30 minutes
 tam result NAME                Print the last response of the task's agents
-tam ps --json                  Every task and chat, as JSON
+tam ps --json                  Every task, chat and shell, as JSON
 tam chat -d --json             Start a chat, print a receipt
+tam shell NAME -d --json       Open a shell, print a receipt
 tam close CHAT -y --json       Close a chat; print it as it was (rename, keep: as it is)
 tam merge INTO FROM --json     Merge tasks; print who moved where
 tam split TASK/MEMBER --json   Split a member out; print who moved where
@@ -231,13 +250,13 @@ Claude asks whether to trust a folder it does not know yet, and runs no hook unt
 | 0 | Done | |
 | 1 | Failed; `tam wait` gave up; `tam result` has no response; a merge or split refused; `tam close` not confirmed | `failed`, `unreachable`, `no_result` |
 | 2 | Invalid arguments (reported as text by the argument parser) | |
-| 3 | No such task, member or chat, or a task name where one member is needed | `not_found` |
+| 3 | No such task, member, chat or open shell; a task name where one member is needed; a chat or a shell where the command takes none | `not_found` |
 | 4 | `tam wait` timed out | `timeout` |
 | 5 | The daemon cannot be reached, or broke off | `daemon` |
 
 With `--json`, stdout holds one JSON document and nothing else, also when the command fails: its `error` is then `{"kind": …, "message": …}`, next to what could still be reported (a command with nothing to report prints only `schema_version` and `error`). Every document has `"schema_version": 1`, raised only when a key is removed, renamed or retyped: new keys may come. Every key is always present, `null` when it has no value.
 
-`tam ps --json`, tasks most urgent first, then chats (most urgent first, else in creation order):
+`tam ps --json`, tasks most urgent first, then chats (most urgent first, else in creation order), then shells (in the order they were opened):
 
 ```json
 {
@@ -317,6 +336,20 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
         "exit_code": null
       }
     }
+  ],
+  "shells": [
+    {
+      "id": "sh-1a2b3c4d",
+      "name": "Shell #1",
+      "number": 1,
+      "task": "feat",
+      "member": "m-1a2b3c4d",
+      "repo": "app",
+      "dir": "/home/me/worktrees/app--feat",
+      "pid": 4250,
+      "viewers": 0,
+      "opened_at": 1763400100
+    }
   ]
 }
 ```
@@ -326,6 +359,7 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
 - `session_id` is the running agent's session, else the last run's. `last_message` is the start of the agent's last response: `tam result` has all of it. A run's `exit_code` is -1 when it was stopped.
 - `health` is what the daemon saw in git: `{"state": "ok", "branch"}`, `{"state": "gone", "cannot_repair"}` or `{"state": "broken", "problem"}`; `null` until checked.
 - A chat's `id` is how to name it to tam; `label` is how tam shows it (its `name`, else its `title`, else its id) and may not be a name tam takes back. `title` (the user's `/rename`, else Claude's title) and `last_prompt` come from Claude's files of the session it is in. `status` is its agent's (`run`, `ready`, `block`, `question`, `error`), else `idle`. `last_turn_at` is when the user last prompted its agent; `closes_at` when autoclean closes it (`null` when kept, or autoclean is off); `session_id` the running agent's session, else the one it resumes next. The keys from `agent` on are those of a task member.
+- A shell's `id` is how to name it to tam (`tam attach`, `tam stop`); `name` is how tam shows it, `Shell #` and its `number` among the shells of its place. `task` and `member` are those of the worktree it runs in, `null` on a main checkout; `pid` its process's (the wrapper's, which `exec`s the shell); `viewers` the clients attached to it or typing into it. A shell has no status.
 - Before version 1, `tam ps --json` printed the `tasks` array alone, with the keys up to `last_activity` (tasks) and `health` (members).
 
 `tam new --json` and `tam run --json`: the task's members (`new`) or the one started (`run`). `agent` is `null` when none started, `resumed_session` is `null` for a new session. For a chat (`tam chat --json`, `tam run CHAT --json`, and `tam wait`/`tam result` of a chat), the document has `chat` (its id) where a task's has `task`, and the chat as the one entry of `members`: `name` is `null` when unnamed, and there is no `branch`.
@@ -403,6 +437,23 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
   "last_turn_at": 1763400000,
   "run_count": 1,
   "open": false
+}
+```
+
+`tam shell --json`: the shell opened, with the keys a shell has in `tam ps --json` (`shell` is its id), but `viewers`. A failure (nothing opened) is the error document alone.
+
+```json
+{
+  "schema_version": 1,
+  "shell": "sh-1a2b3c4d",
+  "name": "Shell #1",
+  "number": 1,
+  "task": "feat",
+  "member": "m-1a2b3c4d",
+  "repo": "app",
+  "dir": "/home/me/worktrees/app--feat",
+  "pid": 4250,
+  "opened_at": 1763400100
 }
 ```
 

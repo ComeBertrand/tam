@@ -1,6 +1,6 @@
 //! The JSON documents tam prints for agents and scripts: `--json` of `ps`,
-//! `new`, `run`, `wait`, `result`, `merge`, `split`, and of the chat
-//! commands (`chat`, `close`, `rename`, `keep`), version
+//! `new`, `run`, `wait`, `result`, `merge`, `split`, of the chat commands
+//! (`chat`, `close`, `rename`, `keep`) and of `shell`, version
 //! [`SCHEMA_VERSION`]. Built from
 //! the daemon's types but kept apart from them, so that the wire protocol
 //! can change without changing them. Documented in the README (Scripting):
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tam_proto::{
     AgentError, AgentInfo, ChatInfo, DeniedTool, MemberHealth, MemberInfo, MemberOutcome, Pending,
-    RunInfo, TaskInfo,
+    RunInfo, ShellInfo, TaskInfo,
 };
 
 use crate::chat::Chat;
@@ -41,12 +41,14 @@ pub struct Failure {
 }
 
 /// `tam ps --json`: the tasks, most urgent first; the chats, most urgent
-/// first, then in creation order.
+/// first, then in creation order; the shells, in the order they were
+/// opened.
 #[derive(Serialize)]
 pub struct Ps {
     pub schema_version: u32,
     pub tasks: Vec<PsTask>,
     pub chats: Vec<PsChat>,
+    pub shells: Vec<PsShell>,
 }
 
 /// What a document is about: a task (`"task": NAME`), or a chat (`"chat":
@@ -222,12 +224,24 @@ pub struct Outcome {
 }
 
 impl Ps {
-    /// The tasks and chats with their runs, and the running agents.
+    /// The tasks and chats with their runs, the open shells, and the
+    /// running agents.
     pub fn new(
         tasks: Vec<(TaskInfo, Vec<RunInfo>)>,
         chats: Vec<(ChatInfo, Vec<RunInfo>)>,
+        shells: Vec<ShellInfo>,
         agents: &[AgentInfo],
     ) -> Self {
+        let task_of = |member: &str| {
+            tasks
+                .iter()
+                .find(|(t, _)| t.member(member).is_some())
+                .map(|(t, _)| t.name.clone())
+        };
+        let shells: Vec<PsShell> = shells
+            .iter()
+            .map(|shell| PsShell::new(shell, shell.member.as_deref().and_then(task_of)))
+            .collect();
         let mut tasks: Vec<(u8, PsTask)> = tasks
             .into_iter()
             .map(|(info, runs)| {
@@ -265,6 +279,7 @@ impl Ps {
                 .iter()
                 .map(|(chat, runs)| PsChat::new(chat, runs))
                 .collect(),
+            shells,
         }
     }
 }
@@ -586,6 +601,87 @@ impl ChatDoc {
             last_turn_at: chat.last_turn_at,
             run_count: chat.run_count,
             open,
+        }
+    }
+}
+
+/// A shell in `tam ps --json` (#83): the user's `$SHELL` on a task
+/// member's worktree or a repository's main checkout. No status: a shell
+/// runs until it exits or is closed.
+#[derive(Serialize)]
+pub struct PsShell {
+    /// `sh-` and 8 hex digits: how to name the shell to tam.
+    pub id: String,
+    /// `Shell #3`.
+    pub name: String,
+    /// Its number among the shells of its place (a member, a main
+    /// checkout).
+    pub number: u32,
+    /// The task of the member whose worktree it runs in; `null` on a main
+    /// checkout.
+    pub task: Option<String>,
+    /// That member's id; `null` on a main checkout.
+    pub member: Option<String>,
+    pub repo: String,
+    /// Where it runs: the member's worktree, or the main checkout.
+    pub dir: PathBuf,
+    /// Of its process (of the wrapper, which `exec`s the shell).
+    pub pid: u32,
+    /// Clients attached to it, or typing into it.
+    pub viewers: usize,
+    /// Unix timestamp (seconds) of when it was opened.
+    pub opened_at: u64,
+}
+
+impl PsShell {
+    fn new(shell: &ShellInfo, task: Option<String>) -> Self {
+        Self {
+            id: shell.id.clone(),
+            name: shell.name(),
+            number: shell.number,
+            task,
+            member: shell.member.clone(),
+            repo: shell.repo.clone(),
+            dir: shell.dir.clone(),
+            pid: shell.pid,
+            viewers: shell.viewers,
+            opened_at: shell.opened_at,
+        }
+    }
+}
+
+/// `tam shell --json`: the shell opened, `shell` its id.
+#[derive(Serialize)]
+pub struct ShellDoc {
+    pub schema_version: u32,
+    /// The shell's id.
+    pub shell: String,
+    pub name: String,
+    pub number: u32,
+    /// `null` on a main checkout.
+    pub task: Option<String>,
+    /// `null` on a main checkout.
+    pub member: Option<String>,
+    pub repo: String,
+    pub dir: PathBuf,
+    pub pid: u32,
+    pub opened_at: u64,
+}
+
+impl ShellDoc {
+    /// `shell`, opened on a member of `task` (`None`: on a main checkout).
+    pub fn new(shell: &ShellInfo, task: Option<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            shell: shell.id.clone(),
+            name: shell.name(),
+            number: shell.number,
+            task,
+            member: shell.member.clone(),
+            repo: shell.repo.clone(),
+            dir: shell.dir.clone(),
+            pid: shell.pid,
+            opened_at: shell.opened_at,
         }
     }
 }

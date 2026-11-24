@@ -622,7 +622,7 @@ find target/release/build/tam-cli-* -name 'completions' -o -name 'man'
 
 ## Contributing
 
-Contributions are welcome — open an issue or submit a pull request. For the full design rationale and architecture, see [`tam_manifesto.md`](tam_manifesto.md).
+Contributions are welcome — open an issue or submit a pull request. For the architecture, see [`CLAUDE.md`](CLAUDE.md); design decisions are recorded in the issues.
 
 ## License
 

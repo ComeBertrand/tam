@@ -3,7 +3,8 @@
 ## Project
 
 Rust workspace. Terminal agent multiplexer merging yawn (worktree management)
-and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.md`.
+and zinc (agent daemon) into a task-centric tool. The design is below (Key
+architecture patterns); decisions and what is left are in the GitHub issues.
 
 ## Crate structure
 

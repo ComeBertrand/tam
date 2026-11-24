@@ -9,7 +9,7 @@ and zinc (agent daemon) into a task-centric tool. Full design in `tam_manifesto.
 
 - `tam-proto`    — wire protocol types (daemon <-> client)
 - `tam-daemon`   — daemon: PTY management, agent screens, agent lifecycle, state detection, task ledger, task drop,
-  worktree reconciliation (member health, repair, adopt), chats
+  worktree reconciliation (member health, repair, adopt), chats, shells
 - `tam-worktree` — library: git ops, worktree CRUD, project discovery, pretty names, init,
   where tam's config and data live (`xdg`, `config::config_path`)
 - `tam-cli`      — binary `tam`: CLI, TUI, bridges worktrees and agents
@@ -73,7 +73,8 @@ adopt). `tam-cli` depends on all three.
   replies `DropRefused` with what would be lost — uncommitted changes, and with
   `delete_branch` commits no other branch/tag/remote holds — or why a directory
   can't be checked, and changes nothing. Otherwise: stop the members' agents
-  and wait for them, check again, remove each member's worktree (`--force`:
+  and close their shells (never a reason to refuse) and wait for them, check
+  again, remove each member's worktree (`--force`:
   checked already, and git refuses clean worktrees with submodules otherwise),
   `git branch -D`, then the ledger. The task leaves the ledger only once its
   worktrees are gone; a kept branch is a warning in `Dropped`. Git runs outside the state lock; the task
@@ -104,9 +105,16 @@ adopt). `tam-cli` depends on all three.
   checkout and a detached HEAD. The new task is named after the branch, or
   the worktree joins an existing task (`--join`, one `MemberAdded`). A lock
   (`DaemonState::worktrees`) serialises reconcile passes, repairs and drops.
-- **Agent screen is the daemon's** — `tam-daemon/src/terminal.rs`: a `vt100`
+- **Agent screen is the daemon's** — `tam-daemon/src/pty.rs` (`Pty`) is the
+  terminal half of an agent, shared with shells: the process (leading its own
+  session), the PTY master (its fds close-on-exec: no process tam starts
+  holds another's terminal), the screen, the output broadcast, the viewers,
+  the last output, the reader thread, and how the process is stopped (`kill`:
+  SIGTERM then SIGKILL, for agents; `hang_up`, for shells; its process group
+  SIGKILLed if dropped alive). `Agent` is a `Pty` plus provider, hooks and
+  state. `tam-daemon/src/terminal.rs`: a `vt100`
   parser per agent at its PTY's size (80×24 until a viewer resizes it, both
-  resized together in `Agent::resize`), with 1000 rows of history. The PTY
+  resized together in `Pty::resize`), with 1000 rows of history. The PTY
   reader feeds it under its lock, then relays the bytes to attach; it also
   stamps `last_output_at` (silence fallback). `Screen { id, from }` returns
   a window as escape sequences: the live screen, or history from a line
@@ -124,7 +132,10 @@ adopt). `tam-cli` depends on all three.
   Line reads on both ends of the socket use `read_until`: `read_line` loses
   a partly read line when `select!` cancels it.
 - **Daemon auto-starts/auto-shuts-down** — client spawns it on first connect,
-  daemon exits after 30s with no agents and no clients.
+  daemon exits after 30s (`IDLE_TIMEOUT`, `Daemon::idle_timeout` in tests)
+  with no agents, no shells and no clients. `run` checks the shutdown flag
+  100 ms after its last accepted connection: a client connecting more often
+  keeps it up (a test watches the socket file instead).
 - **Agents run in their caller's environment (#50)** — not the daemon's
   (inherited from whichever shell started it, maybe days ago).
   `RunAgent.env` (`tam_proto::AgentEnv`: its `Debug` shows a count only) is
@@ -136,7 +147,7 @@ adopt). `tam-cli` depends on all three.
   them counts as nested and writes no transcript, and the messaging token
   is a secret; the caller's pane or window, `TMUX`, `ZELLIJ*`, …;
   `COLUMNS`/`LINES`; `PWD`/`OLDPWD`). `Agent::spawn` applies it
-  (`agent::Launch`): `env_clear`, the client's variables (the program is
+  (`pty::Launch`, in `Pty::spawn`; shells too): `env_clear`, the client's variables (the program is
   looked up on its `PATH`), `TERM=xterm-256color` if it has none or `dumb`,
   `PWD` the worktree, then `TAM_AGENT_ID`/`TAM_SOCKET`, whatever the client
   sent. Empty (`Spawn`, tests): the daemon's. Held until the process starts,
@@ -730,6 +741,53 @@ adopt). `tam-cli` depends on all three.
   prompt; `None`: kept or off), computed in `State::chat_info` from the
   limit the daemon gives the ledger (`Ledger::set_chat_limit`, in memory; a
   change pushes `ChatUpdated` for every chat): #67's last day and time left.
+- **Shells (#81, tracking #80)** — the user's `$SHELL` on a PTY the daemon
+  owns, in a task member's worktree or a repository's main checkout
+  (`tam-daemon/src/shell.rs`, handlers at the end of `daemon.rs`): a `Pty`
+  plus where it runs and its number. Not an agent: `DaemonState::shells`,
+  apart from `agents`, under ids of their own (`sh-xxxxxxxx`), so hooks,
+  state, notify, ledger runs, the inbox, wait/result, autoclean and `List`
+  never see one; nothing in the ledger (a daemon restart closes them, none
+  is resumed). `DaemonState::pty` finds an agent's or a shell's PTY for
+  `Attach`, `Screen`, `WatchScreen`, `Keys`, `Resize` and `Scrollback`
+  (`not_found` says shell or agent by the id's shape); `Kill` refuses a
+  shell's id, `Spawn` an id a shell has. Requests: `OpenShell { on:
+  ShellPlace::Member(target) | Checkout(dir), env, wrapper }` (a member as
+  `Ledger::resolve` takes it, refused while its task is in `dropping` or its
+  health is gone or broken, checked, numbered and inserted in one hold of
+  the lock; a checkout through `main_checkout`, as `CreateChat`, git before
+  the lock), `ListShells` (in opening order, `Shell::seq`), `CloseShell {
+  id }` (replies the shell as it was, once it is gone); events
+  `ShellOpened`, `ShellClosed`; `ResolveTarget` replies `Shell` for an open
+  shell's id, after every other kind. `ShellInfo`: id, member (`None` on a
+  checkout), dir, repo, number, pid, opened_at, viewers; `name()` is
+  `Shell #3`. The number counts per place (`shell::Place`: a member by id,
+  so a merge or split keeps its shells and their numbers; a checkout
+  resolved): the highest open there plus one, 1 when none
+  (`shell::next_number`; exited shells reaped first). Program: `$SHELL` of
+  the client's env (the daemon's when it sent none), else `/bin/sh`, no
+  arguments (no login shell: it would redo the caller's environment),
+  through `[spawn] wrapper` (`Launch`, as `RunAgent`); `TAM_AGENT_ID` and
+  `TAM_SOCKET` removed whatever the env (`NOT_FOR_SHELLS`): what is typed
+  there is the user's (`tam msg` from a shell is from the user). Closing
+  (`Pty::hang_up`): SIGHUP, which bash and zsh pass to their jobs (each in
+  a process group of its own: the group SIGKILL alone, `Pty::kill`'s
+  fallback, orphans them); SIGKILL of its process group if it is still
+  there after 1s; then, for at most 1s, until nothing holds the PTY
+  (`Pty::released`: the reader ended), so the shell a forking wrapper
+  started and its jobs are gone too. Known limits: dash (`sh` on Debian)
+  does not hang up its background jobs, they stay; a wrapper that forks the
+  shell instead of `exec`ing it leaves the shell while it runs a
+  foreground job (the kernel hangs up that job only). Exit: polled with the
+  agents (`reap_exited` → `reap_shells`), also before `ListShells` and a
+  number is given. Drop: `stop_and_remove`/`stop_and_remove_member` take
+  the members' shells with their agents (`take_shells_of`, `ShellClosed`)
+  and `stop_all` waits for them all before any worktree goes; never a
+  `DropRefused` reason, and `Dropped` does not count them (a client counts
+  its `ShellInfo`s). Lifetime: an open shell keeps the daemon up;
+  `Shutdown` closes them. Clients until #82 (dashboard) and #83 (`tam
+  shell`, ps, attach, stop): the TUI ignores the events, `resolve_target`
+  says an id is a shell's.
 
 ## Build & check
 
@@ -809,6 +867,22 @@ cargo test
   or creating against a live daemon (the dashboard always starts Claude) is
   not covered by a test: run the dev dashboard by hand in a sandbox (see
   Testing hooks by hand) with a fake `claude` on its `PATH`.
+- Shells: the daemon's `shells.rs` (real repositories; `sh`, or scripts
+  standing for a shell, on the caller's `PATH`): open on a member and a
+  checkout, list order, numbers (#1 closed with #2 open: #3; all closed:
+  #1; one that exits frees its number), not agents (no agent, no run),
+  `ResolveTarget`, `Kill` refused; screen, keys, scrollback, resize (`stty
+  size`), a viewing watch, attach by id; closing leaves no job (bash, which
+  both CI runners have: a background and a foreground job, then through a
+  forking wrapper the daemon knows only by pid); a refused drop leaving the
+  shell, a task drop, a member drop and its last member, each closing the
+  shells before the worktree goes (`hup-shell`: its HUP trap waits, then
+  records whether its worktree is still there; a drop that does not wait
+  fails it); the caller's environment (a sentinel, no `TAM_*`, the shell and
+  the wrapper only on its `PATH`) in no reply, event, error or file, and no
+  shell id in the ledger; a merge keeping a shell and its numbering; the
+  daemon kept up by a shell, then shutting down; refusals (gone, broken,
+  being dropped, not a main checkout, no member, a chat).
 - The daemon's `xdg.rs`: the worktree config, the notify and autoclean
   settings and the ledger's path follow `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`, else `~/.config` and
   `~/.local/share`, an empty or relative value ignored, a config in

@@ -2053,6 +2053,8 @@ fn apply_event(app: &mut App, event: tam_proto::Event) {
         tam_proto::Event::ChatClosed { id } => {
             app.remove_chat(&id);
         }
+        // Shells in the dashboard: #82.
+        tam_proto::Event::ShellOpened { .. } | tam_proto::Event::ShellClosed { .. } => {}
     }
 }
 

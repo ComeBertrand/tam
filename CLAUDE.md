@@ -117,7 +117,14 @@ adopt). `tam-cli` depends on all three.
   parser per agent at its PTY's size (80×24 until a viewer resizes it, both
   resized together in `Pty::resize`), with 1000 rows of history. The PTY
   reader feeds it under its lock, then relays the bytes to attach; it also
-  stamps `last_output_at` (silence fallback). `Screen { id, from }` returns
+  stamps `last_output_at` (silence fallback). It answers the cursor
+  position and status queries (`CSI 6 n`, `CSI 5 n`: `fzf --height` draws
+  nothing until it has the first) where they come in the output
+  (`Terminal::feed` returns the answers), written to the PTY by a thread of
+  their own (`PtyReader::answer`: the reader is all that drains the
+  output), unless a viewer is attached (`output_tx` has a receiver, checked
+  under the terminal lock): its terminal answers what it is relayed, one
+  answer each. Device attributes and colours go unanswered. `Screen { id, from }` returns
   a window as escape sequences: the live screen, or history from a line
   number (lines keep their number as they scroll into history, so a
   scrolled-back viewer stays put). `WatchScreen { id }` makes one connection
@@ -973,7 +980,9 @@ cargo test
   checkout, list order, numbers (#1 closed with #2 open: #3; all closed:
   #1; one that exits frees its number), not agents (no agent, no run),
   `ResolveTarget`, `Kill` refused; screen, keys, scrollback, resize (`stty
-  size`), a viewing watch, attach by id; closing leaves no job (bash, which
+  size`), a viewing watch, attach by id; the cursor position answered
+  (bash `read -d R`) by the daemon, by an attached terminal alone while
+  one is, by the daemon again after; closing leaves no job (bash, which
   both CI runners have: a background and a foreground job, then through a
   forking wrapper the daemon knows only by pid); a refused drop leaving the
   shell, a task drop, a member drop and its last member, each closing the

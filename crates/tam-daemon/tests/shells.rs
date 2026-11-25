@@ -587,6 +587,95 @@ async fn a_shells_terminal_takes_screen_keys_attach_and_resize() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shells_terminal_answers_where_the_cursor_is_unless_a_terminal_is_attached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let sock = root.join("d.sock");
+    start_daemon(&sock, &root.join("ledger.jsonl")).await;
+    let mut conn = Conn::connect(&sock).await;
+    let api = repo(&root, "api");
+    // bash: `read -d` (dash, `sh` on Debian, has none).
+    let shell = conn
+        .shell(&open(checkout(&api), &env(&root, None, "bash", &[])))
+        .await;
+    let id = shell.id.clone();
+    // Ask where the cursor is, as `fzf --height` does before it draws
+    // anything, once it is somewhere known; the answer goes to a file.
+    let ask = r#"printf '\033[2J\033[7;12H\033[6n'; read -rs -t 5 -d R at; echo "${at#*[}""#;
+
+    // Typed into from a pane (a viewing watch: a viewer, with no terminal
+    // to answer), no terminal attached: the daemon's answers.
+    let mut pane = Conn::connect(&sock).await;
+    assert!(matches!(
+        pane.request(&Request::WatchScreen {
+            id: Some(id.clone()),
+            viewing: true,
+        })
+        .await,
+        Response::Ok
+    ));
+    assert_eq!(conn.shells().await[0].viewers, 1);
+    assert_eq!(
+        run_in(&mut pane, &id, ask, &root.join("alone")).await,
+        "7;12"
+    );
+    drop(pane);
+
+    // Attached: the viewer's terminal answers what it is relayed (its
+    // input comes back to the PTY), the daemon does not: one answer.
+    let (reader, mut writer) = UnixStream::connect(&sock).await.unwrap().into_split();
+    let mut reader = BufReader::new(reader);
+    let mut attach = serde_json::to_string(&Request::Attach {
+        id: id.clone(),
+        cols: 90,
+        rows: 20,
+    })
+    .unwrap();
+    attach.push('\n');
+    writer.write_all(attach.as_bytes()).await.unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.contains("attached"), "{line}");
+    let out = root.join("attached");
+    let typed = format!(
+        "{ask} > '{o}.tmp' && mv '{o}.tmp' '{o}'\n",
+        o = out.display()
+    );
+    assert!(matches!(
+        conn.request(&keys(&id, &typed)).await,
+        Response::Ok
+    ));
+    let mut relayed = Vec::new();
+    let mut buf = [0u8; 4096];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !relayed.windows(4).any(|w| w == b"\x1b[6n") {
+            let n = reader.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the attach ended");
+            relayed.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await
+    .expect("the query was not relayed");
+    writer.write_all(b"\x1b[3;4R").await.unwrap();
+    assert_eq!(written(&out).await, "3;4");
+
+    // Detached: the daemon's again.
+    drop((reader, writer));
+    for _ in 0..250 {
+        if conn.shells().await[0].viewers == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(conn.shells().await[0].viewers, 0);
+    assert_eq!(
+        run_in(&mut conn, &id, ask, &root.join("again")).await,
+        "7;12"
+    );
+    conn.request(&Request::Shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_a_shell_leaves_no_job_behind() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();

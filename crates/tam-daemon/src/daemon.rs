@@ -23,7 +23,7 @@ use crate::inbox::{self, Handover, Inbox, ReplyOutcome};
 use crate::ledger::{ChatSession, Ledger, Owner};
 use crate::notify::{self, Notification, NotifyConfig};
 use crate::provider;
-use crate::pty::Pty;
+use crate::pty::{write_pty, Pty};
 use crate::sessions;
 use crate::shell::{self, Place, Shell};
 use crate::worktrees::{self, Checked, Observation, Recorded, Removal};
@@ -2626,18 +2626,6 @@ async fn handle_wait_inbox(
         }
     }
     Ok(())
-}
-
-/// Write all of `data` to a PTY master.
-fn write_pty(fd: &OwnedFd, mut data: &[u8]) -> bool {
-    while !data.is_empty() {
-        match nix::unistd::write(fd, data) {
-            Ok(n) => data = &data[n..],
-            Err(nix::errno::Errno::EINTR) | Err(nix::errno::Errno::EAGAIN) => continue,
-            Err(_) => return false,
-        }
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------

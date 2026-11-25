@@ -21,13 +21,16 @@ pub struct Terminal {
 }
 
 /// Parser callbacks: count the rows dropped from the top of the main
-/// screen's history, to number lines (see [`ScreenInfo`]), and keep the
-/// input modes the parser doesn't.
+/// screen's history, to number lines (see [`ScreenInfo`]), keep the input
+/// modes the parser doesn't, and answer the program's queries.
 #[derive(Default)]
 struct Lines {
     dropped: u64,
     /// The agent asked for focus events (`CSI ? 1004 h`).
     focus_reporting: bool,
+    /// What a terminal answers to the queries in the output fed so far, in
+    /// order, until [`Terminal::feed`] hands it over.
+    answers: Vec<u8>,
 }
 
 /// DEC private mode: report focus in and out.
@@ -42,7 +45,7 @@ impl vt100::Callbacks for Lines {
 
     fn unhandled_csi(
         &mut self,
-        _screen: &mut vt100::Screen,
+        screen: &mut vt100::Screen,
         i1: Option<u8>,
         _i2: Option<u8>,
         params: &[&[u16]],
@@ -52,6 +55,24 @@ impl vt100::Callbacks for Lines {
             match c {
                 'h' => self.focus_reporting = true,
                 'l' => self.focus_reporting = false,
+                _ => {}
+            }
+        }
+        // Device status reports (DSR), answered where they come in the
+        // output: programs wait for them (`fzf --height` reads the cursor
+        // position before it draws anything).
+        if i1.is_none() && c == 'n' {
+            match params {
+                // Status: ready.
+                [[5]] => self.answers.extend_from_slice(b"\x1b[0n"),
+                // Cursor position, 1-based. Past the last column (a wrap
+                // pending) is the last column, as xterm says.
+                [[6]] => {
+                    let (row, col) = screen.cursor_position();
+                    let last = screen.size().1.get() - 1;
+                    let answer = format!("\x1b[{};{}R", row + 1, col.min(last) + 1);
+                    self.answers.extend_from_slice(answer.as_bytes());
+                }
                 _ => {}
             }
         }
@@ -70,9 +91,12 @@ impl Terminal {
         }
     }
 
-    /// Process output of the agent.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Process output of the agent. Returns what a terminal answers to the
+    /// queries in it (the cursor position, the status), for the program's
+    /// input: empty for most output.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.guarded(|parser| parser.process(bytes));
+        std::mem::take(&mut self.parser.callbacks_mut().answers)
     }
 
     /// Follow a resize of the PTY. Sizes are at least 1×1.
@@ -179,6 +203,7 @@ impl Terminal {
         let lines = Lines {
             dropped: callbacks.dropped + screen.scrollback_len() as u64,
             focus_reporting: callbacks.focus_reporting,
+            answers: Vec::new(),
         };
         self.parser = parser(cols.get(), rows.get(), self.history, lines);
     }
@@ -466,6 +491,22 @@ mod tests {
         assert!(t.replay().contains("\x1b[?1004h"));
         t.feed(b"\x1b[?1004l");
         assert!(!t.replay().contains("\x1b[?1004h"));
+    }
+
+    #[test]
+    fn the_cursor_position_and_the_status_are_answered_where_asked() {
+        let mut t = Terminal::new(10, 4);
+        assert_eq!(t.feed(b"ab\r\ncd"), b"");
+        // Where the query comes in the output, not where the chunk ends.
+        assert_eq!(t.feed(b"\x1b[6nmore\x1b[5n"), b"\x1b[2;3R\x1b[0n");
+        // Handed over once.
+        assert_eq!(t.feed(b"x"), b"");
+        // A wrap pending after the last column: that column.
+        t.feed(b"\x1b[4;1H0123456789");
+        assert_eq!(t.feed(b"\x1b[6n"), b"\x1b[4;10R");
+        // Other queries go unanswered: device attributes, the DEC form of
+        // the cursor position, colours.
+        assert_eq!(t.feed(b"\x1b[c\x1b[>c\x1b[?6n\x1b]11;?\x07"), b"");
     }
 
     #[test]

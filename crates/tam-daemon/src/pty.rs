@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -203,11 +203,12 @@ impl Pty {
                 screen_changed: screen_changed.clone(),
                 output_tx: output_tx.clone(),
                 last_output_at: last_output_at.clone(),
+                answers: None,
             };
             let master = master.clone();
             std::thread::Builder::new()
                 .name("pty-reader".to_string())
-                .spawn(move || reader.run(master.as_raw_fd()))
+                .spawn(move || reader.run(master))
                 .context("failed to spawn PTY reader thread")?
         };
 
@@ -398,12 +399,28 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Write all of `data` to a PTY's master: input for its process. Whether
+/// it was written. Blocks while the process reads none of its input.
+pub fn write_pty(fd: &OwnedFd, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        match nix::unistd::write(fd, data) {
+            Ok(n) => data = &data[n..],
+            Err(nix::errno::Errno::EINTR) | Err(nix::errno::Errno::EAGAIN) => continue,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Where the PTY reader takes the process's output.
 struct PtyReader {
     terminal: Arc<Mutex<Terminal>>,
     screen_changed: watch::Sender<()>,
     output_tx: broadcast::Sender<Vec<u8>>,
     last_output_at: Arc<Mutex<Instant>>,
+    /// To the thread writing the terminal's answers to the process's
+    /// queries, started at the first one.
+    answers: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl PtyReader {
@@ -411,19 +428,31 @@ impl PtyReader {
     /// arrived, feeds the terminal, and broadcasts it to any attached
     /// clients. Exits when the PTY slave side is closed (the process and
     /// all it started that kept the terminal are gone).
-    fn run(self, master_fd: i32) {
+    fn run(mut self, master: Arc<OwnedFd>) {
         let mut buf = [0u8; 4096];
         loop {
-            match nix::unistd::read(master_fd, &mut buf) {
+            match nix::unistd::read(master.as_raw_fd(), &mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     let data = buf[..n].to_vec();
                     *lock(&self.last_output_at) = Instant::now();
-                    {
+                    let answers = {
                         let mut terminal = lock(&self.terminal);
-                        terminal.feed(&data);
+                        let answers = terminal.feed(&data);
                         // Ignore send errors (no receivers is fine)
                         let _ = self.output_tx.send(data);
+                        // An attached viewer's terminal answers the queries
+                        // it is relayed (its input comes back to the PTY):
+                        // one answer each. Viewers attach under this lock,
+                        // so each chunk goes to them or is answered here.
+                        if self.output_tx.receiver_count() == 0 {
+                            answers
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !answers.is_empty() {
+                        self.answer(&master, answers);
                     }
                     self.screen_changed.send_replace(());
                 }
@@ -434,6 +463,36 @@ impl PtyReader {
                     break;
                 }
             }
+        }
+    }
+
+    /// Have `answers` written to the process's input, after those before
+    /// them. Not by the reader: it alone drains the process's output, and a
+    /// process that reads none of its input would block it.
+    fn answer(&mut self, master: &Arc<OwnedFd>, answers: Vec<u8>) {
+        if self.answers.is_none() {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            let master = master.clone();
+            let writer = std::thread::Builder::new()
+                .name("pty-answers".to_string())
+                .spawn(move || {
+                    // Ends with the reader (the sender goes) or the PTY.
+                    for answer in rx {
+                        if !write_pty(&master, &answer) {
+                            break;
+                        }
+                    }
+                });
+            match writer {
+                Ok(_) => self.answers = Some(tx),
+                Err(e) => {
+                    error!("failed to spawn the PTY answer thread: {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(tx) = &self.answers {
+            let _ = tx.send(answers);
         }
     }
 }

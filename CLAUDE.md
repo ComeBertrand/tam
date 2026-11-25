@@ -601,11 +601,29 @@ adopt). `tam-cli` depends on all three.
   filter (task, member names, repositories, branches; the list's order
   kept) and ranks the picker, with positions to highlight. `?` is
   `Mode::Help` (custom commands included; any key or click closes). The
-  mouse: `mouse_capture` turns on click and wheel reports only (`?1000`,
-  SGR `?1006`: no motion), off before attaching (before the input reader
-  pauses: a report must never reach the agent) and back after.
-  `handle_mouse` uses `App::hits`, where the last draw put the list's rows
-  (entry index, member), the pane and the picker's items. Input events are
+  mouse: `mouse_capture` turns on click, wheel and drag reports (`?1002`:
+  motion only while a button is down; SGR `?1006`), off before attaching
+  (before the input reader pauses: a report must never reach the agent)
+  and back after. `handle_mouse` uses `App::hits`, where the last draw put
+  the list's rows (entry index, member), the pane and the picker's items,
+  and `Peek::area`, where the agent's screen was drawn. Selecting text in
+  the pane is the dashboard's (`select_text`, `peek::Selection`): a
+  terminal's own selection (shift-drag) dies at the next redraw (kitty
+  drops it when anything is drawn on a line it spans: a spinner, the
+  agent's status line). The left button dragged over the screen selects
+  (in `Normal`, `Terminal` and `Scroll`, through the list too, clamped to
+  the screen), cells from the one it went down on to the one it is on,
+  both included, kept as `peek::Spot`s (line numbers, so the selection
+  stays on its text as the output scrolls; a resize drops it); drawn in
+  reverse video (`Peek::draw_selection`: a modifier, no colour behind the
+  agent's screen). Letting go is `Action::Copy` (`Peek::selected_text`:
+  vt100's `contents_between`, wrapped rows joined, a wide character
+  whole, blanks copy nothing; what the window has: `Peek::selection_cut`
+  when part of it scrolled out, said after the count): `copy` writes OSC
+  52 to the clipboard and the primary selection (`osc52`, its own
+  `base64`) and says `Copied 3 lines` (the terminal never says whether it
+  did). A click alone copies nothing; the next click
+  or key (`handle_key_event`) takes the selection away. Input events are
   handled in batches (all those queued, then one draw); the screen is
   fetched again once per batch (`screen_moved`). `n` opens the picker at
   once (`start_pick_project`, with `App::projects` from last time);
@@ -975,6 +993,15 @@ cargo test
   shell closing while selected and while typed in, custom commands and the
   keys they took. Opening, typing into and closing one against a live
   daemon: by hand in a sandbox (see Testing hooks by hand).
+- Selecting text in the pane: `peek.rs` (a drag, up or down, its text,
+  its reverse video following the output as it scrolls, cut once a
+  line left the window, a resize dropping it; a click or blanks selecting nothing, a drag past the
+  edges, a wrapped line joined, half a wide character), `mod.rs`
+  (`handle_mouse` down, drag through the list, up: `Action::Copy`; the
+  next key or click taking it away; while typing; `base64`, `osc52`).
+  The bytes: in the sandbox (Testing hooks by hand), the dashboard
+  spawned through `script -qfc tam LOG`, SGR drag reports typed with
+  `Keys`, then `]52;c;` in the log; what the terminal does: by hand.
 - Shells: the daemon's `shells.rs` (real repositories; `sh`, or scripts
   standing for a shell, on the caller's `PATH`): open on a member and a
   checkout, list order, numbers (#1 closed with #2 open: #3; all closed:

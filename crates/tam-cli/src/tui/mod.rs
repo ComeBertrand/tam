@@ -46,6 +46,12 @@ enum Action {
     Quit,
     SelectNext,
     SelectPrev,
+    /// Put text selected in the pane on the clipboard (`cut`: part of it
+    /// had scrolled out of reach, see `Peek::selection_cut`).
+    Copy {
+        text: String,
+        cut: bool,
+    },
     /// Attach to a member's or chat's agent (`id`: the member's or chat's).
     Attach {
         id: String,
@@ -234,15 +240,16 @@ fn keyboard_protocol(on: bool) {
     let _ = out.flush();
 }
 
-/// Have the terminal report mouse clicks and the wheel (`?1000`: no
-/// motion), with SGR coordinates (`?1006`), or stop. Off while attached:
-/// the agent would get the reports as typed text.
+/// Have the terminal report mouse clicks, the wheel and drags (`?1002`:
+/// motion only while a button is down, to select text in the pane), with
+/// SGR coordinates (`?1006`), or stop. Off while attached: the agent would
+/// get the reports as typed text.
 fn mouse_capture(on: bool) {
     use std::io::Write;
     let seq = if on {
-        "\x1b[?1000h\x1b[?1006h"
+        "\x1b[?1002h\x1b[?1006h"
     } else {
-        "\x1b[?1006l\x1b[?1000l"
+        "\x1b[?1006l\x1b[?1002l"
     };
     let mut out = std::io::stdout();
     let _ = out.write_all(seq.as_bytes());
@@ -448,6 +455,7 @@ async fn run_loop(
                 Action::Quit => return Ok(()),
                 Action::SelectNext => app.select_next(),
                 Action::SelectPrev => app.select_prev(),
+                Action::Copy { text, cut } => copy(app, &text, cut),
                 Action::Attach { id, label } => {
                     attach(terminal, app, client, &mut input, &id, &label).await?;
                     screen_moved = true;
@@ -611,6 +619,8 @@ async fn type_keys(client: &mut Client, app: &mut App, id: String, bytes: &[u8])
 // ---------------------------------------------------------------------------
 
 fn handle_key_event(key: KeyEvent, app: &mut App, config: &Config) -> Action {
+    // Copied already: the next key takes it away, as the next click does.
+    app.peek.selection = None;
     // Typed for an agent the pane no longer has the keyboard for.
     if !matches!(app.mode, Mode::Terminal { .. }) && app.drops_key() {
         return Action::None;
@@ -1122,6 +1132,14 @@ fn handle_enter_path_key(key: KeyEvent, app: &mut App) -> Action {
 fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
     let at = ratatui::layout::Position::new(mouse.column, mouse.row);
     let click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    if matches!(
+        app.mode,
+        Mode::Normal | Mode::Terminal { .. } | Mode::Scroll { .. }
+    ) {
+        if let Some(action) = select_text(mouse, app) {
+            return action;
+        }
+    }
     match &mut app.mode {
         Mode::Normal => {}
         // A click in the list gives it the keyboard back; the wheel scrolls
@@ -1174,6 +1192,84 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) -> Action {
         }
         _ => Action::None,
     }
+}
+
+/// Text selected in the pane (`peek::Selection`): the left button drags
+/// over the agent's screen, letting go copies. A click anywhere takes the
+/// last selection away; in the pane, nothing else. `None`: the event is
+/// not the selection's.
+fn select_text(mouse: MouseEvent, app: &mut App) -> Option<Action> {
+    let (x, y) = (mouse.column, mouse.row);
+    let peek = &mut app.peek;
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            peek.selection = None;
+            peek.select_from(x, y).then_some(Action::None)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => peek.select_to(x, y).then_some(Action::None),
+        MouseEventKind::Up(MouseButton::Left) if peek.selection.is_some_and(|s| s.dragging) => {
+            Some(match peek.select_end(x, y) {
+                Some(text) => Action::Copy {
+                    cut: peek.selection_cut(),
+                    text,
+                },
+                None => Action::None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Put `text` on the clipboard and in the primary selection, through the
+/// terminal: OSC 52, which kitty, WezTerm, Alacritty, foot and others take
+/// (tmux with `set-clipboard on`), over ssh too. Whether it did, the
+/// terminal does not say.
+fn copy(app: &mut App, text: &str, cut: bool) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(osc52(text).as_bytes());
+    let _ = out.flush();
+    let mut status = copied(text);
+    if cut {
+        status.push_str(" (the rest had scrolled out of reach)");
+    }
+    app.set_status(status, Duration::from_secs(3));
+}
+
+fn osc52(text: &str) -> String {
+    let data = base64(text.as_bytes());
+    format!("\x1b]52;c;{data}\x1b\\\x1b]52;p;{data}\x1b\\")
+}
+
+/// What the status line says once `text` is copied.
+fn copied(text: &str) -> String {
+    match text.lines().count() {
+        0 | 1 => match text.chars().count() {
+            1 => "Copied 1 character".into(),
+            n => format!("Copied {n} characters"),
+        },
+        n => format!("Copied {n} lines"),
+    }
+}
+
+/// Standard base64, padded (RFC 4648), as OSC 52 wants it.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// `y`/enter: drop, keeping the branch; `b`: drop and delete the branch;
@@ -4787,6 +4883,129 @@ mod tests {
         app.mode = Mode::Help;
         handle_mouse(mouse(click, 0, 0), &mut app);
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn text_dragged_over_in_the_pane_is_copied_when_let_go() {
+        use tam_proto::AgentState::Working;
+        let mut app = two_member_app(&[("m-1", Working)]);
+        app.sync_focus();
+        assert_eq!(app.peek_agent().as_deref(), Some("m-1"));
+        let size = |n| std::num::NonZeroU16::new(n).unwrap();
+        let mut vt = vt100::Parser::new(size(5), size(80), 0);
+        vt.process(b"\x1b[?25lline 10\r\nline 11\r\nline 12");
+        app.peek = Peek {
+            agent: Some("m-1".into()),
+            ..Default::default()
+        };
+        app.peek.set_screen(&tam_proto::ScreenInfo {
+            cols: 80,
+            rows: 5,
+            contents: vt.screen().contents_formatted(),
+            top: 10,
+            oldest: 0,
+            live: 10,
+        });
+        let config = Config::default();
+        let (down, drag, up) = (
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        );
+        // What the dashboard draws: the selection in reverse video.
+        let drawn = |app: &mut App| {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| ui::render(f, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        drawn(&mut app);
+        let area = app.peek.area;
+        assert!(!area.is_empty(), "the pane shows the agent's screen");
+        let list = app.hits.list;
+
+        // From the "1" of line 10 to the end of line 12, through the list
+        // (the drag stays the selection's: the list's selection stays).
+        let start = mouse(down, area.x + 5, area.y);
+        assert!(matches!(handle_mouse(start, &mut app), Action::None));
+        handle_mouse(mouse(drag, area.x + 3, area.y + 1), &mut app);
+        handle_mouse(mouse(drag, 10, list.y + 4), &mut app);
+        assert_eq!(app.selected_task().unwrap().name, "feat");
+        let end = mouse(up, area.x + 6, area.y + 2);
+        let Action::Copy { text, cut: false } = handle_mouse(end, &mut app) else {
+            panic!("letting go copies, all of it");
+        };
+        assert_eq!(text, "10\nline 11\nline 12");
+        assert_eq!(copied(&text), "Copied 3 lines");
+        let buf = drawn(&mut app);
+        let reversed = |buf: &ratatui::buffer::Buffer, x, y| {
+            buf[(area.x + x, area.y + y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        };
+        assert!(!reversed(&buf, 4, 0));
+        assert!(reversed(&buf, 5, 0));
+        assert!(reversed(&buf, 6, 2));
+        assert!(!reversed(&buf, 7, 2));
+        // The next key takes it away.
+        handle_key_event(press('?'), &mut app, &config);
+        app.mode = Mode::Normal;
+        assert_eq!(app.peek.selection, None);
+        assert!(!reversed(&drawn(&mut app), 5, 0));
+
+        // So does the next click; a click alone copies nothing.
+        handle_mouse(mouse(down, area.x, area.y), &mut app);
+        handle_mouse(mouse(up, area.x + 4, area.y), &mut app);
+        assert!(app.peek.selection.is_some());
+        assert!(matches!(
+            handle_mouse(mouse(down, area.x + 1, area.y + 1), &mut app),
+            Action::None
+        ));
+        assert!(matches!(
+            handle_mouse(mouse(up, area.x + 1, area.y + 1), &mut app),
+            Action::None
+        ));
+        assert_eq!(app.peek.selection, None);
+        // Nor does letting go of a drag that started in the list.
+        handle_mouse(mouse(down, 10, list.y + 1), &mut app);
+        handle_mouse(mouse(drag, area.x, area.y), &mut app);
+        assert!(matches!(
+            handle_mouse(mouse(up, area.x + 4, area.y), &mut app),
+            Action::None
+        ));
+
+        // Typing into the pane: a drag selects there too, the keyboard
+        // stays with the pane, and a click in the list still leaves it.
+        app.mode = Mode::Terminal {
+            agent: "m-1".into(),
+        };
+        handle_mouse(mouse(down, area.x, area.y + 1), &mut app);
+        assert!(matches!(
+            handle_mouse(mouse(up, area.x + 3, area.y + 1), &mut app),
+            Action::Copy { text, .. } if text == "line"
+        ));
+        assert!(matches!(app.mode, Mode::Terminal { .. }));
+        handle_mouse(mouse(down, 10, list.y + 1), &mut app);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.peek.selection, None);
+    }
+
+    #[test]
+    fn copying_goes_through_the_terminal_in_base64() {
+        for (text, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foobar", "Zm9vYmFy"),
+            ("漢\n", "5ryiCg=="),
+        ] {
+            assert_eq!(base64(text.as_bytes()), encoded, "{text:?}");
+        }
+        // The clipboard, then the primary selection.
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x1b\\\x1b]52;p;aGk=\x1b\\");
+        assert_eq!(copied("a"), "Copied 1 character");
+        assert_eq!(copied("漢b"), "Copied 2 characters");
     }
 
     #[test]

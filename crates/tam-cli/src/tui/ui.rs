@@ -45,6 +45,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     render_tasks(frame, table_area, app);
     app.hits.pane = pane;
+    if pane.is_none() {
+        app.peek.area = Rect::default();
+    }
     if let Some(pane) = pane {
         // Out of the app while drawn: the pane reads the rest of it.
         let mut peek = std::mem::take(&mut app.peek);
@@ -678,6 +681,7 @@ fn render_pane(frame: &mut Frame, area: Rect, app: &App, peek: &mut Peek) {
         inner,
     );
     peek.height = 0;
+    peek.area = Rect::default();
 }
 
 /// When a chat in its last day closes, and how to keep it (when `p` is the
@@ -745,6 +749,8 @@ fn border_path(area: Rect) -> (Vec<(u16, u16, usize)>, usize) {
 /// at the area's right edge.
 fn render_screen(frame: &mut Frame, area: Rect, peek: &mut Peek, typing: bool) {
     peek.height = area.height;
+    // Set where a screen is drawn: nothing to select otherwise.
+    peek.area = Rect::default();
     let message = match (&peek.agent, &peek.screen, &peek.error) {
         (None, _, _) => "(no agent running)".to_string(),
         (Some(_), Some(screen), _) => {
@@ -754,6 +760,8 @@ fn render_screen(frame: &mut Frame, area: Rect, peek: &mut Peek, typing: bool) {
                 first,
             };
             frame.render_widget(view, area);
+            peek.area = area;
+            peek.draw_selection(frame.buffer_mut());
             // The agent's cursor, where typing goes (on its live screen).
             if let Some((row, col)) = screen.cursor().filter(|_| typing && peek.from.is_none()) {
                 if row >= first && row - first < area.height && col < area.width {

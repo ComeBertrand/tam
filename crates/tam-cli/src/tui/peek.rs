@@ -38,6 +38,45 @@ pub struct Peek {
     /// The size last asked for the agent's terminal: asked once, so that
     /// two dashboards of different sizes do not fight over it.
     pub asked: Option<(u16, u16)>,
+    /// Where the agent's screen was drawn at the last draw (empty when the
+    /// pane showed none): where the mouse selects.
+    pub area: Rect,
+    /// Text selected with the mouse.
+    pub selection: Option<Selection>,
+}
+
+/// A cell of the agent's screen: its line (numbered as in `ScreenInfo`:
+/// a line keeps its number as it scrolls) and its column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Spot {
+    pub line: u64,
+    pub col: u16,
+}
+
+/// Text selected with the mouse in the pane, from the cell the button went
+/// down on to the one it is on (or was let go on), both included, in
+/// reading order. The dashboard's own: a terminal drops its selection when
+/// anything is drawn on its lines (kitty: on any of the lines it spans),
+/// and the dashboard redraws while an agent works. On lines, so it stays on
+/// its text as the agent's output scrolls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: Spot,
+    pub head: Spot,
+    /// The button is still down.
+    pub dragging: bool,
+}
+
+impl Selection {
+    /// Its first and last cells.
+    fn bounds(&self) -> (Spot, Spot) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+
+    fn contains(&self, spot: Spot) -> bool {
+        let (first, last) = self.bounds();
+        first <= spot && spot <= last
+    }
 }
 
 /// How to move through an agent's screen and history.
@@ -63,6 +102,8 @@ impl Peek {
             .is_some_and(|s| s.size() != screen.size() || screen.live < s.live)
         {
             self.from = None;
+            // Its lines are no longer those numbered so.
+            self.selection = None;
         }
         // The lines scrolled back to may have left the history.
         if let Some(from) = &mut self.from {
@@ -128,6 +169,133 @@ impl Peek {
             Scroll::Oldest => self.from,
             Scroll::Live => None,
         };
+    }
+
+    /// The cell of the agent's screen drawn at `(x, y)`; outside the
+    /// screen's area (a drag past the pane's edge), the nearest one.
+    fn spot_at(&self, x: u16, y: u16) -> Option<Spot> {
+        let screen = self.screen.as_ref()?;
+        let area = self.area;
+        let (rows, cols) = screen.size();
+        let width = area.width.min(cols);
+        if width == 0 || area.height == 0 {
+            return None;
+        }
+        let x = x.clamp(area.x, area.x + width - 1);
+        let y = y.clamp(area.y, area.bottom() - 1);
+        let first = screen.first_row(self.from, area.height);
+        let row = (first + (y - area.y)).min(rows - 1);
+        Some(Spot {
+            line: screen.top + u64::from(row),
+            col: x - area.x,
+        })
+    }
+
+    /// The button went down at `(x, y)`: on the agent's screen, a new
+    /// selection, empty until dragged (`false` elsewhere).
+    pub fn select_from(&mut self, x: u16, y: u16) -> bool {
+        let on_screen = self.area.contains(ratatui::layout::Position::new(x, y));
+        let Some(spot) = self.spot_at(x, y).filter(|_| on_screen) else {
+            return false;
+        };
+        self.selection = Some(Selection {
+            anchor: spot,
+            head: spot,
+            dragging: true,
+        });
+        true
+    }
+
+    /// Dragged to `(x, y)`: `false` when no selection is being made.
+    pub fn select_to(&mut self, x: u16, y: u16) -> bool {
+        let spot = self.spot_at(x, y);
+        let Some(selection) = self.selection.as_mut().filter(|s| s.dragging) else {
+            return false;
+        };
+        if let Some(spot) = spot {
+            selection.head = spot;
+        }
+        true
+    }
+
+    /// Let go at `(x, y)`: the text selected. A click alone selects nothing
+    /// (nor do blanks), and leaves no selection.
+    pub fn select_end(&mut self, x: u16, y: u16) -> Option<String> {
+        self.select_to(x, y);
+        let selection = self.selection.as_mut().filter(|s| s.dragging)?;
+        selection.dragging = false;
+        let text = (selection.anchor != selection.head)
+            .then(|| self.selected_text())
+            .flatten();
+        if text.is_none() {
+            self.selection = None;
+        }
+        text
+    }
+
+    /// Part of the selection is out of the window the pane has (scrolled
+    /// into history while dragging, the output or the wheel moving it):
+    /// `selected_text` has the rest only.
+    pub fn selection_cut(&self) -> bool {
+        let (Some(screen), Some(selection)) = (&self.screen, self.selection) else {
+            return false;
+        };
+        let (first, last) = selection.bounds();
+        first.line < screen.top || last.line >= screen.top + u64::from(screen.size().0)
+    }
+
+    /// The selected text the screen has: wrapped rows joined, no blanks
+    /// at the end of a line. `None` when it is all blank.
+    pub fn selected_text(&self) -> Option<String> {
+        let (screen, selection) = (self.screen.as_ref()?, self.selection?);
+        let (first, last) = selection.bounds();
+        let (rows, cols) = screen.size();
+        let top = screen.top;
+        let bottom = top + u64::from(rows) - 1;
+        if last.line < top || first.line > bottom {
+            return None;
+        }
+        let (start_row, mut start_col) = match first.line.checked_sub(top) {
+            Some(row) => (row as u16, first.col),
+            None => (0, 0),
+        };
+        let (end_row, end_col) = if last.line > bottom {
+            (rows - 1, cols)
+        } else {
+            ((last.line - top) as u16, last.col + 1)
+        };
+        // Half of a wide character: all of it.
+        let vt = screen.screen();
+        if start_col > 0
+            && vt
+                .cell(start_row, start_col)
+                .is_some_and(vt100::Cell::is_wide_continuation)
+        {
+            start_col -= 1;
+        }
+        let text = vt.contents_between(start_row, start_col, end_row, end_col.min(cols));
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// The selection over the screen as drawn in `area`: its cells in
+    /// reverse video, as terminals show theirs (the theme paints nothing
+    /// behind the agent's screen).
+    pub fn draw_selection(&self, buf: &mut Buffer) {
+        let (Some(screen), Some(selection)) = (&self.screen, self.selection) else {
+            return;
+        };
+        let area = self.area;
+        let first = screen.first_row(self.from, area.height);
+        let (rows, cols) = screen.size();
+        let width = area.width.min(cols);
+        for (y, row) in (area.y..area.bottom()).zip(first..rows) {
+            let line = screen.top + u64::from(row);
+            for col in 0..width {
+                if selection.contains(Spot { line, col }) {
+                    buf[(area.x + col, y)].modifier.toggle(Modifier::REVERSED);
+                }
+            }
+        }
     }
 }
 
@@ -484,6 +652,110 @@ mod tests {
         p.scroll(Scroll::Up(1));
         p.scroll(Scroll::Oldest);
         assert_eq!(p.from, None);
+    }
+
+    /// `p` drawn in `area` (where the mouse finds it), its selection over.
+    fn drawn(p: &mut Peek, area: Rect) -> Buffer {
+        p.area = area;
+        p.height = area.height;
+        let mut buf = Buffer::empty(Rect::new(0, 0, area.right() + 2, area.bottom() + 2));
+        let screen = p.screen.as_ref().unwrap();
+        ScreenView {
+            screen: screen.screen(),
+            first: screen.first_row(p.from, area.height),
+        }
+        .render(area, &mut buf);
+        p.draw_selection(&mut buf);
+        buf
+    }
+
+    /// The columns of row `y` of `area` drawn in reverse video.
+    fn reversed(buf: &Buffer, area: Rect, y: u16) -> Vec<u16> {
+        (0..area.width)
+            .filter(|&x| {
+                buf[(area.x + x, area.y + y)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_drag_selects_text_that_stays_on_its_lines() {
+        // Lines 10-13 read "line 1" to "line 4", drawn from (2, 1).
+        let mut p = peek(
+            &info(20, 4, &format!("\x1b[?25l{}", rows(1..=4)), 10, 0, 10),
+            4,
+        );
+        let area = Rect::new(2, 1, 20, 4);
+        drawn(&mut p, area);
+        // From the "1" of line 10 to the "e" of line 12, both included.
+        assert!(p.select_from(2 + 5, 1));
+        assert!(p.select_to(2 + 3, 1 + 2));
+        assert_eq!(
+            p.select_end(2 + 3, 1 + 2).as_deref(),
+            Some("1\nline 2\nline")
+        );
+        let buf = drawn(&mut p, area);
+        assert_eq!(reversed(&buf, area, 0), (5..20).collect::<Vec<_>>());
+        assert_eq!(reversed(&buf, area, 1), (0..20).collect::<Vec<_>>());
+        assert_eq!(reversed(&buf, area, 2), [0, 1, 2, 3]);
+        assert!(reversed(&buf, area, 3).is_empty());
+        // Upwards: the same text.
+        assert!(p.select_from(2 + 3, 1 + 2));
+        assert_eq!(p.select_end(2 + 5, 1).as_deref(), Some("1\nline 2\nline"));
+        assert!(!p.selection_cut());
+
+        // More output scrolls the screen a line up: the selection goes
+        // with its text, and has what the screen still shows.
+        p.set_screen(&info(
+            20,
+            4,
+            &format!("\x1b[?25l{}", rows(2..=5)),
+            11,
+            0,
+            11,
+        ));
+        let buf = drawn(&mut p, area);
+        assert_eq!(reversed(&buf, area, 0), (0..20).collect::<Vec<_>>());
+        assert_eq!(reversed(&buf, area, 1), [0, 1, 2, 3]);
+        assert!(reversed(&buf, area, 2).is_empty());
+        assert_eq!(p.selected_text().as_deref(), Some("line 2\nline"));
+        assert!(p.selection_cut(), "line 10 left the window");
+        // A resize: the lines are no longer those numbered so.
+        p.set_screen(&info(30, 4, &rows(2..=5), 11, 0, 11));
+        assert_eq!(p.selection, None);
+    }
+
+    #[test]
+    fn a_selection_takes_whole_characters_and_joins_wrapped_rows() {
+        let area = Rect::new(0, 0, 10, 3);
+        // A click alone selects nothing, and leaves no selection.
+        let mut p = peek(&info(10, 3, "abcdefghijklmno", 0, 0, 0), 3);
+        drawn(&mut p, area);
+        assert!(p.select_from(3, 0));
+        assert_eq!(p.select_end(3, 0), None);
+        assert_eq!(p.selection, None);
+        // Nor does a drag over blanks.
+        assert!(p.select_from(0, 2));
+        assert_eq!(p.select_end(5, 2), None);
+        // Outside the screen, a click starts nothing, a drag nothing either.
+        assert!(!p.select_from(10, 0));
+        assert!(!p.select_to(5, 1));
+        // A row the line wraps from: one line.
+        assert!(p.select_from(2, 0));
+        assert_eq!(p.select_end(1, 1).as_deref(), Some("cdefghijkl"));
+        // Dragged past the pane's edges: to its last cell, then its first.
+        assert!(p.select_from(2, 0));
+        assert!(p.select_to(40, 40));
+        assert_eq!(p.selection.unwrap().head, Spot { line: 2, col: 9 });
+        assert_eq!(p.select_end(0, 0).as_deref(), Some("abc"));
+
+        // From the second half of a wide character: all of it.
+        let mut p = peek(&info(10, 2, "a漢b c", 0, 0, 0), 2);
+        drawn(&mut p, Rect::new(0, 0, 10, 2));
+        assert!(p.select_from(2, 0));
+        assert_eq!(p.select_end(3, 0).as_deref(), Some("漢b"));
     }
 
     #[test]

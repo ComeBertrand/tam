@@ -6,6 +6,15 @@ Rust workspace. Terminal agent multiplexer merging yawn (worktree management)
 and zinc (agent daemon) into a task-centric tool. The design is below (Key
 architecture patterns); decisions and what is left are in the GitHub issues.
 
+User documentation: `README.md` is for a first-time user only (what tam is,
+install, quick start, the dashboard's main keys, concepts, a command table,
+links); keep it short. The reference is `docs/`, one page per topic
+(`tasks`, `dashboard`, `chats`, `shells`, `collaboration`, `scripting`,
+`configuration`, `claude-code`, indexed by `docs/README.md`): a feature's
+documentation goes there, and the README at most links to it. The `--help`
+strings' "see README, Scripting" lands on the README's short Scripting
+section, which links to `docs/scripting.md`.
+
 ## Crate structure
 
 - `tam-proto`    — wire protocol types (daemon <-> client)
@@ -370,7 +379,7 @@ adopt). `tam-cli` depends on all three.
   `main` wraps `run` and reports the error, as a JSON document on stdout with
   `--json` unless the command printed it inside its own (`reported`). The JSON
   documents are view structs in `schema.rs`, never wire types: `schema_version` 1,
-  every key present (`null`), documented in the README (Scripting); a key removed
+  every key present (`null`), documented in `docs/scripting.md`; a key removed
   or retyped bumps the version, `ps --json` keeps its pre-version keys. `tam wait`
   is `WaitAgents` (a `dispatch` arm like `WaitReply`: events plus a 1s recheck,
   gives up on `exit`/`error` not waited for; `MemberState::satisfies`: `ready`

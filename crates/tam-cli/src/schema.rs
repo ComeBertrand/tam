@@ -3,7 +3,7 @@
 //! (`chat`, `close`, `rename`, `keep`) and of `shell`, version
 //! [`SCHEMA_VERSION`]. Built from
 //! the daemon's types but kept apart from them, so that the wire protocol
-//! can change without changing them. Documented in the README (Scripting):
+//! can change without changing them. Documented in `docs/scripting.md`:
 //! a change here is a change there.
 //!
 //! Every key is always present, `null` when it has no value.

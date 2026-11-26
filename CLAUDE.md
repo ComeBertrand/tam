@@ -13,7 +13,11 @@ links); keep it short. The reference is `docs/`, one page per topic
 `configuration`, `claude-code`, indexed by `docs/README.md`): a feature's
 documentation goes there, and the README at most links to it. The `--help`
 strings' "see README, Scripting" lands on the README's short Scripting
-section, which links to `docs/scripting.md`.
+section, which links to `docs/scripting.md`. Screenshots, recordings and the
+README's dashboard block come from `scripts/demo/` (a made-up world: three
+repositories, a separate daemon under `/tmp/tam-demo`, and `bin/claude`, a
+script that plays Claude's hooks through `tam hook-notify`), never from
+real work: a change to the hooks tam reads may need one there too.
 
 ## Crate structure
 

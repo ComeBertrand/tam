@@ -23,3 +23,5 @@ target
 # Nix
 result
 .direnv/
+scripts/demo/dashboard.png
+scripts/demo/dashboard.gif

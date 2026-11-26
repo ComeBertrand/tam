@@ -3,38 +3,39 @@
 Running `tam` with no arguments opens the dashboard:
 
 ```
- tam  4 chats  7 tasks  5 need you                                by repository
- STATUS          TASK                                          BRANCH  CTX
- chats ─────────────────────────────────────────────────────────────────────────
-▌◆ ready      2m Release deployment on staging                 backend  41% ━━━━
- ⠹ run       10s Why rounding differs between runs             backend  12% ━━━━
- ? question   5m Answering the support thread ∞                backend  63% ━━━━
- ○ idle       2d Chat design ◔                                 tam
- shells ────────────────────────────────────────────────────────────────────────
-                 Shell #1                                      backend
-                 Shell #1                                      frontend
- backend ───────────────────────────────────────────────────────────────────────
- ▲ block      3m fix-allotment-rounding                         ↑2 *1   67% ━━━━
+ tam  4 chats  8 tasks  6 need you                                 by repository
+ STATUS          TASK                                            BRANCH CTX
+ chats ──────────────────────────────────────────────────────────────────────────
+▌◆ ready      7s Release checklist for v2.4                      api     41% ━━━━
+ ⠸ run        7s Why are the e2e tests flaky?                    web     12% ━━━━
+ ? question   7s Postgres 17 upgrade plan ∞                      infra   63% ━━━━
+ ○ idle       2d Pricing page copy ◔                             web
+ shells ─────────────────────────────────────────────────────────────────────────
+                 Shell #1                                        api
+                 Shell #1                                        web
+ api ────────────────────────────────────────────────────────────────────────────
+ ▲ block     34s fix-rate-limit                                  ↑2 *1   67% ━━━━
                   ├ Shell #1
-                  └ Shell #3
- ⠹ run       20s perf                                           =       31% ━━━━
- ◌ stale     45d spike-cache                                    ↑5 ↓12
- backend + frontend ────────────────────────────────────────────────────────────
-                 unit-pricing
- ⠹ run        1m  ├ backend                                     ↑1 *3   12% ━━━━
+                  └ Shell #2
+ ⠸ run       34s perf-cache                                      =       31% ━━━━
+ ◌ stale     45d spike-graphql                                   ↑5 ↓12
+ api + web ──────────────────────────────────────────────────────────────────────
+                 checkout-v2
+ ⠸ run        8s  ├ api                                          ↑1 *3   12% ━━━━
                   │ └ Shell #1
- ? question   5m  └▸frontend                                    ↑1      40% ━━━━
- frontend ──────────────────────────────────────────────────────────────────────
- ○ idle       2d nav                                            =
+ ? question   7s  └ web                                          ↑1      40% ━━━━
+ infra ──────────────────────────────────────────────────────────────────────────
+ ✗ error      7s log-retention                                   ↑1      22% ━━━━
+ ◆ ready      7s terraform-upgrade                               ↑3 ↓1   55% ━━━━
+ web ────────────────────────────────────────────────────────────────────────────
+ ○ idle       2d dark-mode                                       =
  ∅ gone       3d old-banner
- rustpallet ────────────────────────────────────────────────────────────────────
- ◆ ready     12m offload-explain                                ↑3 ↓1   55% ━━━━
- enter:type  f:full screen  x:stop  d:close  p:keep  N:rename  !:shell here  n:new task  c:new chat  ?:help
+ enter:type  x:stop  d:close  p:keep  n:new task  c:new chat  ?:help  q:quit
 ```
 
 ## The list
 
-Tasks are grouped by repository (a task in several under one header naming them, e.g. `backend + frontend`), the most urgent first in each (blocked/question → error → ready → running → idle → stale → gone), then by name. `t` lists chats and tasks together, most urgent first across repositories, with a REPO column (a chat's BRANCH says `chat`); a task's shells stay below it, and those on main checkouts come last (their BRANCH says `shell`). A task with several members has a row per member below its own, which shows its name alone: each member's row has its status. A working agent's mark is a spinner, and CTX is how full its context is; `▸` marks the member the keys act on. Next to the status, how long it has been in it (without an agent: since the task's last activity). BRANCH compares each worktree with the default branch: `↑` commits ahead, `↓` behind, `*` paths with uncommitted changes, `=` none of them (`…` until git was asked). Git is asked, read-only and one worktree at a time, about every worktree once a minute and after its agent's state changes, and every 10 seconds about the one the pane shows. When the list is above the pane and at least 100 columns wide, a last column says what each member waits on. Columns the width cannot hold go first (what members wait on, then CTX, BRANCH, REPO and the time in a status), task names last.
+Tasks are grouped by repository (a task in several under one header naming them, e.g. `api + web`), the most urgent first in each (blocked/question → error → ready → running → idle → stale → gone), then by name. `t` lists chats and tasks together, most urgent first across repositories, with a REPO column (a chat's BRANCH says `chat`); a task's shells stay below it, and those on main checkouts come last (their BRANCH says `shell`). A task with several members has a row per member below its own, which shows its name alone: each member's row has its status. A working agent's mark is a spinner, and CTX is how full its context is; `▸` marks the member the keys act on. Next to the status, how long it has been in it (without an agent: since the task's last activity). BRANCH compares each worktree with the default branch: `↑` commits ahead, `↓` behind, `*` paths with uncommitted changes, `=` none of them (`…` until git was asked). Git is asked, read-only and one worktree at a time, about every worktree once a minute and after its agent's state changes, and every 10 seconds about the one the pane shows. When the list is above the pane and at least 100 columns wide, a last column says what each member waits on. Columns the width cannot hold go first (what members wait on, then CTX, BRANCH, REPO and the time in a status), task names last.
 
 ### Chats in the list
 
@@ -104,11 +105,11 @@ On a chat: `enter` types into it, starting its agent first when none runs (in th
 
 ## Shells
 
-`!` opens a shell where the selection is: in the worktree of the member the pane shows, on a chat's main checkout, or where the selected shell runs (another one there); `s` opens one on the main checkout of a repository you pick (in the picker `n` uses, one repository). The new shell is selected and has the keyboard at once. It runs in the environment the dashboard was started from, through `[spawn] wrapper` as an agent does, without `TAM_AGENT_ID`: what you type there is yours. It keeps running when you quit the dashboard, until it exits (`exit`, ctrl-d) or you close it; dropping its task or member closes it, and the drop dialog says how many shells go with it. A daemon restart closes every shell. On a shell: `enter` types into it (`ctrl-]` comes back to the list), `f` and `shift-enter` attach, `v` scrolls its history, `!` opens another one in the same place, `x` and `d` close it after you confirm (what runs in it stops; nothing on disk changes); `r`, `R`, `a`, `p` and `N` do nothing. The pane is its screen, titled with where it runs (`Shell #3 · fix-allotment-rounding`). A shell that closes while selected leaves the selection on its task.
+`!` opens a shell where the selection is: in the worktree of the member the pane shows, on a chat's main checkout, or where the selected shell runs (another one there); `s` opens one on the main checkout of a repository you pick (in the picker `n` uses, one repository). The new shell is selected and has the keyboard at once. It runs in the environment the dashboard was started from, through `[spawn] wrapper` as an agent does, without `TAM_AGENT_ID`: what you type there is yours. It keeps running when you quit the dashboard, until it exits (`exit`, ctrl-d) or you close it; dropping its task or member closes it, and the drop dialog says how many shells go with it. A daemon restart closes every shell. On a shell: `enter` types into it (`ctrl-]` comes back to the list), `f` and `shift-enter` attach, `v` scrolls its history, `!` opens another one in the same place, `x` and `d` close it after you confirm (what runs in it stops; nothing on disk changes); `r`, `R`, `a`, `p` and `N` do nothing. The pane is its screen, titled with where it runs (`Shell #2 · fix-rate-limit`). A shell that closes while selected leaves the selection on its task.
 
 ## Filter and prompts
 
-The filter and the project picker match fuzzily: the letters typed, in order, not necessarily together (`unpr` finds `unit-pricing`), the matched letters highlighted. The filter looks at task names and at each member's name, repository and branch, at a chat's name, title, id and repository, and at the repository of a shell on a main checkout (a shell in a worktree shows with its task) (`enter` keeps it, `esc` empties it with the task found still selected); the picker ranks the best matches first. In the filter, the picker and the name and path prompts, `←`/`→`, `home`/`end` and `ctrl-a`/`ctrl-e` move the cursor, `ctrl-←`/`ctrl-→` by word, `ctrl-w` deletes a word, `ctrl-u`/`ctrl-k` to the start/end. `n` opens the picker at once: the projects under `$HOME` are looked for in the background (those found last time show meanwhile).
+The filter and the project picker match fuzzily: the letters typed, in order, not necessarily together (`frl` finds `fix-rate-limit`), the matched letters highlighted. The filter looks at task names and at each member's name, repository and branch, at a chat's name, title, id and repository, and at the repository of a shell on a main checkout (a shell in a worktree shows with its task) (`enter` keeps it, `esc` empties it with the task found still selected); the picker ranks the best matches first. In the filter, the picker and the name and path prompts, `←`/`→`, `home`/`end` and `ctrl-a`/`ctrl-e` move the cursor, `ctrl-←`/`ctrl-→` by word, `ctrl-w` deletes a word, `ctrl-u`/`ctrl-k` to the start/end. `n` opens the picker at once: the projects under `$HOME` are looked for in the background (those found last time show meanwhile).
 
 ## Mouse and copying
 

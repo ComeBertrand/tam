@@ -37,10 +37,10 @@ name = "open in editor"
 key = "o"
 command = "code {dir}"                  # also {task}, {id}, {provider}: as for notify; {dir} is the worktree, or a chat's or shell's main checkout
 
-[[brief.patterns]]                      # tam new --brief CS-42, tam brief --set CS-42
-match = '^CS-(\d+)$'                    # a regular expression: the first one that matches applies
-reference = "https://tickets.example.com/CS-{1}"
-prompt = "/implement-task {brief}"      # the agents' start prompt for tam new without -p
+[[brief.patterns]]                      # tam new --brief SHOP-42, tam brief --set SHOP-42
+match = '^SHOP-(\d+)$'                    # a regular expression: the first one that matches applies
+reference = "https://tickets.example.com/SHOP-{1}"
+prompt = "/start-ticket {brief}"        # the agents' start prompt for tam new without -p
 ```
 
 ### Custom commands

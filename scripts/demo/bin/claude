@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# A scripted stand-in for Claude Code, for tam's demo (see ../README.md).
+#
+# tam starts it as it starts `claude`: `--settings JSON [--resume ID] [PROMPT]`,
+# with TAM_AGENT_ID and TAM_SOCKET set. It draws a made-up conversation and
+# plays the hooks Claude would fire, through the `tam hook-notify` command
+# found in the settings, so that tam shows the state the scene asks for.
+# It also writes a session transcript where Claude would, for the context
+# use (CTX) and a chat's title. DEMO_SCENE (from the environment of the
+# `tam` command that started it) picks the scene; anything typed into it
+# gets a short canned turn.
+#
+# bash 3.2 compatible (macOS).
+
+settings='' resume='' prompt=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --settings) settings=$2; shift 2 ;;
+    --resume) resume=$2; shift 2 ;;
+    --*) shift ;;
+    *) prompt=$1; shift ;;
+  esac
+done
+
+hook_cmd=$(printf '%s' "$settings" | sed -n 's/.*"command":"\([^"]*hook-notify\)".*/\1/p')
+[ -n "$hook_cmd" ] || hook_cmd='tam hook-notify'
+
+new_id() {
+  printf '%04x%04x-%04x-4%03x-a%03x-%04x%04x%04x' \
+    $RANDOM $RANDOM $RANDOM $((RANDOM % 4096)) $((RANDOM % 4096)) $RANDOM $RANDOM $RANDOM
+}
+session=${resume:-$(new_id)}
+project=$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')
+transcript="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$project/$session.jsonl"
+
+# JSON string contents: backslashes and quotes escaped.
+js() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# hook EVENT [JSON fields]: what Claude's hook would send tam.
+hook() {
+  printf '{"hook_event_name":"%s","session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' \
+    "$1" "$session" "$(js "$transcript")" "$(js "$PWD")" "${2:+,$2}" |
+    sh -c "$hook_cmd" >/dev/null 2>&1
+}
+
+B=$'\033[1m' D=$'\033[2m' R=$'\033[0m'
+O=$'\033[38;5;173m' G=$'\033[32m' Y=$'\033[33m' C=$'\033[36m' E=$'\033[31m'
+
+# ---------------------------------------------------------------- scenes
+# Each sets: title, prompt (unless tam gave one), ctx (percent), state
+# (working, ready, blocked, question or error), activity (what the
+# spinner says), last (the response that ended the turn), and body().
+
+scene=${DEMO_SCENE:-default}
+title='' ctx=20 state=ready activity='Thinking' last='Done.' tool='' tool_input='' error=''
+body() { :; }
+
+case $scene in
+  release-checklist)
+    title='Release checklist for v2.4'
+    prompt=${prompt:-'Walk me through what is left before we tag v2.4'}
+    ctx=41 state=ready
+    last='Two blockers left before tagging v2.4: the rate limiter fix and the checkout v2 migration.'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Bash${R}(git log --oneline v2.3..main | wc -l)
+  ${D}⎿  47${R}
+
+${O}●${R} ${B}Read${R}(CHANGELOG.md)
+  ${D}⎿  Read 112 lines${R}
+
+${O}●${R} 47 commits since v2.3. Before tagging v2.4:
+
+  ${G}✓${R} Changelog is up to date
+  ${G}✓${R} Database migrations 0031 to 0034 are reversible
+  ${G}✓${R} Staging has run main for 26 hours without errors
+  ${Y}○${R} ${B}fix-rate-limit${R} is not merged: bursts still get through
+  ${Y}○${R} ${B}checkout-v2${R} needs its migration reviewed
+
+  Two blockers left before tagging v2.4: the rate limiter fix and
+  the checkout v2 migration.
+EOF
+    } ;;
+  flaky-e2e)
+    title='Why are the e2e tests flaky?'
+    prompt=${prompt:-'The checkout e2e test fails one run in five. Why?'}
+    ctx=12 state=working activity='Reading test traces'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Bash${R}(npx playwright test checkout --repeat-each 10)
+  ${D}⎿  8 passed, 2 failed (timeout waiting for #pay-button)${R}
+
+${O}●${R} ${B}Read${R}(tests/e2e/checkout.spec.ts)
+  ${D}⎿  Read 86 lines${R}
+
+${O}●${R} Both failures wait on ${C}#pay-button${R} before the cart total has
+  loaded. Checking whether the button renders before the price API
+  answers.
+EOF
+    } ;;
+  pg-upgrade)
+    title='Postgres 17 upgrade plan'
+    prompt=${prompt:-'Plan the upgrade of the main database to Postgres 17'}
+    ctx=63 state=question
+    tool=AskUserQuestion
+    tool_input='{"questions":[{"question":"How much downtime can the upgrade take?","header":"Downtime","multiSelect":false,"options":[{"label":"None","description":"Logical replication to a new cluster, then switch over"},{"label":"Under 5 minutes","description":"pg_upgrade --link during the maintenance window"},{"label":"An hour","description":"Dump and restore"}]}]}'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Read${R}(modules/db/main.tf)
+  ${D}⎿  Read 64 lines${R}
+
+${O}●${R} The main database runs Postgres 15.6 on a db.r6g.xlarge, 410 GB.
+  Two ways to get to 17 fit this setup, depending on the downtime
+  you can accept.
+
+${C}? How much downtime can the upgrade take?${R}
+  ${B}1. None${R}            ${D}logical replication, then switch over${R}
+  ${B}2. Under 5 minutes${R} ${D}pg_upgrade --link in the window${R}
+  ${B}3. An hour${R}         ${D}dump and restore${R}
+EOF
+    } ;;
+  pricing-copy)
+    title='Pricing page copy'
+    prompt=${prompt:-'Rewrite the pricing page intro, shorter and friendlier'}
+    ctx=8 state=ready
+    last='Here is a shorter intro: three sentences, no jargon.'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Read${R}(src/pages/Pricing.tsx)
+  ${D}⎿  Read 140 lines${R}
+
+${O}●${R} Here is a shorter intro: three sentences, no jargon.
+EOF
+    } ;;
+  fix-rate-limit)
+    prompt=${prompt:-'Bursts over 100 req/s get through the rate limiter. Fix it and add a test.'}
+    ctx=67 state=blocked
+    tool=Bash
+    tool_input='{"command":"npm test -- rateLimit","description":"Run the rate limiter tests"}'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Read${R}(src/middleware/rateLimit.ts)
+  ${D}⎿  Read 84 lines${R}
+
+${O}●${R} The window resets on every request instead of sliding, so a burst
+  right after a reset gets twice the limit. Fixing slidingWindow() and
+  adding a burst test.
+
+${O}●${R} ${B}Update${R}(src/middleware/rateLimit.ts)
+  ${D}⎿  Updated with 18 additions and 7 removals${R}
+
+${O}●${R} ${B}Update${R}(test/rateLimit.test.ts)
+  ${D}⎿  Updated with 31 additions${R}
+
+${Y}╭─ Permission ─────────────────────────────────────────╮${R}
+${Y}│${R} ${B}Bash${R}: npm test -- rateLimit                          ${Y}│${R}
+${Y}│${R} ${D}Run the rate limiter tests${R}                           ${Y}│${R}
+${Y}│${R}                                                      ${Y}│${R}
+${Y}│${R} Allow?  ${D}(answer here, or with a in tam)${R}              ${Y}│${R}
+${Y}╰──────────────────────────────────────────────────────╯${R}
+EOF
+    } ;;
+  perf-cache)
+    prompt=${prompt:-'Warm the product cache at startup so the first requests are not slow'}
+    ctx=31 state=working activity='Profiling cold start'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Read${R}(src/cache.ts)
+  ${D}⎿  Read 57 lines${R}
+
+${O}●${R} ${B}Bash${R}(npm run bench -- --cold)
+  ${D}⎿  p50 412ms  p99 1.9s  (first 1000 requests)${R}
+
+${O}●${R} The first requests all miss the cache. Loading the 500 most viewed
+  products before the server listens.
+
+${O}●${R} ${B}Update${R}(src/cache.ts)
+  ${D}⎿  Updated with 24 additions${R}
+EOF
+    } ;;
+  checkout-api)
+    prompt=${prompt:-'Checkout v2: the API side. Agree on the payload with the web member.'}
+    ctx=12 state=working activity='Writing the endpoint'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Bash${R}(tam msg web "POST /v2/checkout takes {cartId, paymentMethod}, returns {orderId, total}")
+  ${D}⎿  Sent to checkout-v2/web${R}
+
+${O}●${R} ${B}Write${R}(src/routes/checkoutV2.ts)
+  ${D}⎿  Wrote 96 lines${R}
+
+${O}●${R} ${B}Write${R}(migrations/0035_checkout_v2.sql)
+  ${D}⎿  Wrote 22 lines${R}
+EOF
+    } ;;
+  checkout-web)
+    prompt=${prompt:-'Checkout v2: the web side. Agree on the payload with the api member.'}
+    ctx=40 state=question
+    tool=AskUserQuestion
+    tool_input='{"questions":[{"question":"Keep the old checkout behind a flag during the rollout?","header":"Rollout","multiSelect":false,"options":[{"label":"Yes, behind a flag","description":"Both pages ship; the flag picks one"},{"label":"No, replace it","description":"Checkout v2 only"}]}]}'
+    body() {
+      cat <<EOF
+${O}●${R} ${D}Message from checkout-v2/api:${R} POST /v2/checkout takes
+  {cartId, paymentMethod}, returns {orderId, total}
+
+${O}●${R} ${B}Write${R}(src/pages/CheckoutV2.tsx)
+  ${D}⎿  Wrote 148 lines${R}
+
+${C}? Keep the old checkout behind a flag during the rollout?${R}
+  ${B}1. Yes, behind a flag${R}  ${D}both pages ship; the flag picks one${R}
+  ${B}2. No, replace it${R}      ${D}checkout v2 only${R}
+EOF
+    } ;;
+  terraform-upgrade)
+    prompt=${prompt:-'Upgrade the AWS provider to v6 and fix what breaks'}
+    ctx=55 state=ready
+    last='The AWS provider is on v6. terraform plan shows no changes.'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Bash${R}(terraform init -upgrade)
+  ${D}⎿  Installed hashicorp/aws v6.2.0${R}
+
+${O}●${R} ${B}Update${R}(modules/db/main.tf)
+  ${D}⎿  Updated with 3 additions and 3 removals${R}
+
+${O}●${R} ${B}Bash${R}(terraform plan)
+  ${D}⎿  No changes. Your infrastructure matches the configuration.${R}
+
+${O}●${R} The AWS provider is on v6. terraform plan shows no changes.
+EOF
+    } ;;
+  log-retention)
+    prompt=${prompt:-'Set log retention to 30 days on every log group'}
+    ctx=22 state=error
+    error='"error":"rate_limit","error_details":"API Error: 429 rate limit reached, retry in a few minutes"'
+    body() {
+      cat <<EOF
+${O}●${R} ${B}Bash${R}(grep -rn retention_in_days modules/)
+  ${D}⎿  modules/logs/main.tf:12:  retention_in_days = 0${R}
+
+${E}⎿  API Error: 429 rate limit reached, retry in a few minutes${R}
+EOF
+    } ;;
+  *)
+    prompt=${prompt:-'Hello'}
+    ;;
+esac
+
+# ---------------------------------------------------------------- drawing
+
+draw() {
+  printf '\033[2J\033[H'
+  printf '%s✻%s %sClaude Code%s %s(tam demo: a scripted session)%s\n\n' "$O" "$R" "$B" "$R" "$D" "$R"
+  printf '%s> %s%s\n\n' "$D" "$prompt" "$R"
+  body
+}
+
+spinner_pid=''
+spin() {
+  (
+    frames=('·' '✢' '✳' '✶' '✻' '✽' '✻' '✶' '✳' '✢') n=0 s=0
+    while :; do
+      i=$((n % 10))
+      printf '\r%s%s %s… %s(%ds · esc to interrupt)%s\033[K' \
+        "$O" "${frames[$i]}" "$1" "$D" "$s" "$R"
+      sleep 1
+      n=$((n + 1)) s=$((s + 1))
+    done
+  ) &
+  spinner_pid=$!
+}
+unspin() {
+  [ -n "$spinner_pid" ] && kill "$spinner_pid" 2>/dev/null
+  spinner_pid=''
+  printf '\r\033[K'
+}
+
+prompt_line() { printf '\n%s>%s ' "$D" "$R"; }
+
+transcript_line() {
+  mkdir -p "$(dirname "$transcript")"
+  printf '%s\n' "$1" >>"$transcript"
+}
+record_turn() { # record_turn PROMPT
+  transcript_line "{\"type\":\"user\",\"sessionId\":\"$session\",\"message\":{\"role\":\"user\",\"content\":\"$(js "$1")\"}}"
+  transcript_line "{\"type\":\"assistant\",\"sessionId\":\"$session\",\"message\":{\"model\":\"claude\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":$((ctx * 10000)),\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":800}}}"
+  [ -n "$title" ] && transcript_line "{\"type\":\"ai-title\",\"aiTitle\":\"$(js "$title")\",\"sessionId\":\"$session\"}"
+  transcript_line "{\"type\":\"last-prompt\",\"lastPrompt\":\"$(js "$1")\",\"leafUuid\":\"$(new_id)\",\"sessionId\":\"$session\"}"
+}
+
+# A request waiting on the user: its PermissionRequest hook waits for an
+# answer from tam (`a` in the dashboard); then the tool "runs".
+ask() {
+  (
+    answer=$(printf '{"hook_event_name":"PermissionRequest","session_id":"%s","transcript_path":"%s","cwd":"%s","tool_name":"%s","tool_input":%s}' \
+      "$session" "$(js "$transcript")" "$(js "$PWD")" "$tool" "$tool_input" | sh -c "$hook_cmd" 2>/dev/null)
+    case $answer in
+      *'"deny"'*)
+        printf '\n%s●%s Okay, I will not run it. What should I do instead?\n' "$O" "$R"
+        hook Stop "\"last_assistant_message\":\"Okay, I will not run it.\""
+        prompt_line ;;
+      *'"allow"'*)
+        hook PostToolUse "\"tool_name\":\"$tool\",\"tool_input\":$tool_input"
+        printf '\n%s●%s Going on with your answer.\n' "$O" "$R"
+        sleep 3
+        printf '\n%s●%s Done: %s42 passed%s.\n' "$O" "$R" "$G" "$R"
+        hook Stop "\"last_assistant_message\":\"Done: 42 passed.\""
+        prompt_line ;;
+    esac
+  ) &
+  ask_pid=$!
+}
+
+cleanup() {
+  unspin
+  [ -n "${ask_pid:-}" ] && kill "$ask_pid" 2>/dev/null
+  exit 0
+}
+trap cleanup TERM HUP INT
+
+# ---------------------------------------------------------------- the session
+
+if [ -n "$resume" ]; then hook SessionStart '"source":"resume"'; else hook SessionStart '"source":"startup"'; fi
+draw
+record_turn "$prompt"
+hook UserPromptSubmit "\"prompt\":\"$(js "$prompt")\""
+
+case $state in
+  working)
+    printf '\n'
+    spin "$activity" ;;
+  ready)
+    hook Stop "\"last_assistant_message\":\"$(js "$last")\""
+    prompt_line ;;
+  blocked)
+    ask ;;
+  question)
+    hook PreToolUse "\"tool_name\":\"$tool\",\"tool_input\":$tool_input"
+    ask ;;
+  error)
+    hook StopFailure "$error"
+    prompt_line ;;
+esac
+
+# Anything typed gets a short turn.
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  unspin
+  hook UserPromptSubmit "\"prompt\":\"$(js "$line")\""
+  record_turn "$line"
+  spin 'Working'
+  sleep 3
+  unspin
+  printf '%s●%s On it: this is a scripted demo session, so that is all it says.\n' "$O" "$R"
+  hook Stop '"last_assistant_message":"On it."'
+  prompt_line
+done
+# stdin closed: stay up like an idle session until tam stops it.
+while :; do sleep 3600; done

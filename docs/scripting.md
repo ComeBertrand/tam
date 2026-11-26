@@ -177,7 +177,7 @@ With `--json`, stdout holds one JSON document and nothing else, also when the co
 {
   "schema_version": 1,
   "task": "feat",
-  "reference": "https://tickets.example.com/CS-42",
+  "reference": "https://tickets.example.com/SHOP-42",
   "file": null,
   "scratch": "/home/me/.local/share/tam/tasks/feat/scratch"
 }

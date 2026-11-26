@@ -30,35 +30,9 @@
 
 tam gives every piece of work you hand to an AI agent a name: a **task**. A task is a git branch, its worktree and a [Claude Code](https://github.com/anthropics/claude-code) session, created, resumed and cleaned up together. A small daemon keeps the agents running while you come and go, and a dashboard shows at a glance which ones need you.
 
-```
- tam  4 chats  7 tasks  5 need you                                by repository
- STATUS          TASK                                          BRANCH  CTX
- chats ─────────────────────────────────────────────────────────────────────────
-▌◆ ready      2m Release deployment on staging                 backend  41% ━━━━
- ⠹ run       10s Why rounding differs between runs             backend  12% ━━━━
- ? question   5m Answering the support thread ∞                backend  63% ━━━━
- ○ idle       2d Chat design ◔                                 tam
- shells ────────────────────────────────────────────────────────────────────────
-                 Shell #1                                      backend
-                 Shell #1                                      frontend
- backend ───────────────────────────────────────────────────────────────────────
- ▲ block      3m fix-allotment-rounding                         ↑2 *1   67% ━━━━
-                  ├ Shell #1
-                  └ Shell #3
- ⠹ run       20s perf                                           =       31% ━━━━
- ◌ stale     45d spike-cache                                    ↑5 ↓12
- backend + frontend ────────────────────────────────────────────────────────────
-                 unit-pricing
- ⠹ run        1m  ├ backend                                     ↑1 *3   12% ━━━━
-                  │ └ Shell #1
- ? question   5m  └▸frontend                                    ↑1      40% ━━━━
- frontend ──────────────────────────────────────────────────────────────────────
- ○ idle       2d nav                                            =
- ∅ gone       3d old-banner
- rustpallet ────────────────────────────────────────────────────────────────────
- ◆ ready     12m offload-explain                                ↑3 ↓1   55% ━━━━
- enter:type  f:full screen  x:stop  d:close  p:keep  N:rename  c:new chat  ?:help
-```
+<p align="center">
+  <img src="assets/dashboard.png" alt="The tam dashboard: chats, shells and tasks grouped by repository, each with its status, and the selected agent's screen in the pane beside them">
+</p>
 
 ## Why tam
 
@@ -271,7 +245,7 @@ NAME is a task, `TASK/MEMBER` for one member of a task, or a chat. Without it, `
 
 ## Contributing
 
-Contributions are welcome: open an issue or a pull request. The architecture is described in [CLAUDE.md](CLAUDE.md), and design decisions are recorded in the [issues](https://github.com/ComeBertrand/tam/issues). Before sending a change:
+Contributions are welcome: open an issue or a pull request. The architecture is described in [CLAUDE.md](CLAUDE.md), and design decisions are recorded in the [issues](https://github.com/ComeBertrand/tam/issues). To see the dashboard full of agents without running any, [scripts/demo](scripts/demo/README.md) builds a made-up world in a few seconds. Before sending a change:
 
 ```bash
 cargo fmt

@@ -147,6 +147,11 @@ impl Drop for InTheme {
     }
 }
 
+/// The name of the theme in use.
+pub fn name() -> &'static str {
+    THEMES[THEME.load(Ordering::Relaxed)].0
+}
+
 /// Switch to the next theme (until the dashboard quits: the configured
 /// one comes back); returns its name.
 pub fn next() -> &'static str {

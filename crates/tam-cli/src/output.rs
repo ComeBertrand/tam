@@ -21,10 +21,10 @@ pub fn stdout_line(args: Arguments) {
         .and_then(|()| out.flush());
     if let Err(e) = written {
         if e.kind() == ErrorKind::BrokenPipe {
-            std::process::exit(0);
+            crate::activity::exit(0);
         }
         stderr_line(format_args!("tam: cannot write to stdout: {e}"));
-        std::process::exit(1);
+        crate::activity::exit(1);
     }
 }
 

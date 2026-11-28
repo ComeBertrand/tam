@@ -39,6 +39,7 @@ mod shell;
 mod task;
 mod tui;
 
+mod activity;
 mod output;
 mod ps;
 mod schema;
@@ -49,11 +50,23 @@ use tam_proto::{MemberInfo, RunInfo, SessionChoice, TaskInfo};
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            activity::usage_error(e.kind());
+            e.exit()
+        }
+    };
     let json = cli.command.as_ref().is_some_and(script::json_output);
-    if let Err(e) = run(cli).await {
-        // Its exit status tells scripts why (see `script::ErrorKind`).
-        std::process::exit(script::fail(&e, json));
+    activity::start(cli.command.as_ref());
+    match run(cli).await {
+        Ok(()) => activity::end(0, None),
+        Err(e) => {
+            // Its exit status tells scripts why (see `script::ErrorKind`).
+            let code = script::fail(&e, json);
+            activity::end(code, Some(&e));
+            std::process::exit(code);
+        }
     }
 }
 
@@ -213,7 +226,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if stopped == 0 {
                 eprintln!("Error: no agent running in task '{}'", label);
-                std::process::exit(1);
+                activity::exit(1);
             }
         }
 
@@ -274,7 +287,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 if !confirm("Drop anyway? [y/N] ")? {
                     eprintln!("{what} kept (pass --force to drop anyway).");
-                    std::process::exit(1);
+                    activity::exit(1);
                 }
                 outcome = client.drop_task(&name, true, branch).await?;
             }
@@ -369,7 +382,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             if failed {
-                std::process::exit(1);
+                activity::exit(1);
             }
         }
 
@@ -482,7 +495,7 @@ async fn run(cli: Cli) -> Result<()> {
 
             let output = child.wait_with_output()?;
             if !output.status.success() {
-                std::process::exit(1);
+                activity::exit(1);
             }
             let choice = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if let Ok(path) = tam_worktree::pretty::resolve(&choice, &paths) {
@@ -501,7 +514,7 @@ async fn run(cli: Cli) -> Result<()> {
                 tam_proto::Response::Ok => println!("Daemon shutting down."),
                 tam_proto::Response::Error { message } => {
                     eprintln!("Error: {}", message);
-                    std::process::exit(1);
+                    activity::exit(1);
                 }
                 _ => {}
             }
@@ -511,24 +524,36 @@ async fn run(cli: Cli) -> Result<()> {
             Some(_) => println!("Daemon is running."),
             None => {
                 println!("Daemon is not running.");
-                std::process::exit(1);
+                activity::exit(1);
             }
         },
 
         Commands::Daemon => {
-            use tracing_subscriber::EnvFilter;
-            tracing_subscriber::fmt()
-                .with_env_filter(
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            use tracing_subscriber::{EnvFilter, Layer};
+            let ledger_path = tam_daemon::ledger::default_path();
+            let log = match tam_daemon::activity::settings().enabled {
+                true => tam_daemon::activity::Activity::to_dir(
+                    tam_daemon::activity::dir_next_to(&ledger_path),
+                    "daemon",
+                ),
+                false => tam_daemon::activity::Activity::off(),
+            };
+            // Its warnings and errors in the activity log too: a daemon a
+            // client started has no terminal.
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_filter(
                     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-                )
+                ))
+                .with(tam_daemon::activity::WarningLayer(log.clone()))
                 .init();
             #[cfg(unix)]
             {
                 let _ = nix::unistd::setsid();
             }
             let socket_path = tam_proto::default_socket_path();
-            let ledger_path = tam_daemon::ledger::default_path();
-            let d = tam_daemon::daemon::Daemon::new(socket_path, ledger_path);
+            let d = tam_daemon::daemon::Daemon::new(socket_path, ledger_path).activity(log);
             return d.run().await;
         }
 
@@ -692,7 +717,7 @@ async fn resolve_target(client: &mut client::Client, name: Option<&str>) -> Resu
 async fn stop_chat(client: &mut client::Client, chat: &tam_proto::ChatInfo) -> Result<()> {
     if !client.list_agents().await?.iter().any(|a| a.id == chat.id) {
         eprintln!("Error: no agent running in chat {}", chat::describe(chat));
-        std::process::exit(1);
+        activity::exit(1);
     }
     match client
         .send(tam_proto::Request::Kill {

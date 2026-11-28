@@ -159,6 +159,8 @@ async fn run_resumes_the_members_current_session() {
     std::env::set_var("HOME", &home);
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+    // The `tam` it runs writes its activity log there, not in the user's.
+    std::env::set_var("XDG_DATA_HOME", root.join("data"));
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     std::env::set_var("PATH", path);
     let args_file = root.join("agent-args");

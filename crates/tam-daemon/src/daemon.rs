@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde_json::json;
 use tam_proto::{
     AgentInfo, AgentState, Event, MemberHealth, MemberOutcome, MemberState, MessageInfo, NewMember,
     Request, Response, SessionChoice, TaskInfo,
@@ -16,6 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch, Mutex};
 use tracing::{error, info, warn};
 
+use crate::activity::{self, Activity, ConnStats};
 use crate::agent::Agent;
 use crate::answer::{self, Delivery};
 use crate::autoclean;
@@ -36,6 +38,10 @@ pub struct Daemon {
     autoclean: autoclean::Source,
     autoclean_every: Duration,
     idle_timeout: Duration,
+    /// Where the activity log goes; `None`: next to the ledger, as the
+    /// config says (see [`activity`]).
+    activity: Option<Activity>,
+    conn_stats_after: Duration,
 }
 
 struct DaemonState {
@@ -56,6 +62,8 @@ struct DaemonState {
     worktrees: Arc<Mutex<()>>,
     next_id: u64,
     shutdown: bool,
+    /// Why it shuts down: `idle` or `requested` (for the log).
+    shutdown_reason: &'static str,
     event_tx: broadcast::Sender<Event>,
     socket_path: PathBuf,
     connected_clients: Arc<AtomicUsize>,
@@ -70,6 +78,8 @@ struct DaemonState {
     peer_changes: HashMap<String, Vec<String>>,
     /// Permission requests agents' hooks wait on, for clients to answer.
     asks: answer::Asks,
+    /// The activity log (see [`activity`]).
+    activity: Activity,
 }
 
 /// How long the daemon stays up with no agent, no shell and no client.
@@ -78,6 +88,10 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Capacity of the event broadcast channel. A subscriber that falls this far
 /// behind misses events.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// How often the daemon removes the activity log's old files (and when it
+/// starts).
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// How often the daemon checks the members' worktrees against git.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
@@ -105,7 +119,23 @@ impl Daemon {
             autoclean: autoclean::Source::default(),
             autoclean_every: autoclean::INTERVAL,
             idle_timeout: IDLE_TIMEOUT,
+            activity: None,
+            conn_stats_after: CONN_STATS_AFTER,
         }
+    }
+
+    /// Log what a connection read when it closes if it lasted `after`
+    /// instead of [`CONN_STATS_AFTER`].
+    pub fn conn_stats_after(mut self, after: Duration) -> Self {
+        self.conn_stats_after = after;
+        self
+    }
+
+    /// Write the activity log to `activity` instead of next to the ledger
+    /// (`log/`), and keep `[log] keep_days` days of it.
+    pub fn activity(mut self, activity: Activity) -> Self {
+        self.activity = Some(activity);
+        self
     }
 
     /// Shut down after `timeout` with no agent, no shell and no client
@@ -147,6 +177,15 @@ impl Daemon {
     }
 
     pub async fn run(&self) -> Result<()> {
+        let started = Instant::now();
+        let settings = activity::settings();
+        let activity = self
+            .activity
+            .clone()
+            .unwrap_or_else(|| match settings.enabled {
+                true => Activity::to_dir(activity::dir_next_to(&self.ledger_path), "daemon"),
+                false => Activity::off(),
+            });
         // Lock the ledger before touching the socket: a second daemon must
         // fail here rather than unlink the running daemon's socket.
         let ledger_path = self.ledger_path.clone();
@@ -177,6 +216,16 @@ impl Daemon {
             info!(removed = report.compacted, "compacted ledger");
         }
 
+        let pruned = activity
+            .dir()
+            .map(|dir| activity::prune(dir, settings.keep_days));
+        let (tasks, chats) = (ledger.tasks().len(), ledger.chats().len());
+        let ledger_report = json!({
+            "migrated": report.migrated,
+            "compacted": report.compacted,
+            "malformed": report.malformed.len(),
+        });
+
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let state = Arc::new(Mutex::new(DaemonState {
             agents: HashMap::new(),
@@ -187,6 +236,7 @@ impl Daemon {
             worktrees: Arc::new(Mutex::new(())),
             next_id: 1,
             shutdown: false,
+            shutdown_reason: "",
             event_tx,
             socket_path: self.socket_path.clone(),
             connected_clients: Arc::new(AtomicUsize::new(0)),
@@ -195,6 +245,7 @@ impl Daemon {
             inbox: Inbox::default(),
             peer_changes: HashMap::new(),
             asks: answer::Asks::default(),
+            activity: activity.clone(),
         }));
 
         // Chats past their time are closed before any client sees them.
@@ -215,6 +266,18 @@ impl Daemon {
         let listener = UnixListener::bind(&self.socket_path)
             .with_context(|| format!("failed to bind socket at {:?}", self.socket_path))?;
         info!("tamd listening on {:?}", self.socket_path);
+        activity.record(
+            "daemon.start",
+            json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "protocol": tam_proto::PROTOCOL_VERSION,
+                "ms": activity::ms_since(started),
+                "tasks": tasks,
+                "chats": chats,
+                "ledger": ledger_report,
+                "log_files_pruned": pruned,
+            }),
+        );
 
         // Write PID file next to socket
         let pid_path = self.socket_path.with_extension("pid");
@@ -243,6 +306,21 @@ impl Daemon {
             self.chat_sessions_every,
         ));
 
+        // The activity log's old files, for a daemon up for days.
+        if let Some(dir) = activity.dir() {
+            let (dir, keep_days) = (dir.to_path_buf(), settings.keep_days);
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(PRUNE_INTERVAL);
+                every.tick().await;
+                loop {
+                    every.tick().await;
+                    let dir = dir.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || activity::prune(&dir, keep_days)).await;
+                }
+            });
+        }
+
         // And chats past their time, periodically.
         tokio::spawn(autoclean_loop(
             Arc::downgrade(&state),
@@ -250,14 +328,25 @@ impl Daemon {
             self.autoclean_every,
         ));
 
+        let mut connections: u64 = 0;
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _)) => {
                             let state = state.clone();
+                            connections += 1;
+                            let conn = Conn {
+                                id: connections,
+                                // The client's pid: its own lines carry it.
+                                peer: stream.peer_cred().ok().and_then(|c| c.pid()),
+                                activity: activity.clone(),
+                                stats: ConnStats::default(),
+                                opened: Instant::now(),
+                                stats_after: self.conn_stats_after,
+                            };
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, state).await {
+                                if let Err(e) = handle_connection(stream, state, conn).await {
                                     error!("client error: {}", e);
                                 }
                             });
@@ -275,6 +364,15 @@ impl Daemon {
         // Cleanup
         let _ = tokio::fs::remove_file(&self.socket_path).await;
         let _ = tokio::fs::remove_file(&pid_path).await;
+        let reason = state.lock().await.shutdown_reason;
+        activity.record(
+            "daemon.stop",
+            json!({
+                "reason": reason,
+                "uptime_s": started.elapsed().as_secs(),
+                "connections": connections,
+            }),
+        );
 
         Ok(())
     }
@@ -309,18 +407,21 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
         state.reap_exited();
 
         // Check for state changes
-        let changes: Vec<(String, AgentState, AgentState)> = state
+        let changes: Vec<(String, AgentState, AgentState, Duration)> = state
             .agents
             .iter_mut()
             .filter_map(|(id, agent)| {
                 agent
                     .check_state_change()
-                    .map(|(old, new)| (id.clone(), old, new))
+                    .map(|(old, new, held)| (id.clone(), old, new, held))
             })
             .collect();
-        for (id, old, new) in changes {
+        for (id, old, new, held) in changes {
             info!(id = %id, old = %old, new = %new, "state changed");
-            if let (Some(cfg), Some(info)) = (&notify_config, state.agent_info(&id)) {
+            let Some(info) = state.agent_info(&id) else {
+                continue;
+            };
+            let notified = notify_config.as_ref().is_some_and(|cfg| {
                 // A member's task, a chat's label.
                 let name = match state.ledger.chat(&id) {
                     Some(chat) => chat.label(),
@@ -336,8 +437,24 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
                         detail: &info.detail,
                         viewers: info.viewers,
                     },
-                );
-            }
+                )
+            });
+            let detail = &info.detail;
+            state.activity.record(
+                "agent.state",
+                json!({
+                    "id": id,
+                    "task": info.task,
+                    "from": old,
+                    "to": new,
+                    // How long it was `from`.
+                    "prev_ms": activity::ms(held),
+                    "viewers": info.viewers,
+                    "notified": notified,
+                    "tool": detail.pending.as_ref().and_then(|p| p.tool.clone()),
+                    "error": detail.error.as_ref().map(|e| activity::cut(&e.kind, 100)),
+                }),
+            );
             let _ = state.event_tx.send(Event::StateChange { id, old, new });
         }
 
@@ -355,6 +472,7 @@ async fn state_monitor(state_arc: Arc<Mutex<DaemonState>>, notify_config: Option
             if Instant::now() >= deadline {
                 info!("idle timeout reached, auto-shutting down");
                 state.shutdown = true;
+                state.shutdown_reason = "idle";
                 break;
             }
         }
@@ -456,7 +574,16 @@ impl DaemonState {
             .collect();
         for id in exited {
             info!(id = %id, "shell exited");
-            self.shells.remove(&id);
+            if let Some(shell) = self.shells.remove(&id) {
+                self.activity.record(
+                    "shell.exit",
+                    json!({
+                        "id": id,
+                        "member": shell.member(),
+                        "run_ms": activity::ms(shell.pty().uptime()),
+                    }),
+                );
+            }
             self.broadcast(Event::ShellClosed { id });
         }
     }
@@ -491,11 +618,21 @@ impl DaemonState {
     /// An agent was removed from the table: emit `AgentExited` and record the
     /// end of its member's (or chat's) run.
     fn agent_gone(&mut self, id: &str, agent: &Agent, exit_code: i32) {
+        let mut fields = agent.run_summary();
+        fields["id"] = id.into();
+        fields["task"] = agent
+            .owner()
+            .and_then(|m| self.ledger.member_task(m))
+            .into();
+        // -1: tam stopped it (stop, drop, close, shutdown).
+        fields["exit_code"] = exit_code.into();
+        self.activity.record("agent.exit", fields);
         self.broadcast(Event::AgentExited {
             id: id.to_string(),
             exit_code,
         });
         self.inbox.agent_gone(id, agent.owner());
+        self.ask_ended(id, "agent_exit", None);
         self.asks.release(id);
         if let Some(member) = agent.owner() {
             self.peer_changes.remove(member);
@@ -616,12 +753,81 @@ async fn next_screen_update(watch: &mut Option<ScreenWatch>) -> Option<String> {
     Some(watch.id.clone())
 }
 
+/// A client's connection, as the activity log names it: its number since
+/// the daemon started and the client's pid (the client's own lines carry
+/// it). Counts its quiet requests, written every `ConnStats::PERIOD` and
+/// when it closes, if it lasted (a command's few reads say nothing its
+/// own `cli` line does not).
+struct Conn {
+    id: u64,
+    peer: Option<i32>,
+    activity: Activity,
+    stats: ConnStats,
+    opened: Instant,
+    /// Lasted this long, it writes its stats when it closes.
+    stats_after: Duration,
+}
+
+/// A connection that lasted this long says what it read when it closes.
+pub const CONN_STATS_AFTER: Duration = Duration::from_secs(10);
+
+impl Conn {
+    /// Log a request answered with `response` after `took`; a quiet one is
+    /// counted instead, unless it was slow.
+    fn answered(&mut self, described: activity::Described, took: Duration, response: &Response) {
+        let (reply, error) = activity::reply(response);
+        if described.quiet {
+            self.stats.add(described.kind, took, error.is_some());
+            if self.stats.due() {
+                self.flush();
+            }
+            if took < activity::SLOW {
+                return;
+            }
+        }
+        let mut fields = described.fields;
+        fields.insert("req".into(), described.kind.into());
+        fields.insert("ms".into(), activity::ms(took).into());
+        fields.insert("reply".into(), reply.into());
+        fields.insert("error".into(), error.into());
+        if described.quiet {
+            fields.insert("slow".into(), true.into());
+        }
+        self.record("request", fields);
+    }
+
+    fn record(&self, kind: &str, mut fields: serde_json::Map<String, serde_json::Value>) {
+        fields.insert("conn".into(), self.id.into());
+        fields.insert("peer".into(), self.peer.into());
+        self.activity.record(kind, fields.into());
+    }
+
+    /// Write what was counted (`conn.stats`), if anything.
+    fn flush(&mut self) {
+        if let Some(serde_json::Value::Object(fields)) = self.stats.take() {
+            self.record("conn.stats", fields);
+        }
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if self.opened.elapsed() >= self.stats_after {
+            self.flush();
+        }
+    }
+}
+
 /// Handle a single client connection.
 /// Starts as newline-delimited JSON request/response.
 /// If the client sends an Attach request, switches to raw byte streaming.
 /// After a Subscribe request, daemon events are pushed to the client as JSON
 /// lines between responses.
-async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> Result<()> {
+async fn handle_connection(
+    stream: UnixStream,
+    state: Arc<Mutex<DaemonState>>,
+    mut conn: Conn,
+) -> Result<()> {
     let mut event_rx: Option<broadcast::Receiver<Event>> = None;
     let mut screen_watch: Option<ScreenWatch> = None;
     // Track connected clients for auto-shutdown
@@ -650,14 +856,24 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         let resp = Response::Error {
                             message: format!("invalid request: {}", e),
                         };
+                        // Not serde's message: it can quote the request.
+                        let kind = serde_json::from_slice::<serde_json::Value>(line.trim_ascii())
+                            .ok()
+                            .and_then(|v| Some(activity::cut(v.get("type")?.as_str()?, 50)));
+                        let mut fields = serde_json::Map::new();
+                        fields.insert("req".into(), kind.into());
+                        fields.insert("error".into(), format!("{:?}", e.classify()).into());
+                        conn.record("request.invalid", fields);
                         write_response(&mut writer, &resp).await?;
                         line.clear();
                         continue;
                     }
                 };
+                let described = activity::describe(&request);
+                let started = Instant::now();
 
                 // Attach takes over the connection — handle it specially
-                if let Request::Attach { id, cols, rows } = request {
+                let response = if let Request::Attach { id, cols, rows } = request {
                     let attach_resources = {
                         let state_guard = state.lock().await;
                         match state_guard.pty(&id) {
@@ -676,21 +892,26 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                             write_response(&mut writer, &Response::Attached).await?;
                             let buffered = buf_reader.buffer().to_vec();
                             let reader = buf_reader.into_inner();
-                            return handle_attach_session(
+                            let typed = handle_attach_session(
                                 reader, writer, buffered, output_rx, replay, master, viewers,
                             )
                             .await;
+                            // Written when it ends: `ms` is how long it lasted.
+                            let mut fields = described.fields;
+                            fields.insert("ms".into(), activity::ms_since(started).into());
+                            fields.insert("wait".into(), true.into());
+                            fields.insert("typed_bytes".into(), (*typed.as_ref().unwrap_or(&0)).into());
+                            conn.record("attach", fields);
+                            return typed.map(|_| ());
                         }
-                        Err(msg) => {
-                            write_response(&mut writer, &Response::Error { message: msg }).await?;
-                        }
+                        Err(message) => Response::Error { message },
                     }
                 } else if let Request::Subscribe = request {
                     // Subscribe before replying: no event after the Ok is missed.
                     event_rx = Some(state.lock().await.event_tx.subscribe());
-                    write_response(&mut writer, &Response::Ok).await?;
+                    Response::Ok
                 } else if let Request::WatchScreen { id, viewing } = request {
-                    let response = match id {
+                    match id {
                         None => {
                             screen_watch = None;
                             Response::Ok
@@ -710,11 +931,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                 message: not_found(&id),
                             },
                         },
-                    };
-                    write_response(&mut writer, &response).await?;
+                    }
                 } else if let Request::Keys { id, data } = request {
                     let master = state.lock().await.pty(&id).map(Pty::master);
-                    let response = match master {
+                    match master {
                         Some(master) => {
                             // Off the runtime: a PTY whose agent reads nothing blocks.
                             let written = tokio::task::spawn_blocking(move || {
@@ -740,18 +960,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         None => Response::Error {
                             message: not_found(&id),
                         },
-                    };
-                    write_response(&mut writer, &response).await?;
+                    }
                 } else if let Request::WaitInbox { agent_id } = request {
-                    // Takes over the connection until messages are handed over.
+                    // Takes over the connection until messages are handed
+                    // over (the log has the messages, not the wait).
                     return handle_wait_inbox(buf_reader, writer, &state, &agent_id).await;
                 } else if let Request::WaitAnswer { agent_id, payload } = request {
-                    // Takes over the connection until the request is over.
+                    // Takes over the connection until the request is over
+                    // (the log has the request: `ask.open`, `ask.end`).
                     return handle_wait_answer(buf_reader, writer, &state, &agent_id, &payload).await;
                 } else {
-                    let response = dispatch(request, &state).await;
-                    write_response(&mut writer, &response).await?;
-                }
+                    dispatch(request, &state).await
+                };
+                // Before the reply: a client gone meanwhile (a `tam wait`
+                // interrupted) fails the write.
+                conn.answered(described, started.elapsed(), &response);
+                write_response(&mut writer, &response).await?;
 
                 line.clear();
 
@@ -765,7 +989,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         write_event(&mut writer, &event).await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(missed = n, "client lagging behind, events dropped");
+                        warn!(missed = n, conn = conn.id, "client lagging behind, events dropped");
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -784,7 +1008,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
     Ok(())
 }
 
-/// Bidirectional raw byte relay between a client and an agent's PTY.
+/// Bidirectional raw byte relay between a client and an agent's PTY. How
+/// many bytes the client typed (for the log: never what).
 async fn handle_attach_session(
     mut reader: tokio::net::unix::OwnedReadHalf,
     mut writer: tokio::net::unix::OwnedWriteHalf,
@@ -793,7 +1018,7 @@ async fn handle_attach_session(
     replay: Vec<u8>,
     master: Arc<OwnedFd>,
     viewers: Arc<AtomicUsize>,
-) -> Result<()> {
+) -> Result<u64> {
     viewers.fetch_add(1, Ordering::Relaxed);
     // Bring the client's terminal to the agent's: history, screen, modes.
     writer.write_all(&replay).await?;
@@ -822,7 +1047,8 @@ async fn handle_attach_session(
     };
 
     // Client input → PTY
-    let input_task = async move {
+    let typed = AtomicU64::new(buffered.len() as u64);
+    let input_task = async {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf).await {
@@ -831,6 +1057,7 @@ async fn handle_attach_session(
                     if nix::unistd::write(&*write_master, &buf[..n]).is_err() {
                         break;
                     }
+                    typed.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Err(_) => break,
             }
@@ -843,7 +1070,7 @@ async fn handle_attach_session(
     }
 
     viewers.fetch_sub(1, Ordering::Relaxed);
-    Ok(())
+    Ok(typed.load(Ordering::Relaxed))
 }
 
 async fn write_response(
@@ -1220,7 +1447,8 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         .map(|a| a.read_only.clone())
         .unwrap_or_default();
     let resolved = Arc::from(provider::resolve_with(&provider, access));
-    match Agent::spawn(
+    let started = Instant::now();
+    let spawned = Agent::spawn(
         resolved,
         &dir,
         &args,
@@ -1228,7 +1456,23 @@ async fn handle_spawn(state: &Arc<Mutex<DaemonState>>, spec: SpawnSpec) -> Respo
         prompt.as_deref(),
         &env_vars,
         &launch,
-    ) {
+    );
+    state.activity.record(
+        "agent.spawn",
+        json!({
+            "id": id,
+            "task": member.as_deref().and_then(|m| state.ledger.member_task(m)),
+            "provider": provider,
+            "dir": dir,
+            "resume": resume_session.is_some(),
+            "args": args.len(),
+            "prompt_len": prompt.as_ref().map(|p| p.chars().count()),
+            "wrapper": !launch.wrapper.is_empty(),
+            "ms": activity::ms_since(started),
+            "error": spawned.as_ref().err().map(|e| activity::cut(&format!("{e:#}"), 500)),
+        }),
+    );
+    match spawned {
         Ok(mut agent) => {
             info!(id = %id, provider = %provider, dir = %dir.display(), "spawned agent");
             agent.set_owner(member.clone());
@@ -1502,6 +1746,7 @@ async fn handle_shutdown(state: &Arc<Mutex<DaemonState>>) -> Response {
         })
         .collect();
     state.shutdown = true;
+    state.shutdown_reason = "requested";
 
     if !agents.is_empty() || !shells.is_empty() {
         tokio::task::spawn_blocking(move || stop_all(agents, shells));
@@ -1568,10 +1813,19 @@ async fn handle_drop_task(
         dirs
     };
 
-    let worktrees = state.lock().await.worktrees.clone();
+    let (worktrees, activity) = {
+        let state = state.lock().await;
+        (state.worktrees.clone(), state.activity.clone())
+    };
+    let mut phases = activity::Phases::start();
     let held = worktrees.lock().await;
-    let removal = stop_and_remove(state, name, dirs, force, delete_branch).await;
+    phases.mark("lock_wait");
+    let removal = stop_and_remove(state, name, dirs, force, delete_branch, &mut phases).await;
     drop(held);
+    activity.record(
+        "drop.steps",
+        json!({ "task": name, "ok": removal.is_ok(), "steps_ms": phases.steps() }),
+    );
 
     let mut state = state.lock().await;
     state.dropping.remove(name);
@@ -1605,11 +1859,13 @@ async fn stop_and_remove(
     dirs: Vec<PathBuf>,
     force: bool,
     delete_branch: bool,
+    phases: &mut activity::Phases,
 ) -> Result<Removal, Response> {
     let check = |dirs: Vec<PathBuf>| {
         blocking(move || dirs.into_iter().map(worktrees::check).collect::<Vec<_>>())
     };
     let mut checked = check(dirs.clone()).await?;
+    phases.mark("check");
     if !force {
         refuse_lossy_drop(&checked, delete_branch)?;
     }
@@ -1629,17 +1885,19 @@ async fn stop_and_remove(
         );
         // Gone before the worktrees are removed.
         blocking(move || stop_all(agents, shells)).await?;
+        phases.mark("stop");
         if !force {
             checked = check(dirs).await?;
+            phases.mark("check");
             refuse_lossy_drop(&checked, delete_branch)?;
         }
     }
 
-    blocking(move || worktrees::remove_all(&checked, delete_branch))
-        .await?
-        .map_err(|e| Response::Error {
-            message: format!("Task '{name}' kept{}: {e}", stopped.note()),
-        })
+    let removed = blocking(move || worktrees::remove_all(&checked, delete_branch)).await?;
+    phases.mark("remove");
+    removed.map_err(|e| Response::Error {
+        message: format!("Task '{name}' kept{}: {e}", stopped.note()),
+    })
 }
 
 /// `DropTask`: a task, or one member of a task (`<task>/<member>`, a member
@@ -1735,10 +1993,25 @@ async fn handle_drop_member(
     if is_last {
         return drop_with_last_member(state, &label, &task.name, force, delete_branch).await;
     }
-    let worktrees = state.lock().await.worktrees.clone();
+    let (worktrees, activity) = {
+        let state = state.lock().await;
+        (state.worktrees.clone(), state.activity.clone())
+    };
+    let mut phases = activity::Phases::start();
     let held = worktrees.lock().await;
-    let removal = stop_and_remove_member(state, &label, &member, force, delete_branch).await;
+    phases.mark("lock_wait");
+    let removal =
+        stop_and_remove_member(state, &label, &member, force, delete_branch, &mut phases).await;
     drop(held);
+    activity.record(
+        "drop.steps",
+        json!({
+            "task": task.name,
+            "member": member.id,
+            "ok": removal.is_ok(),
+            "steps_ms": phases.steps(),
+        }),
+    );
 
     let mut state = state.lock().await;
     state.dropping.remove(&task.name);
@@ -1775,9 +2048,11 @@ async fn stop_and_remove_member(
     member: &tam_proto::MemberInfo,
     force: bool,
     delete_branch: bool,
+    phases: &mut activity::Phases,
 ) -> Result<Removal, Response> {
     let check = |dir: PathBuf| blocking(move || vec![worktrees::check(dir)]);
     let mut checked = check(member.dir.clone()).await?;
+    phases.mark("check");
     if !force {
         refuse_lossy_drop(&checked, delete_branch)?;
     }
@@ -1796,17 +2071,19 @@ async fn stop_and_remove_member(
         );
         // Gone before the worktree is removed.
         blocking(move || stop_all(agents, shells)).await?;
+        phases.mark("stop");
         if !force {
             checked = check(member.dir.clone()).await?;
+            phases.mark("check");
             refuse_lossy_drop(&checked, delete_branch)?;
         }
     }
     let label = label.to_string();
-    blocking(move || worktrees::remove_all(&checked, delete_branch))
-        .await?
-        .map_err(|e| Response::Error {
-            message: format!("'{label}' kept{}: {e}", stopped.note()),
-        })
+    let removed = blocking(move || worktrees::remove_all(&checked, delete_branch)).await?;
+    phases.mark("remove");
+    removed.map_err(|e| Response::Error {
+        message: format!("'{label}' kept{}: {e}", stopped.note()),
+    })
 }
 
 /// What a drop stopped before removing worktrees, for its error.
@@ -1907,16 +2184,33 @@ async fn reconcile_loop(state: Arc<Mutex<DaemonState>>, every: Duration) {
 /// pushing `TaskUpdated` for each task where it changed. Observes only:
 /// nothing is created, removed, or written to the ledger file.
 async fn reconcile(state: &Arc<Mutex<DaemonState>>) {
-    let worktrees = state.lock().await.worktrees.clone();
+    let (worktrees, activity) = {
+        let state = state.lock().await;
+        (state.worktrees.clone(), state.activity.clone())
+    };
+    let mut phases = activity::Phases::start();
     let _held = worktrees.lock().await;
+    phases.mark("lock_wait");
     let (ids, recorded): (Vec<String>, Vec<Recorded>) =
         state.lock().await.recorded_worktrees().into_iter().unzip();
+    let members = ids.len();
     let observed = observe(recorded).await;
+    phases.mark("git");
     state
         .lock()
         .await
         .record_health(ids.into_iter().zip(observed));
+    // Every 10 s: only when slow (a change is `member.health`).
+    if phases.total_ms() >= RECONCILE_SLOW_MS {
+        activity.record(
+            "reconcile.slow",
+            json!({ "members": members, "ms": phases.total_ms(), "steps_ms": phases.steps() }),
+        );
+    }
 }
+
+/// A reconcile pass that took this long is logged.
+const RECONCILE_SLOW_MS: f64 = 1000.0;
 
 /// [`worktrees::observe`], off the async runtime.
 async fn observe(recorded: Vec<Recorded>) -> Vec<Observation> {
@@ -1990,6 +2284,10 @@ impl DaemonState {
                 } else if was_unhealthy {
                     info!(task = %task, member = %member, "member worktree back");
                 }
+                self.activity.record(
+                    "member.health",
+                    json!({ "task": task, "member": member, "health": health }),
+                );
                 changed.insert(task);
             }
         }
@@ -2173,6 +2471,33 @@ async fn handle_create_members(
     join: bool,
     env: std::collections::BTreeMap<String, String>,
 ) -> Response {
+    let activity = state.lock().await.activity.clone();
+    let mut phases = activity::Phases::start();
+    let count = members.len();
+    let response = create_members(state, task, members, source, join, env, &mut phases).await;
+    activity.record(
+        "create.steps",
+        json!({
+            "task": task,
+            "join": join,
+            "members": count,
+            "ok": matches!(response, Response::Task { .. }),
+            "steps_ms": phases.steps(),
+        }),
+    );
+    response
+}
+
+/// [`handle_create_members`], its steps timed.
+async fn create_members(
+    state: &Arc<Mutex<DaemonState>>,
+    task: &str,
+    members: Vec<NewMember>,
+    source: Option<String>,
+    join: bool,
+    env: std::collections::BTreeMap<String, String>,
+    phases: &mut activity::Phases,
+) -> Response {
     let error = |why: String| Response::Error {
         message: match join {
             true => format!("cannot add to task '{task}': {why}"),
@@ -2184,6 +2509,7 @@ async fn handle_create_members(
     }
     let worktrees = state.lock().await.worktrees.clone();
     let _held = worktrees.lock().await;
+    phases.mark("lock_wait");
     if let Err(why) = state.lock().await.can_create_members(task, join) {
         return error(why);
     }
@@ -2193,7 +2519,9 @@ async fn handle_create_members(
     let checked = run_git(move || {
         tam_worktree::git::with_env(in_env, || worktrees::check_new(&check, from.as_deref()))
     });
-    if let Err(e) = checked.await {
+    let checked = checked.await;
+    phases.mark("check");
+    if let Err(e) = checked {
         return error(format!("{e:#}\nNothing was created."));
     }
     let (create, in_env) = (members.clone(), env.clone());
@@ -2202,12 +2530,15 @@ async fn handle_create_members(
             worktrees::create_all(&create, source.as_deref())
         }))
     });
-    let created = match created.await {
+    let created = created.await;
+    phases.mark("create");
+    let created = match created {
         Ok(Ok(created)) => created,
         Ok(Err(report)) => return error(report),
         Err(e) => return error(format!("{e:#} (worktrees may be left behind)")),
     };
     let observed = observe(members.iter().map(Recorded::from).collect()).await;
+    phases.mark("observe");
 
     let mut state = state.lock().await;
     let recorded = match state.can_create_members(task, join) {
@@ -2309,6 +2640,8 @@ impl DaemonState {
         let (text, ids) = inbox::batch(&queued);
         if self.inbox.hand_over(member, member, text, ids.clone()) {
             info!(member = %member, ids = ?ids, "messages handed to the inbox hook");
+            self.activity
+                .record("message.handed", json!({ "to": member, "messages": ids }));
         }
     }
 
@@ -2319,6 +2652,15 @@ impl DaemonState {
         match self.ledger.message_delivered(id) {
             Ok(Some(message)) => {
                 info!(id = %id, to = %message.to, "message delivered");
+                self.activity.record(
+                    "message.delivered",
+                    json!({
+                        "message": id,
+                        "to": message.to,
+                        "after_s": crate::ledger::now().saturating_sub(message.sent_at),
+                        "in_turn": in_turn,
+                    }),
+                );
                 self.inbox.record_hop(&message.to, message.hop);
                 if in_turn {
                     self.inbox.delivered_this_turn(&message.to, id);
@@ -2431,6 +2773,17 @@ fn send_message(
         )
         .map_err(|e| format!("cannot record the message: {e:#}"))?;
     info!(id = %message.id, from = %message.from_label, to = %message.to_label, hop, "message sent");
+    state.activity.record(
+        "message.sent",
+        json!({
+            "message": message.id,
+            "from": message.from,
+            "to": message.to,
+            "hop": hop,
+            "reply_to": message.reply_to,
+            "len": text.chars().count(),
+        }),
+    );
     state.broadcast(Event::MessageSent {
         message: message.clone(),
     });
@@ -3219,6 +3572,26 @@ const ANSWER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 impl DaemonState {
     /// Show clients `ask` as the request of agent `id` they can answer
     /// (`None`: none).
+    /// Log that the request agent `id` waits on (if any) ends without an
+    /// answer from a client: `how` (`agent_exit`, `hook_event` with the
+    /// `event`). (`hook_gone`, no in the terminal or the hook's timeout, and
+    /// `answered` are logged where they happen.)
+    fn ask_ended(&self, id: &str, how: &str, event: Option<&str>) {
+        if let Some((ask, open)) = self.asks.waiting(id) {
+            self.activity.record(
+                "ask.end",
+                json!({
+                    "id": id,
+                    "ask": ask,
+                    "how": how,
+                    "event": event,
+                    "ms": activity::ms(open),
+                    "wait": true,
+                }),
+            );
+        }
+    }
+
     fn show_ask(&mut self, id: &str, ask: Option<tam_proto::Ask>) {
         let changed = self
             .agents
@@ -3245,6 +3618,7 @@ async fn handle_answer_hook(
 ) {
     let mut state = state.lock().await;
     if state.asks.ended_by(agent_id, event, payload) {
+        state.ask_ended(agent_id, "hook_event", Some(event));
         state.asks.release(agent_id);
         state.show_ask(agent_id, None);
     }
@@ -3269,6 +3643,26 @@ async fn handle_wait_answer(
                 .asks
                 .register(agent_id, payload)
                 .map(|(ask, token, rx)| {
+                    let (what, cut, questions) = match &ask.kind {
+                        tam_proto::AskKind::Permission { cut, .. } => ("permission", *cut, None),
+                        tam_proto::AskKind::Plan { cut, .. } => ("plan", *cut, None),
+                        tam_proto::AskKind::Questions { questions } => {
+                            ("questions", false, Some(questions.len()))
+                        }
+                    };
+                    let task = state.ledger.member_task(agent_id).map(str::to_string);
+                    state.activity.record(
+                        "ask.open",
+                        json!({
+                            "id": agent_id,
+                            "task": task,
+                            "ask": ask.id,
+                            "tool": activity::cut(&ask.tool, 100),
+                            "what": what,
+                            "cut": cut,
+                            "questions": questions,
+                        }),
+                    );
                     state.show_ask(agent_id, Some(ask));
                     (token, rx)
                 })
@@ -3295,7 +3689,25 @@ async fn handle_wait_answer(
         _ = reader.read(&mut buf) => {
             // The hook went away: answered "no" in the terminal, or timed out.
             let mut state = state.lock().await;
+            // Logged only if it is this hook's (a newer one may have
+            // replaced it).
+            let waiting = state
+                .asks
+                .waiting(agent_id)
+                .map(|(ask, open)| (ask.to_string(), open));
             if state.asks.unregister(agent_id, token) {
+                if let Some((ask, open)) = waiting {
+                    state.activity.record(
+                        "ask.end",
+                        json!({
+                            "id": agent_id,
+                            "ask": ask,
+                            "how": "hook_gone",
+                            "ms": activity::ms(open),
+                            "wait": true,
+                        }),
+                    );
+                }
                 state.show_ask(agent_id, None);
             }
         }
@@ -3311,8 +3723,9 @@ async fn handle_answer(
     ask: &str,
     answer: tam_proto::AskAnswer,
 ) -> Response {
-    let written = {
+    let (written, open, activity) = {
         let mut state = state.lock().await;
+        let open = state.asks.waiting(agent_id).map(|(_, open)| open);
         match state.asks.answer(agent_id, ask, &answer) {
             Ok(written) => {
                 if let Some(agent) = state.agents.get_mut(agent_id) {
@@ -3325,15 +3738,33 @@ async fn handle_answer(
                         info,
                     });
                 }
-                written
+                (written, open, state.activity.clone())
             }
             Err(message) => return Response::Error { message },
         }
     };
-    info!(id = %agent_id, ask = %ask, answer = ?answer, "answered");
-    match tokio::time::timeout(ANSWER_WRITE_TIMEOUT, written).await {
-        Ok(Ok(true)) => Response::Ok,
-        _ => Response::Error {
+    // Not the answer itself: a reason or an answer typed is the user's text.
+    let kind = activity::answer_kind(&answer);
+    info!(id = %agent_id, ask = %ask, answer = kind, "answered");
+    let delivered = matches!(
+        tokio::time::timeout(ANSWER_WRITE_TIMEOUT, written).await,
+        Ok(Ok(true))
+    );
+    activity.record(
+        "ask.end",
+        json!({
+            "id": agent_id,
+            "ask": ask,
+            "how": "answered",
+            "answer": kind,
+            "delivered": delivered,
+            "ms": open.map(activity::ms),
+            "wait": true,
+        }),
+    );
+    match delivered {
+        true => Response::Ok,
+        false => Response::Error {
             message: "the agent's hook went away before it got the answer: answer in its terminal"
                 .into(),
         },
@@ -3743,6 +4174,18 @@ async fn clean_chats(state: &Arc<Mutex<DaemonState>>, source: &mut autoclean::So
         due.into_iter()
             .filter_map(|chat| {
                 let (agent, closed) = state.close_chat(&chat.id);
+                if closed.is_ok() {
+                    let now = crate::ledger::now();
+                    state.activity.record(
+                        "chat.autoclean",
+                        json!({
+                            "chat": chat.id,
+                            "agent_running": agent.is_some(),
+                            "since_turn_s": chat.last_turn_at.map(|t| now.saturating_sub(t)),
+                            "since_created_s": now.saturating_sub(chat.created_at),
+                        }),
+                    );
+                }
                 match closed {
                     Ok(_) => info!(
                         chat = %chat.id,

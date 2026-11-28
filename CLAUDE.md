@@ -916,6 +916,46 @@ adopt). `tam-cli` depends on all three.
   (`ListShells` first) and says so: before `Drop anyway?`, and `Dropped
   task 'x' and closed its 2 shells`.
 
+- **Activity log** — what tam did, when, how long it took, to read
+  afterwards (`docs/activity-log.md` documents every `kind`). JSONL, a
+  file per local day in `log/` next to the ledger
+  (`tam_daemon::activity::dir_next_to`: whatever keeps a ledger apart, a
+  test, keeps its log apart), each line one `write` on a file opened for
+  appending (per line: a removed log is made again), from every process:
+  `src` `daemon`, `cli`, `tui`; header `ts` (ms), `time` (local, offset
+  from `localtime_r`), `src`, `pid`, `kind`, then the fields, nulls left
+  out, durations `ms`. `[log] enabled`/`keep_days` (`activity::settings`;
+  pruned at start and hourly). `Activity` is a handle, never a static in
+  the daemon (several run in one test process): `Daemon::activity`, else
+  next to the ledger; `DaemonState::activity`; `Conn` per connection
+  (number, client pid from `peer_cred`, `ConnStats` of its quiet requests,
+  written when it lasted `Daemon::conn_stats_after`). What may be written
+  is chosen field by field in one place per side, exhaustive matches so a
+  new request, command or action is a decision: `activity::describe`
+  (requests) and `reply`, `tam-cli/src/activity.rs` (commands: `start`,
+  `end`, `exit`, which every early `process::exit` goes through, and
+  SIGINT/SIGTERM/SIGHUP, `signal`, exit 128+n; `hook-notify`,
+  `inbox-wait`, `daemon` log nothing as commands),
+  `tui/log.rs` (`Recorder`: inputs, modes, actions, slow frames). Never a
+  serialised request, response or hook payload; prompts, messages, keys,
+  answers' text and briefs as lengths; an invalid request as serde's
+  category only (its message can quote the request). A request is logged
+  before its reply is written (an interrupted client fails the write).
+  `wait: true` marks an `ms` that is mostly waiting (attach, `tam wait`,
+  asks, a dashboard session). The daemon's
+  `tracing` warnings and errors go in too (`WarningLayer`, installed by
+  `tam daemon`: a started daemon's stderr is null). Daemon kinds:
+  `request` (non-quiet, or slow ≥ `SLOW`), `conn.stats`, `attach`,
+  `*.steps` (`Phases`), `agent.spawn`/`state`/`exit` (`Agent::run_summary`:
+  states' times, hook counts), `ask.open`/`end`, `message.*`,
+  `member.health`, `reconcile.slow`, `chat.autoclean`, `shell.exit`.
+  Clients: `cli`, `cli.usage`, `daemon.autostart`, `tui.*`. The dashboard
+  logs a key with the mode it came in and left for, never a key typed into
+  the pane (counted: `typed_bytes`, `writes`), a character into a prompt
+  (`chars`), or a key dropped after the pane gave the keyboard back
+  (`dropped_keys`: `Recorder::before` reads `dropping_keys_until`, never
+  `drops_key`, which pushes the pause back).
+
 ## Build & check
 
 ```bash
@@ -1042,6 +1082,20 @@ cargo test
   `drop`, `merge`, `close`, `shell` refusing a shell's id (exit 3, JSON
   `not_found`); `attach` taking it; `stop` by id, then not found; the
   wrapper run in the worktree; `tam drop` saying it closed two.
+- Activity log: `activity.rs` unit tests (a line's header, files per
+  day, dates, prune, settings, requests saying lengths never text,
+  `ConnStats`); the daemon's `tests/activity.rs` (a daemon logging to its
+  tempdir: a request with the client's pid, creation and drop steps, an
+  agent's spawn and exit, a message's length, a connection's stats, an
+  invalid request, start and stop; no message text in any file); the
+  CLI's `tests/activity_log.rs` (the real `tam`: `cli` lines, a usage
+  error, the daemon it starts, `TAM_AGENT_ID` as `agent`, a SIGINT;
+  `[log] enabled = false` writes nothing); `tui/log.rs` (the `Recorder` on
+  an `App`: modes, typing counted, keys dropped after `stop_typing` never
+  named, prompt text counted, an action). The tests that
+  set `HOME` for `tam` children set `XDG_DATA_HOME` too: else their lines
+  would go to the user's log. `shells.rs` checks shell ids are in no file
+  but the log.
 - The daemon's `xdg.rs`: the worktree config, the notify and autoclean
   settings and the ledger's path follow `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`, else `~/.config` and
   `~/.local/share`, an empty or relative value ignored, a config in

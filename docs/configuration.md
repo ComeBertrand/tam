@@ -1,6 +1,6 @@
 # Configuration
 
-tam reads `$XDG_CONFIG_HOME/tam/config.toml`, by default `~/.config/tam/config.toml`, on every platform (macOS too). It keeps its data (the task ledger, the tasks' directories) in `$XDG_DATA_HOME/tam`, by default `~/.local/share/tam`, the same way.
+tam reads `$XDG_CONFIG_HOME/tam/config.toml`, by default `~/.config/tam/config.toml`, on every platform (macOS too). It keeps its data (the task ledger, the tasks' directories, the [activity log](activity-log.md)) in `$XDG_DATA_HOME/tam`, by default `~/.local/share/tam`, the same way.
 
 ## config.toml
 
@@ -28,6 +28,10 @@ finder = "fzf"                          # tam pick's finder
 [chat]
 autoclean = 3                           # days without a turn before a chat is closed (fractions too); 0 or false: never
 
+[log]
+enabled = true                          # the activity log (default); false: nothing written
+keep_days = 30                          # its files older than this are removed (default 30)
+
 [tui]
 theme = "dark"                          # 24-bit palette; "unicorn": brighter, with rainbows; "ansi": the terminal's 16 colours. Default: dark when COLORTERM says truecolor
 animate = true                          # unicorn: the rainbows move (the logo, the selection's bar, the spinners, the rules, the pane's border)
@@ -54,6 +58,10 @@ A brief pattern turns what you type into the task's brief (`reference`: `{0}` is
 ### Chat autoclean
 
 `autoclean` in `[chat]` is how many days a chat may go without a turn before it is closed: see [Chats](chats.md#autoclean).
+
+### Activity log
+
+`[log]` turns the activity log off (`enabled = false`) or keeps it longer or shorter (`keep_days`): see [Activity log](activity-log.md).
 
 ### Notifications
 

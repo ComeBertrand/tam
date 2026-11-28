@@ -4,6 +4,7 @@ mod branch;
 mod fuzzy;
 mod input;
 mod keys;
+mod log;
 mod peek;
 mod table;
 mod theme;
@@ -163,6 +164,7 @@ enum Action {
 }
 
 pub async fn run() -> Result<()> {
+    let started = std::time::Instant::now();
     anyhow::ensure!(
         std::io::stdin().is_terminal(),
         "TUI requires an interactive terminal"
@@ -199,7 +201,14 @@ pub async fn run() -> Result<()> {
     app.set_shells(shells);
     app.set_tasks(tasks);
 
-    let result = run_loop(&mut terminal, &mut app, &mut client, &config).await;
+    let mut rec = log::Recorder::new(crate::activity::log());
+    let size = terminal
+        .size()
+        .map(|s| (s.width, s.height))
+        .unwrap_or_default();
+    rec.start(&app, size, tam_daemon::activity::ms_since(started));
+    let result = run_loop(&mut terminal, &mut app, &mut client, &config, &mut rec).await;
+    rec.stop(result.as_ref().err());
 
     mouse_capture(false);
     bracketed_paste(false);
@@ -332,11 +341,20 @@ impl InputReader {
     }
 }
 
+/// What the event loop does after an input's action.
+enum Flow {
+    Next,
+    /// Drop the rest of the batch.
+    Break,
+    Quit,
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     client: &mut Client,
     config: &Config,
+    rec: &mut log::Recorder,
 ) -> Result<()> {
     let mut input = InputReader::spawn();
     // Redraw at least every second: times in state move on.
@@ -357,6 +375,8 @@ async fn run_loop(
         app.sync_focus();
         // The pane keeps the keyboard only for the agent it took it for.
         app.check_typing();
+        rec.sync(app);
+        let mut phases = tam_daemon::activity::Phases::start();
         // Typing into it or scrolling it is looking at it: the daemon is
         // told with the watch (see `refresh_peek`).
         if app.peek.viewing != app.mode.pane_agent().is_some() {
@@ -366,11 +386,14 @@ async fn run_loop(
         // or exiting), the preview follows.
         if app.peek_stale() || std::mem::take(&mut screen_moved) {
             refresh_peek(client, app).await;
+            phases.mark("peek");
         }
         if app.detail_stale() {
             refresh_detail(client, app).await;
+            phases.mark("detail");
         }
         fit_agent(client, app).await;
+        phases.mark("fit");
         if let Some((id, dir)) = app.branch_due() {
             let tx = branch_tx.clone();
             // A thread of its own: quitting never waits for a slow git (the
@@ -380,6 +403,8 @@ async fn run_loop(
             });
         }
         terminal.draw(|frame| ui::render(frame, app))?;
+        phases.mark("draw");
+        rec.frame(&phases);
 
         let events = tokio::select! {
             Some(ev) = input.events.recv() => {
@@ -429,175 +454,204 @@ async fn run_loop(
                 Mode::Terminal { agent } => Some(agent.clone()),
                 _ => None,
             };
-            let action = match ev {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key_event(key, app, config)
-                }
+            let before = rec.before(app);
+            let (action, came) = match &ev {
+                Event::Key(key) if key.kind == KeyEventKind::Press => (
+                    handle_key_event(*key, app, config),
+                    Some(log::Input::Key(key)),
+                ),
                 Event::Paste(text) if typing.is_some() => {
                     let bracketed = app
                         .peek
                         .screen
                         .as_ref()
                         .is_some_and(|s| s.bracketed_paste());
-                    Action::Keys(keys::paste(&text, bracketed))
+                    let input = log::Input::Paste(text.chars().count());
+                    (Action::Keys(keys::paste(text, bracketed)), Some(input))
                 }
                 Event::Paste(text) => {
-                    paste_into_prompt(&text, app, config);
-                    Action::None
+                    paste_into_prompt(text, app, config);
+                    (Action::None, Some(log::Input::Paste(text.chars().count())))
                 }
-                Event::Mouse(mouse) => handle_mouse(mouse, app),
-                _ => Action::None,
+                Event::Mouse(mouse) => (handle_mouse(*mouse, app), mouse_input(mouse)),
+                _ => (Action::None, None),
             };
+            let described = log::describe(&action);
+            let acting = std::time::Instant::now();
             // The pane just took the keyboard: what follows in this batch
             // was typed before any frame said so, and is dropped.
             let focused = typing.is_none() && matches!(app.mode, Mode::Terminal { .. });
-            match action {
-                Action::Quit => return Ok(()),
-                Action::SelectNext => app.select_next(),
-                Action::SelectPrev => app.select_prev(),
-                Action::Copy { text, cut } => copy(app, &text, cut),
-                Action::Attach { id, label } => {
-                    attach(terminal, app, client, &mut input, &id, &label).await?;
-                    screen_moved = true;
-                    // What came before attaching is not for the dashboard.
-                    break;
-                }
-                Action::Resume {
-                    id,
-                    label,
-                    attach: full,
-                } => {
-                    if resume_chat(client, app, &id, &label).await && full {
+            let flow = 'act: {
+                match action {
+                    Action::Quit => break 'act Flow::Quit,
+                    Action::SelectNext => app.select_next(),
+                    Action::SelectPrev => app.select_prev(),
+                    Action::Copy { text, cut } => copy(app, &text, cut),
+                    Action::Attach { id, label } => {
                         attach(terminal, app, client, &mut input, &id, &label).await?;
+                        screen_moved = true;
+                        // What came before attaching is not for the dashboard.
+                        break 'act Flow::Break;
                     }
-                    screen_moved = true;
-                    // The keys queued behind are not for the dashboard: for
-                    // the agent, or typed before a notice said why not.
-                    break;
-                }
-                Action::CloseChat { id, label } => {
-                    close_chat(client, app, &id, &label).await;
-                    screen_moved = true;
-                }
-                Action::OpenShell { on } => {
-                    open_shell(client, app, on).await;
-                    screen_moved = true;
-                    // As for the enter that gives the pane the keyboard:
-                    // the keys queued behind it are dropped.
-                    break;
-                }
-                Action::CloseShell { id, label } => {
-                    close_shell(client, app, &id, &label).await;
-                    screen_moved = true;
-                }
-                Action::KeepChat { id, label, keep } => {
-                    keep_chat(client, app, &id, &label, keep).await;
-                }
-                Action::RenameChat { id, label, name } => {
-                    rename_chat(client, app, &id, &label, name).await;
-                }
-                Action::StopAgent { id, label } => {
-                    stop_agent(client, app, &id, &label).await?;
-                    screen_moved = true;
-                }
-                Action::DropTask {
-                    name,
-                    label,
-                    force,
-                    delete_branch,
-                } => {
-                    drop_task(client, app, &name, &label, force, delete_branch).await;
-                    screen_moved = true;
-                }
-                Action::PickProject(purpose) => {
-                    start_pick_project(app, purpose);
-                    if !app.discovering {
-                        app.discovering = true;
-                        let tx = projects_tx.clone();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(discover_projects());
-                        });
+                    Action::Resume {
+                        id,
+                        label,
+                        attach: full,
+                    } => {
+                        if resume_chat(client, app, &id, &label).await && full {
+                            attach(terminal, app, client, &mut input, &id, &label).await?;
+                        }
+                        screen_moved = true;
+                        // The keys queued behind are not for the dashboard: for
+                        // the agent, or typed before a notice said why not.
+                        break 'act Flow::Break;
                     }
-                }
-                Action::RunAgent { member } => {
-                    do_run(client, app, &member, SessionChoice::Current).await?;
-                }
-                Action::ChatHistory { dir } => {
-                    open_chat_history(client, app, dir).await;
-                }
-                Action::CreateChat { dir, session } => {
-                    create_chat(client, app, &dir, session).await;
-                    screen_moved = true;
-                    // As for the enter that gives the pane the keyboard:
-                    // the keys queued behind it are dropped.
-                    break;
-                }
-                Action::DoNewTask { name, dirs } => {
-                    do_new_task(client, app, &name, &dirs).await?;
-                }
-                Action::CustomCommand {
-                    name,
-                    command,
-                    task,
-                    id,
-                    dir,
-                    provider,
-                } => match config::run_custom_command(
-                    &command,
-                    &CommandValues {
-                        task: &task,
-                        id: &id,
-                        dir: &dir,
-                        provider: &provider,
-                    },
-                ) {
-                    Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
-                    Err(e) => app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5)),
-                },
-                Action::RunNewSession { member } => {
-                    do_run(client, app, &member, SessionChoice::New).await?;
-                }
-                Action::RepairTask { name } => {
-                    repair_task(client, app, &name).await;
-                }
-                Action::ScrollPeek(scroll) => {
-                    app.peek.scroll(scroll);
-                    screen_moved = true;
-                }
-                Action::Keys(bytes) => {
-                    if let Some(agent) = typing {
-                        typed.get_or_insert((agent, Vec::new())).1.extend(bytes);
-                    }
-                    // Typing shows the live screen again.
-                    if app.peek.from.take().is_some() {
+                    Action::CloseChat { id, label } => {
+                        close_chat(client, app, &id, &label).await;
                         screen_moved = true;
                     }
+                    Action::OpenShell { on } => {
+                        open_shell(client, app, on).await;
+                        screen_moved = true;
+                        // As for the enter that gives the pane the keyboard:
+                        // the keys queued behind it are dropped.
+                        break 'act Flow::Break;
+                    }
+                    Action::CloseShell { id, label } => {
+                        close_shell(client, app, &id, &label).await;
+                        screen_moved = true;
+                    }
+                    Action::KeepChat { id, label, keep } => {
+                        keep_chat(client, app, &id, &label, keep).await;
+                    }
+                    Action::RenameChat { id, label, name } => {
+                        rename_chat(client, app, &id, &label, name).await;
+                    }
+                    Action::StopAgent { id, label } => {
+                        stop_agent(client, app, &id, &label).await?;
+                        screen_moved = true;
+                    }
+                    Action::DropTask {
+                        name,
+                        label,
+                        force,
+                        delete_branch,
+                    } => {
+                        drop_task(client, app, &name, &label, force, delete_branch).await;
+                        screen_moved = true;
+                    }
+                    Action::PickProject(purpose) => {
+                        start_pick_project(app, purpose);
+                        if !app.discovering {
+                            app.discovering = true;
+                            let tx = projects_tx.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(discover_projects());
+                            });
+                        }
+                    }
+                    Action::RunAgent { member } => {
+                        do_run(client, app, &member, SessionChoice::Current).await?;
+                    }
+                    Action::ChatHistory { dir } => {
+                        open_chat_history(client, app, dir).await;
+                    }
+                    Action::CreateChat { dir, session } => {
+                        create_chat(client, app, &dir, session).await;
+                        screen_moved = true;
+                        // As for the enter that gives the pane the keyboard:
+                        // the keys queued behind it are dropped.
+                        break 'act Flow::Break;
+                    }
+                    Action::DoNewTask { name, dirs } => {
+                        do_new_task(client, app, &name, &dirs).await?;
+                    }
+                    Action::CustomCommand {
+                        name,
+                        command,
+                        task,
+                        id,
+                        dir,
+                        provider,
+                    } => match config::run_custom_command(
+                        &command,
+                        &CommandValues {
+                            task: &task,
+                            id: &id,
+                            dir: &dir,
+                            provider: &provider,
+                        },
+                    ) {
+                        Ok(()) => app.set_status(format!("{name}: {task}"), Duration::from_secs(3)),
+                        Err(e) => {
+                            app.set_status(format!("{name} failed: {e}"), Duration::from_secs(5))
+                        }
+                    },
+                    Action::RunNewSession { member } => {
+                        do_run(client, app, &member, SessionChoice::New).await?;
+                    }
+                    Action::RepairTask { name } => {
+                        repair_task(client, app, &name).await;
+                    }
+                    Action::ScrollPeek(scroll) => {
+                        app.peek.scroll(scroll);
+                        screen_moved = true;
+                    }
+                    Action::Keys(bytes) => {
+                        rec.typed(bytes.len());
+                        if let Some(agent) = typing {
+                            typed.get_or_insert((agent, Vec::new())).1.extend(bytes);
+                        }
+                        // Typing shows the live screen again.
+                        if app.peek.from.take().is_some() {
+                            screen_moved = true;
+                        }
+                    }
+                    Action::NextTheme => {
+                        let name = theme::next();
+                        app.set_status(format!("theme: {name}"), Duration::from_secs(2));
+                    }
+                    Action::Answer {
+                        agent,
+                        ask,
+                        answer,
+                        label,
+                        what,
+                    } => {
+                        let request = tam_proto::Request::Answer { agent, ask, answer };
+                        answer_request(client, app, request, &label, &what).await?;
+                    }
+                    Action::None => {}
                 }
-                Action::NextTheme => {
-                    let name = theme::next();
-                    app.set_status(format!("theme: {name}"), Duration::from_secs(2));
-                }
-                Action::Answer {
-                    agent,
-                    ask,
-                    answer,
-                    label,
-                    what,
-                } => {
-                    let request = tam_proto::Request::Answer { agent, ask, answer };
-                    answer_request(client, app, request, &label, &what).await?;
-                }
-                Action::None => {}
+                Flow::Next
+            };
+            if let Some(came) = came {
+                rec.input(app, before, came, described, acting.elapsed());
             }
-            if focused {
-                break;
+            match flow {
+                Flow::Quit => return Ok(()),
+                Flow::Break => break,
+                Flow::Next if focused => break,
+                Flow::Next => {}
             }
         }
         screen_moved |= app.peek.from != from;
         if let Some((agent, bytes)) = typed {
+            rec.wrote();
             type_keys(client, app, agent, &bytes).await;
         }
     }
+}
+
+/// How the log names a mouse event (`None`: a move, not logged).
+fn mouse_input(mouse: &MouseEvent) -> Option<log::Input<'static>> {
+    Some(log::Input::Mouse(match mouse.kind {
+        MouseEventKind::Down(_) => "click",
+        MouseEventKind::Up(_) => "release",
+        MouseEventKind::Drag(_) => "drag",
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => "wheel",
+        _ => return None,
+    }))
 }
 
 /// Type `bytes` into `agent`'s terminal; the pane gives the keyboard back

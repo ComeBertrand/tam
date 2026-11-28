@@ -12,5 +12,6 @@ New to tam? Start with the [README](../README.md): install, quick start and conc
 | [Scripting](scripting.md) | Running without a terminal, `tam wait` and `tam result`, exit statuses, every JSON document |
 | [Configuration](configuration.md) | `config.toml`, custom commands, brief patterns, notifications, `.tam.toml` |
 | [How tam runs Claude Code](claude-code.md) | Hooks, the agent's environment, the dev-environment wrapper, sessions |
+| [Activity log](activity-log.md) | What tam did, when and how long it took: where it is, every kind of line, what it never holds |
 
 `tam help COMMAND` (or `tam COMMAND --help`) describes each command and its options.

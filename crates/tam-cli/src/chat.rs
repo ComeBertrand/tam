@@ -341,7 +341,7 @@ pub async fn close(target: &str, yes: bool, json: bool) -> Result<()> {
                 ));
             }
             eprintln!("Chat {} kept.", describe(&chat));
-            std::process::exit(1);
+            crate::activity::exit(1);
         }
     }
     let (closed, _) = client.close_chat(&chat.id).await?;

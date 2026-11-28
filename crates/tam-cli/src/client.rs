@@ -78,25 +78,34 @@ impl Client {
         let stream = match UnixStream::connect(&socket_path).await {
             Ok(s) => s,
             Err(_) => {
+                let started = std::time::Instant::now();
                 Self::start_daemon().map_err(daemon_error)?;
                 // Poll until daemon is ready (up to 2s)
                 let mut attempts = 0;
-                loop {
+                let stream = loop {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     match UnixStream::connect(&socket_path).await {
-                        Ok(s) => break s,
+                        Ok(s) => break Ok(s),
                         Err(_) if attempts < 40 => {
                             attempts += 1;
                             continue;
                         }
-                        Err(e) => {
-                            return Err(daemon_error(
-                                anyhow::Error::new(e)
-                                    .context("failed to connect to daemon after starting it"),
-                            ));
-                        }
+                        Err(e) => break Err(e),
                     }
-                }
+                };
+                crate::activity::log().record(
+                    "daemon.autostart",
+                    serde_json::json!({
+                        "ms": tam_daemon::activity::ms_since(started),
+                        "ok": stream.is_ok(),
+                    }),
+                );
+                stream.map_err(|e| {
+                    daemon_error(
+                        anyhow::Error::new(e)
+                            .context("failed to connect to daemon after starting it"),
+                    )
+                })?
             }
         };
 

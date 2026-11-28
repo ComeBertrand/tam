@@ -62,6 +62,8 @@ struct Waiting {
     /// The tool's input, as the hook sent it.
     input: Value,
     tx: oneshot::Sender<Delivery>,
+    /// Since when it waits (for the activity log).
+    opened: std::time::Instant,
 }
 
 /// The requests agents' hooks wait on, by agent id: one per agent (Claude
@@ -103,6 +105,7 @@ impl Asks {
                 token,
                 input,
                 tx,
+                opened: std::time::Instant::now(),
             },
         );
         Some((ask, token, rx))
@@ -116,6 +119,12 @@ impl Asks {
             return true;
         }
         false
+    }
+
+    /// The id of the request `agent` waits on, and for how long.
+    pub fn waiting(&self, agent: &str) -> Option<(&str, std::time::Duration)> {
+        let waiting = self.waiting.get(agent)?;
+        Some((&waiting.ask.id, waiting.opened.elapsed()))
     }
 
     /// Release the hook of `agent`'s request, if any (it prints nothing).

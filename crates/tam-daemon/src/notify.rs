@@ -206,9 +206,9 @@ pub fn command_for(config: &NotifyConfig, n: &Notification) -> Option<String> {
 }
 
 /// Fire the notification command for a state change, if it matches.
-pub fn fire_if_matching(config: &NotifyConfig, n: &Notification) {
+pub fn fire_if_matching(config: &NotifyConfig, n: &Notification) -> bool {
     let Some(cmd) = command_for(config, n) else {
-        return;
+        return false;
     };
 
     info!(id = %n.id, state = %n.new, "firing notification");
@@ -219,6 +219,7 @@ pub fn fire_if_matching(config: &NotifyConfig, n: &Notification) {
             error!(cmd = %cmd, error = %e, "notification command failed");
         }
     });
+    true
 }
 
 /// Replace `{name}` placeholders in a `sh -c` template, escaping each value

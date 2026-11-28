@@ -242,6 +242,7 @@ NAME is a task, `TASK/MEMBER` for one member of a task, or a chat. Without it, `
 | [Scripting](docs/scripting.md) | Running without a terminal, exit statuses, JSON output |
 | [Configuration](docs/configuration.md) | Every option, notifications, per-repository setup |
 | [How tam runs Claude Code](docs/claude-code.md) | Hooks, environment, dev-environment wrapper, sessions |
+| [Activity log](docs/activity-log.md) | What tam did, when and how long it took |
 
 ## Contributing
 

@@ -110,6 +110,8 @@ async fn hooks_reach_the_daemon_through_hook_notify() {
     std::fs::create_dir_all(&bin).unwrap();
     std::env::set_var("HOME", root.join("home"));
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+    // The `tam` it runs writes its activity log there, not in the user's.
+    std::env::set_var("XDG_DATA_HOME", root.join("data"));
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     std::env::set_var("PATH", path);
 

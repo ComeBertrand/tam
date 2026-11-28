@@ -1011,10 +1011,13 @@ exec sleep 120
         watcher.seen
     );
 
-    // Nor in what the daemon writes; and no shell is in the ledger.
+    // Nor in what the daemon writes; and no shell is in the ledger (the
+    // activity log, `log/`, says what was done with them).
     conn.request(&Request::Shutdown).await;
     drop((conn, watcher));
     wait_ledger_released(&ledger).await;
+    let log = data.join("log");
+    assert!(log.is_dir(), "no activity log in {}", data.display());
     let mut files = vec![data.clone()];
     while let Some(path) = files.pop() {
         if path.is_dir() {
@@ -1022,6 +1025,9 @@ exec sleep 120
         } else if let Ok(bytes) = std::fs::read(&path) {
             let text = String::from_utf8_lossy(&bytes);
             assert_no_secret(&path.display().to_string(), &text);
+            if path.starts_with(&log) {
+                continue;
+            }
             for id in [&plain.id, &wrapped.id] {
                 assert!(!text.contains(id.as_str()), "{id} in {}", path.display());
             }

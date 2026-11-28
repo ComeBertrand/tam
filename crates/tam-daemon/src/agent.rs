@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -42,6 +43,10 @@ pub struct Agent {
     /// Other members' worktrees the agent was given read access to when
     /// it started (see `provider::TaskAccess`).
     readable: Vec<PathBuf>,
+    /// For the activity log: how long it was in each state, how many hooks
+    /// of each event it ran.
+    states: BTreeMap<String, Duration>,
+    hooks: BTreeMap<String, u64>,
 }
 
 impl Agent {
@@ -73,6 +78,8 @@ impl Agent {
             owner: None,
             hook_data: HookData::default(),
             readable: Vec::new(),
+            states: BTreeMap::new(),
+            hooks: BTreeMap::new(),
         })
     }
 
@@ -119,6 +126,25 @@ impl Agent {
         &self.readable
     }
 
+    /// What the activity log says of the run so far: how long it ran, in
+    /// each state (milliseconds, the current one until now), and how many
+    /// hooks of each event it ran.
+    pub fn run_summary(&self) -> serde_json::Value {
+        let mut states = self.states.clone();
+        *states.entry(self.reported_state.to_string()).or_default() +=
+            self.reported_since.elapsed().unwrap_or_default();
+        let states: serde_json::Map<_, _> = states
+            .into_iter()
+            .map(|(state, held)| (state, crate::activity::ms(held).into()))
+            .collect();
+        serde_json::json!({
+            "provider": self.provider.name(),
+            "run_ms": crate::activity::ms(self.pty.uptime()),
+            "states_ms": states,
+            "hooks": self.hooks,
+        })
+    }
+
     pub fn provider_name(&self) -> &str {
         self.provider.name()
     }
@@ -151,6 +177,7 @@ impl Agent {
             // state can't bring back a stale `working`.
             HookResult::Handled { state: None } => self.set_state(current),
         }
+        *self.hooks.entry(event.to_string()).or_default() += 1;
         Some(result)
     }
 
@@ -164,9 +191,10 @@ impl Agent {
         self.hook_data.resumable_session.as_deref()
     }
 
-    /// Check for a state transition. Returns Some((old, new)) if state changed.
-    /// Updates reported_state so the same transition isn't reported twice.
-    pub fn check_state_change(&mut self) -> Option<(AgentState, AgentState)> {
+    /// Check for a state transition. Returns Some((old, new, how long it was
+    /// in old)) if state changed. Updates reported_state so the same
+    /// transition isn't reported twice.
+    pub fn check_state_change(&mut self) -> Option<(AgentState, AgentState, Duration)> {
         let current = self.current_state();
         // Commit a silence-derived state: output that follows (e.g. the
         // prompt echoing the user's typing) must not bring back `working`.
@@ -175,9 +203,11 @@ impl Agent {
         }
         if current != self.reported_state {
             let old = self.reported_state;
+            let held = self.reported_since.elapsed().unwrap_or_default();
+            *self.states.entry(old.to_string()).or_default() += held;
             self.reported_state = current;
             self.reported_since = SystemTime::now();
-            Some((old, current))
+            Some((old, current, held))
         } else {
             None
         }
